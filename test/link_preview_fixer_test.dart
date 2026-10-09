@@ -9,6 +9,15 @@ MessageTextEntity _code(int offset, int length) => MessageTextEntity(
   type: 'textEntityTypeCode',
 );
 
+/// A `TextUrl` entity hiding [url] behind [length] characters at [offset].
+MessageTextEntity _textUrl(int offset, int length, String url) =>
+    MessageTextEntity(
+      offset: offset,
+      length: length,
+      type: 'textEntityTypeTextUrl',
+      url: url,
+    );
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -235,6 +244,112 @@ void main() {
         ),
         text,
       );
+    });
+
+    test('a hidden link is the link, not the label', () {
+      // TDLib previews the target a TextUrl points at, so the target is what
+      // decides whether a mirror applies — the label is decoration.
+      const text = 'Read this';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, text.length, 'https://x.com/a/status/1')],
+        ),
+        'https://x.com/a/status/1',
+      );
+    });
+
+    test('the first link wins even when it is hidden', () {
+      const text = 'Read this https://x.com/a/status/1';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, 'Read this'.length, 'https://example.test/a')],
+        ),
+        'https://example.test/a',
+      );
+    });
+
+    test('a label spelling an unrelated link is never scanned', () {
+      // The label looks like the mirrorable link; the target does not. Reading
+      // the label would move the card to a page the sender never linked.
+      const label = 'x.com/a/status/1';
+      const text = '$label and more words';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, label.length, 'https://example.test/doc')],
+        ),
+        'https://example.test/doc',
+      );
+      // And with no target at all, the label contributes nothing.
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, label.length, '')],
+        ),
+        isNull,
+      );
+    });
+
+    test('walks past a hidden target that is not a web link', () {
+      const text = 'ton://site https://x.com/a/status/1';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, 'ton://site'.length, 'tonsite://example')],
+        ),
+        'https://x.com/a/status/1',
+      );
+    });
+
+    test('a url entity contributes its own slice', () {
+      const link = 'https://x.com/a/status/1';
+      const text = 'see $link now';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: const [
+            MessageTextEntity(
+              offset: 'see '.length,
+              length: link.length,
+              type: 'textEntityTypeUrl',
+            ),
+          ],
+        ),
+        link,
+      );
+      // TDLib skips a `Url` entity too short to hold a link, and keeps walking.
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          'x.y $link',
+          entities: const [
+            MessageTextEntity(offset: 0, length: 3, type: 'textEntityTypeUrl'),
+          ],
+        ),
+        link,
+      );
+    });
+
+    test('ignores links inside pre and quote spans', () {
+      const coded = 'https://x.com/a';
+      const text = '$coded https://twitter.com/b';
+      for (final type in const [
+        'textEntityTypePre',
+        'textEntityTypePreCode',
+        'textEntityTypeBlockQuote',
+      ]) {
+        expect(
+          LinkPreviewFixer.firstPreviewableUrl(
+            text,
+            entities: [
+              MessageTextEntity(offset: 0, length: coded.length, type: type),
+            ],
+          ),
+          'https://twitter.com/b',
+          reason: type,
+        );
+      }
     });
   });
 

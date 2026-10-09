@@ -19,6 +19,29 @@ Map<String, dynamic> _codeEntity(String text) => {
   'type': {'@type': 'textEntityTypeCode'},
 };
 
+/// A TDLib `textEntity` hiding [url] behind the first [length] characters.
+Map<String, dynamic> _textUrlEntity(int length, String url) => {
+  '@type': 'textEntity',
+  'offset': 0,
+  'length': length,
+  'type': {'@type': 'textEntityTypeTextUrl', 'url': url},
+};
+
+/// A TDLib `textEntity` marking [length] characters at [offset] as a link.
+Map<String, dynamic> _urlEntity(int offset, int length) => {
+  '@type': 'textEntity',
+  'offset': offset,
+  'length': length,
+  'type': {'@type': 'textEntityTypeUrl'},
+};
+
+Map<String, dynamic> _preEntity(String text) => {
+  '@type': 'textEntity',
+  'offset': 0,
+  'length': text.length,
+  'type': {'@type': 'textEntityTypePre'},
+};
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   late List<Map<String, dynamic>> requests;
@@ -121,6 +144,107 @@ void main() {
       'url': 'https://fxtwitter.com/user/status/2',
     });
   });
+
+  test('a hidden first link keeps the preview it already has', () async {
+    await enableFixer();
+    const label = 'Read this';
+    final vm = model();
+
+    // The label is followed by a mirrorable link, but the sender's own first
+    // link points somewhere with no rule. Moving the card to the mirror would
+    // swap which page the message previews.
+    expect(
+      await vm.sendFormatted('$label https://x.com/a/status/1', [
+        _textUrlEntity(label.length, 'https://example.test/article'),
+      ]),
+      isTrue,
+    );
+
+    expect(sentContent().containsKey('link_preview_options'), isFalse);
+  });
+
+  test('a hidden link with a rule gets the mirror', () async {
+    await enableFixer();
+    const label = 'Read this';
+    final vm = model();
+
+    expect(
+      await vm.sendFormatted(label, [
+        _textUrlEntity(label.length, 'https://x.com/a/status/1'),
+      ]),
+      isTrue,
+    );
+
+    final content = sentContent();
+    // The text keeps the sender's label and its hidden target; only the fetched
+    // preview moves.
+    final sent = content['text'] as Map<String, dynamic>;
+    expect(sent['text'], label);
+    expect(
+      (sent['entities'] as List<dynamic>).first,
+      _textUrlEntity(label.length, 'https://x.com/a/status/1'),
+    );
+    expect(content['link_preview_options'], {
+      '@type': 'linkPreviewOptions',
+      'is_disabled': false,
+      'url': 'https://fixupx.com/a/status/1',
+    });
+  });
+
+  test('a label spelling a mirrorable link is not read as one', () async {
+    await enableFixer();
+    const label = 'x.com/a/status/1';
+    final vm = model();
+
+    expect(
+      await vm.sendFormatted('$label and more words', [
+        _textUrlEntity(label.length, 'https://example.test/doc'),
+      ]),
+      isTrue,
+    );
+
+    expect(sentContent().containsKey('link_preview_options'), isFalse);
+  });
+
+  test('a formatted send skips a link the sender put in a pre block', () async {
+    await enableFixer();
+    const coded = 'https://x.com/user/status/1';
+    final vm = model();
+
+    expect(
+      await vm.sendFormatted('$coded 以及 https://twitter.com/user/status/2', [
+        _preEntity(coded),
+      ]),
+      isTrue,
+    );
+
+    expect(sentContent()['link_preview_options'], {
+      '@type': 'linkPreviewOptions',
+      'is_disabled': false,
+      'url': 'https://fxtwitter.com/user/status/2',
+    });
+  });
+
+  test(
+    'a link the sender marked as a url entity is the one previewed',
+    () async {
+      await enableFixer();
+      const link = 'https://x.com/user/status/1';
+      const text = 'see $link now';
+      final vm = model();
+
+      expect(
+        await vm.sendFormatted(text, [_urlEntity('see '.length, link.length)]),
+        isTrue,
+      );
+
+      expect(sentContent()['link_preview_options'], {
+        '@type': 'linkPreviewOptions',
+        'is_disabled': false,
+        'url': 'https://fixupx.com/user/status/1',
+      });
+    },
+  );
 
   test('a link without a rule sends no preview override', () async {
     await enableFixer();

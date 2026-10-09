@@ -132,20 +132,35 @@ class LinkPreviewFixer extends ChangeNotifier {
     return fixedUrl(first);
   }
 
-  /// The link TDLib would preview in [text] — its first URL, ignoring spans the
-  /// sender formatted as code — or null when there is none.
+  /// The link TDLib would preview in [text] — its first URL — or null when there
+  /// is none.
   ///
   /// TDLib fills `linkPreviewOptions.url` for exactly one page, and without it
   /// previews the first URL in the text. Returning only that first URL keeps the
   /// override from swapping which link the card shows: a rule matching a later
   /// link is deliberately ignored.
+  ///
+  /// Selection follows TDLib's own `get_first_url`
+  /// (td/telegram/MessageEntity.cpp), which walks the message's entities in
+  /// order and takes the first `Url` or `TextUrl` one. A `TextUrl` contributes
+  /// the target hidden behind its label, not the label — so a message whose
+  /// first link is disguised still keeps its preview, and a later link that does
+  /// have a rule cannot steal the slot. mithka only sends the entities its
+  /// composer made, so whatever no entity covers is scanned the way TDLib's
+  /// detector would have; see [_withoutEntitySpans] for which spans that leaves
+  /// out.
   @visibleForTesting
   static String? firstPreviewableUrl(
     String text, {
     List<MessageTextEntity> entities = const [],
   }) {
     if (text.isEmpty) return null;
-    final searchable = _withoutCodeSpans(text, entities);
+    final ordered = _orderedEntities(entities, text.length);
+    for (final entity in ordered) {
+      final url = _entityUrl(entity, text);
+      if (url != null) return url;
+    }
+    final searchable = _withoutEntitySpans(text, ordered);
     final schemed = _schemeUrl.firstMatch(searchable);
     final bare = _bareHost.firstMatch(searchable);
     if (schemed == null && bare == null) return null;
@@ -155,6 +170,54 @@ class LinkPreviewFixer extends ChangeNotifier {
         : schemed!.start;
     final url = trimmedUrl(searchable.substring(start));
     return url.isEmpty ? null : url;
+  }
+
+  /// [entities] in the order TDLib walks them: by offset, with anything that
+  /// cannot point into [text] dropped.
+  static List<MessageTextEntity> _orderedEntities(
+    List<MessageTextEntity> entities,
+    int textLength,
+  ) {
+    if (entities.isEmpty) return const [];
+    final ordered = [...entities]..sort((a, b) => a.offset.compareTo(b.offset));
+    return [
+      for (final entity in ordered)
+        if (entity.length > 0 &&
+            entity.offset >= 0 &&
+            entity.offset < textLength)
+          entity,
+    ];
+  }
+
+  /// The URL one entity contributes to the preview, or null when TDLib would
+  /// look past it and keep walking.
+  static String? _entityUrl(MessageTextEntity entity, String text) {
+    final String candidate;
+    switch (entity.type) {
+      case 'textEntityTypeTextUrl':
+        // The label is decoration; the hidden target is what gets fetched.
+        candidate = entity.url ?? '';
+      case 'textEntityTypeUrl':
+        // TDLib skips a `Url` entity too short to hold a link.
+        if (entity.length <= 4) return null;
+        final start = entity.offset.clamp(0, text.length);
+        candidate = text.substring(start, entity.end.clamp(start, text.length));
+      default:
+        return null;
+    }
+    final url = trimmedUrl(candidate.trim());
+    return url.isEmpty || !_isWebLink(url) ? null : url;
+  }
+
+  /// True when [url] is something a preview mirror could serve: no scheme at
+  /// all, or an http(s) one. TDLib walks past `ton:`, `tg:`, `ftp:` and
+  /// `tonsite:` entities instead of giving up, so a foreign scheme has to skip
+  /// the entity rather than fail the whole lookup.
+  static bool _isWebLink(String url) {
+    final separator = url.indexOf('://');
+    if (separator < 0) return !_hasForeignScheme(url);
+    final scheme = url.substring(0, separator).toLowerCase();
+    return scheme == 'http' || scheme == 'https';
   }
 
   /// The mirror for a single [url], or null when no rule matches or rewriting
@@ -307,9 +370,25 @@ class LinkPreviewFixer extends ChangeNotifier {
     return -1;
   }
 
-  /// Blanks code spans without moving any offset: TDLib does not linkify inside
-  /// code, so a URL there must not claim the single preview slot.
-  static String _withoutCodeSpans(
+  /// The entity types TDLib treats as splittable: a link it detects inside one
+  /// of these survives the merge, so their spans stay searchable
+  /// (`is_splittable_entity` in td/telegram/MessageEntity.cpp).
+  static const Set<String> _splittableEntities = {
+    'textEntityTypeBold',
+    'textEntityTypeItalic',
+    'textEntityTypeUnderline',
+    'textEntityTypeStrikethrough',
+    'textEntityTypeSpoiler',
+  };
+
+  /// Blanks every span TDLib would not linkify, without moving any offset.
+  ///
+  /// TDLib merges its detector's findings with the entities a client sent and
+  /// drops any detected link overlapping a non-splittable one
+  /// (`merge_new_entities`), so code and quotes, mentions and addresses, and a
+  /// `TextUrl`'s label all hide whatever link-shaped text they cover. Scanning
+  /// them anyway would let a label stand in for the target behind it.
+  static String _withoutEntitySpans(
     String text,
     List<MessageTextEntity> entities,
   ) {
@@ -317,7 +396,7 @@ class LinkPreviewFixer extends ChangeNotifier {
     final codes = text.codeUnits.toList();
     var masked = false;
     for (final entity in entities) {
-      if (entity.type != 'textEntityTypeCode' && !entity.isPreBlock) continue;
+      if (_splittableEntities.contains(entity.type)) continue;
       final start = entity.offset.clamp(0, codes.length);
       final end = entity.end.clamp(start, codes.length);
       for (var index = start; index < end; index++) {
