@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mithka/chat/link_preview_fixer.dart';
 import 'package:mithka/components/ui_components.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/general_settings_view.dart';
@@ -26,6 +27,9 @@ void main() {
     final prefs = await SharedPreferences.getInstance();
     final theme = ThemeController(prefs);
     addTearDown(theme.dispose);
+    // The row reads the shared fixer, which the app initializes at startup.
+    LinkPreviewFixer.shared.initialize(prefs);
+    addTearDown(() async => LinkPreviewFixer.shared.setEnabled(false));
 
     await tester.pumpWidget(_app(theme, const ChatBehaviorSettingsView()));
     await tester.pump();
@@ -44,6 +48,7 @@ void main() {
       'chat-behavior-preserve-sender',
       'chat-behavior-forward-rich-markdown',
       'chat-behavior-media-metadata',
+      'chat-behavior-fix-link-previews',
       'chat-behavior-save-captured-photos',
       'chat-behavior-quick-replies',
       'chat-behavior-link-browser',
@@ -146,6 +151,25 @@ void main() {
     await tester.pump();
     expect(theme.mediaMetadataEnabled, isFalse);
     expect(prefs.getBool('mediaMetadataEnabled'), isFalse);
+    // The preview fix keeps its own preference store, so the row is the only
+    // thing that can flip it.
+    final previewRow = find.byKey(
+      const ValueKey('chat-behavior-fix-link-previews'),
+    );
+    await tester.ensureVisible(previewRow);
+    await tester.pump();
+    expect(LinkPreviewFixer.shared.enabled, isFalse);
+    await tester.tap(previewRow);
+    await tester.pump();
+    expect(LinkPreviewFixer.shared.enabled, isTrue);
+    expect(prefs.getBool(LinkPreviewFixer.preferenceKey), isTrue);
+
+    LinkPreviewFixer.shared.initialize(prefs);
+    expect(
+      LinkPreviewFixer.shared.enabled,
+      isTrue,
+      reason: 'a later surface reads the same stored choice back',
+    );
 
     final browserRow = find.byKey(const ValueKey('chat-behavior-link-browser'));
     await tester.ensureVisible(browserRow);
