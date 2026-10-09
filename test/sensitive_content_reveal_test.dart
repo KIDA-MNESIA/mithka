@@ -34,8 +34,9 @@ Future<ThemeController> _pumpMessages(
   required SensitiveContentController controller,
   required List<ChatMessage> messages,
   void Function(ChatMessage, Rect?, dynamic)? onLongPress,
+  Map<String, Object> initialPreferences = const {},
 }) async {
-  SharedPreferences.setMockInitialValues({});
+  SharedPreferences.setMockInitialValues(initialPreferences);
   final preferences = await SharedPreferences.getInstance();
   final theme = ThemeController(preferences);
   await tester.pumpWidget(
@@ -243,4 +244,127 @@ void main() {
       expect(ordinaryActionRequests, 0);
     },
   );
+
+  testWidgets('auto reveal preference uncovers every message on its own', (
+    tester,
+  ) async {
+    final controller = SensitiveContentController.forTesting(
+      query: (_) async => {'@type': 'ok'},
+    );
+    addTearDown(controller.dispose);
+    final theme = await _pumpMessages(
+      tester,
+      controller: controller,
+      messages: [
+        _restrictedMessage(7, 'Covered first'),
+        _restrictedMessage(8, 'Covered too'),
+      ],
+    );
+    addTearDown(theme.dispose);
+
+    expect(_richText(_restriction), findsNWidgets(2));
+    expect(_richText('Covered first'), findsNothing);
+
+    theme.autoRevealRestrictedMedia = true;
+    await tester.pump();
+
+    expect(_richText(_restriction), findsNothing);
+    expect(_richText('Covered first'), findsOneWidget);
+    expect(_richText('Covered too'), findsOneWidget);
+
+    theme.autoRevealRestrictedMedia = false;
+    await tester.pump();
+    expect(_richText(_restriction), findsNWidgets(2));
+  });
+
+  testWidgets('auto revealed content sends the press to the action menu', (
+    tester,
+  ) async {
+    final requests = <Map<String, dynamic>>[];
+    final controller = SensitiveContentController.forTesting(
+      query: (request) async {
+        requests.add(request);
+        return {'@type': 'ok'};
+      },
+    );
+    addTearDown(controller.dispose);
+    var ordinaryActionRequests = 0;
+    final theme = await _pumpMessages(
+      tester,
+      controller: controller,
+      messages: [_restrictedMessage(9, 'Visible without asking')],
+      onLongPress: (_, _, _) => ordinaryActionRequests += 1,
+      initialPreferences: const {'autoRevealRestrictedMedia': true},
+    );
+    addTearDown(theme.dispose);
+
+    expect(theme.autoRevealRestrictedMedia, isTrue);
+    expect(_richText('Visible without asking'), findsOneWidget);
+
+    await tester.longPress(_richText('Visible without asking'));
+    await tester.pumpAndSettle();
+
+    expect(ordinaryActionRequests, 1);
+    expect(
+      find.byKey(const ValueKey('sensitive-content-choice-surface')),
+      findsNothing,
+    );
+    expect(requests, isEmpty);
+    // The preference is not per-message state: the press must not mask it again.
+    expect(_richText('Visible without asking'), findsOneWidget);
+  });
+
+  testWidgets('auto reveal still asks when there is nothing to show', (
+    tester,
+  ) async {
+    final controller = SensitiveContentController.forTesting(
+      query: (_) async => {'@type': 'ok'},
+    );
+    addTearDown(controller.dispose);
+    final theme = await _pumpMessages(
+      tester,
+      controller: controller,
+      // No retained text and no media: only the account option can uncover it.
+      messages: [_restrictedMessage(10, '')],
+      initialPreferences: const {'autoRevealRestrictedMedia': true},
+    );
+    addTearDown(theme.dispose);
+
+    expect(_richText(_restriction), findsOneWidget);
+    await tester.longPress(_richText(_restriction));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('sensitive-content-enable')),
+      findsOneWidget,
+    );
+    expect(controller.enabled, isFalse);
+  });
+
+  testWidgets('a manual reveal can be masked again by hand', (tester) async {
+    final controller = SensitiveContentController.forTesting(
+      query: (_) async => {'@type': 'ok'},
+    );
+    addTearDown(controller.dispose);
+    final theme = await _pumpMessages(
+      tester,
+      controller: controller,
+      messages: [_restrictedMessage(11, 'Uncovered by hand')],
+    );
+    addTearDown(theme.dispose);
+
+    await tester.longPress(_richText(_restriction));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('sensitive-content-reveal-once')),
+    );
+    await tester.pumpAndSettle();
+    expect(_richText('Uncovered by hand'), findsOneWidget);
+
+    // Revealing by hand is per-message state, so the same press masks it again.
+    await tester.longPress(_richText('Uncovered by hand'));
+    await tester.pumpAndSettle();
+    expect(_richText(_restriction), findsOneWidget);
+    expect(_richText('Uncovered by hand'), findsNothing);
+  });
 }

@@ -250,7 +250,17 @@ class _MessageBubbleState extends State<MessageBubble>
       widget.sensitiveContentController ?? SensitiveContentController.shared;
 
   bool get _revealsRestrictedContent =>
-      _showRestrictedContent || _sensitiveContentController.enabled;
+      _showRestrictedContent ||
+      _sensitiveContentController.enabled ||
+      (_theme.autoRevealRestrictedMedia && message.hasRestrictedRevealContent);
+
+  /// A long press flips the per-message reveal, so content uncovered by hand can
+  /// be masked again. Reveals that come from the account option or from the
+  /// auto-reveal preference are not per-message state: there the press belongs
+  /// to the ordinary action menu.
+  bool get _togglesRestrictedContentOnLongPress =>
+      message.hasRestrictedRevealContent &&
+      (_showRestrictedContent || !_revealsRestrictedContent);
 
   Rect? _bubbleBounds() {
     final box = _bubbleKey.currentContext?.findRenderObject() as RenderBox?;
@@ -312,7 +322,7 @@ class _MessageBubbleState extends State<MessageBubble>
       unawaited(_showSensitiveContentUnblockPrompt(anchor: _bubbleBounds()));
       return;
     }
-    if (message.hasRestrictedRevealContent) {
+    if (_togglesRestrictedContentOnLongPress) {
       setState(() => _showRestrictedContent = !_showRestrictedContent);
       return;
     }

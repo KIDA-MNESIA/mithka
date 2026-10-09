@@ -1156,6 +1156,9 @@ class ThemeController extends ChangeNotifier {
     _groupImageMessages = _prefs.getBool(_groupImageMessagesKey) ?? true;
     _hideBlockedUserMessages =
         _prefs.getBool(_hideBlockedUserMessagesKey) ?? false;
+    // Restricted media the user wants on screen without confirming per message.
+    _autoRevealRestrictedMedia =
+        _prefs.getBool(_autoRevealRestrictedMediaKey) ?? false;
     _liquidGlassBottomBar = _prefs.getBool(_liquidGlassBottomBarKey) ?? false;
     _showChannelsTab = _prefs.getBool(_showChannelsTabKey) ?? false;
     _showContactsTab = _prefs.getBool(_showContactsTabKey) ?? true;
@@ -1266,6 +1269,7 @@ class ThemeController extends ChangeNotifier {
   static const _quickReactionsKey = 'quickReactions';
   static const _groupImageMessagesKey = 'groupImageMessages';
   static const _hideBlockedUserMessagesKey = 'hideBlockedUserMessages';
+  static const _autoRevealRestrictedMediaKey = 'autoRevealRestrictedMedia';
   static const _liquidGlassBottomBarKey = 'liquidGlassBottomBar';
   static const _showChannelsTabKey = 'showChannelsTab';
   static const _showContactsTabKey = 'showContactsTab';
@@ -1357,6 +1361,7 @@ class ThemeController extends ChangeNotifier {
   late List<QuickReactionChoice> _quickReactions;
   bool _groupImageMessages = true;
   bool _hideBlockedUserMessages = false;
+  bool _autoRevealRestrictedMedia = false;
   bool _liquidGlassBottomBar = false;
   bool _showChannelsTab = false;
   bool _showContactsTab = true;
@@ -1838,6 +1843,13 @@ class ThemeController extends ChangeNotifier {
       List.unmodifiable(_quickReactions);
   bool get groupImageMessages => _groupImageMessages;
   bool get hideBlockedUserMessages => _hideBlockedUserMessages;
+
+  /// Shows message content Telegram marked as restricted without asking first.
+  ///
+  /// Purely local: unlike the account's sensitive-content option it never writes
+  /// `ignore_sensitive_content_restrictions`, so it cannot lift a restriction
+  /// the server still enforces.
+  bool get autoRevealRestrictedMedia => _autoRevealRestrictedMedia;
   bool get liquidGlassBottomBar => _liquidGlassBottomBar;
   bool get showChannelsTab => _showChannelsTab;
   bool get showContactsTab => _showContactsTab;
@@ -2788,6 +2800,13 @@ class ThemeController extends ChangeNotifier {
   set hideBlockedUserMessages(bool value) {
     _hideBlockedUserMessages = value;
     _prefs.setBool(_hideBlockedUserMessagesKey, value);
+    notifyListeners();
+  }
+
+  set autoRevealRestrictedMedia(bool value) {
+    if (_autoRevealRestrictedMedia == value) return;
+    _autoRevealRestrictedMedia = value;
+    _prefs.setBool(_autoRevealRestrictedMediaKey, value);
     notifyListeners();
   }
 
