@@ -242,9 +242,50 @@ class TdClient {
   static final TdClient shared = TdClient._();
   static const defaultQueryTimeout = Duration(seconds: 30);
 
+  /// A private instance for tests that exercise the real restore lifecycle
+  /// against synthetic bindings instead of tdjson.
+  @visibleForTesting
+  factory TdClient.forTesting() => TdClient._();
+
+  TdBindings? _debugBindings;
+  Future<Map<String, dynamic>> Function(
+    Map<String, dynamic> request,
+    int clientId,
+  )?
+  _debugQueryOverride;
+
+  /// Points a [TdClient.forTesting] instance at synthetic bindings, mock
+  /// preferences and a scratch support directory, and optionally scripts the
+  /// answers [queryTo] would otherwise wait for TDLib to give.
+  @visibleForTesting
+  void prepareForTesting({
+    required SharedPreferences prefs,
+    required String supportDir,
+    TdBindings? bindings,
+    Future<Map<String, dynamic>> Function(
+      Map<String, dynamic> request,
+      int clientId,
+    )?
+    queryOverride,
+    bool isShuttingDown = false,
+  }) {
+    _prefs = prefs;
+    _supportDir = supportDir;
+    _debugBindings = bindings;
+    _debugQueryOverride = queryOverride;
+    _isShuttingDown = isShuttingDown;
+  }
+
+  /// Answers the close handshake a test's fake bindings started, so slot
+  /// cleanup does not sit on the real 15-second close timeout.
+  @visibleForTesting
+  void debugCompleteClientClosed(int clientId) {
+    _clientClosedWaiters.remove(clientId)?.complete();
+  }
+
   // Lazy: only opened when first used, so demo/simulator builds (no tdjson) can
   // touch the singleton (e.g. read activeSlot) without resolving symbols.
-  late final TdBindings _bindings = TdBindings.open();
+  late final TdBindings _bindings = _debugBindings ?? TdBindings.open();
   TdClientProxyTransport? _proxyTransport;
   StreamSubscription<Map<String, dynamic>>? _proxyUpdateSub;
 
@@ -1196,22 +1237,27 @@ class TdClient {
     int? expectedUserId,
   }) async {
     final newSlot = _nextSlot();
-    final dbDir = Directory(_databaseDirectory(newSlot));
-    if (await dbDir.exists()) {
-      await dbDir.delete(recursive: true);
-    }
-    await dbDir.create(recursive: true);
-    final sessionFile = File('${dbDir.path}/td.binlog');
-    _ensureAcceptingNewClients();
-    _bindings.importSessionString(sessionString, sessionFile.path);
-
-    final cid = _bindings.createClientId();
+    // Claim the slot before the first await: two concurrent imports must not
+    // compute the same "next" slot and then share one database directory.
     if (!_slots.contains(newSlot)) _slots.add(newSlot);
-    _clientForSlot[newSlot] = cid;
-    _slotForClient[cid] = newSlot;
-    if (kDebugMode) unawaited(_persistDebugLiveClientIds());
-    _bindings.send(cid, _tdActivateRequest);
+    final dbDir = Directory(_databaseDirectory(newSlot));
     try {
+      if (await dbDir.exists()) {
+        await dbDir.delete(recursive: true);
+      }
+      await dbDir.create(recursive: true);
+      final sessionFile = File('${dbDir.path}/td.binlog');
+      _ensureAcceptingNewClients();
+      _bindings.importSessionString(sessionString, sessionFile.path);
+
+      final cid = _bindings.createClientId();
+      _clientForSlot[newSlot] = cid;
+      _slotForClient[cid] = newSlot;
+      if (kDebugMode) unawaited(_persistDebugLiveClientIds());
+      _bindings.send(
+        cid,
+        jsonEncode({'@type': 'getOption', 'name': 'version'}),
+      );
       final restoredUserId = await _waitForRestoredSessionReady(
         newSlot,
         cid,
@@ -1269,20 +1315,24 @@ class TdClient {
     required int expectedUserId,
   }) async {
     final newSlot = _nextSlot();
-    final dbDir = Directory(_databaseDirectory(newSlot));
-    if (await dbDir.exists()) {
-      await dbDir.delete(recursive: true);
-    }
-    await dbDir.create(recursive: true);
-
-    _ensureAcceptingNewClients();
-    final cid = _bindings.createClientId();
+    // Claim the slot before the first await, as in the import path above.
     if (!_slots.contains(newSlot)) _slots.add(newSlot);
-    _clientForSlot[newSlot] = cid;
-    _slotForClient[cid] = newSlot;
-    if (kDebugMode) unawaited(_persistDebugLiveClientIds());
-    _bindings.send(cid, _tdActivateRequest);
+    final dbDir = Directory(_databaseDirectory(newSlot));
     try {
+      if (await dbDir.exists()) {
+        await dbDir.delete(recursive: true);
+      }
+      await dbDir.create(recursive: true);
+
+      _ensureAcceptingNewClients();
+      final cid = _bindings.createClientId();
+      _clientForSlot[newSlot] = cid;
+      _slotForClient[cid] = newSlot;
+      if (kDebugMode) unawaited(_persistDebugLiveClientIds());
+      _bindings.send(
+        cid,
+        jsonEncode({'@type': 'getOption', 'name': 'version'}),
+      );
       await _waitForQrLoginReady(cid);
       await queryTo({
         '@type': 'requestQrCodeAuthentication',
@@ -2227,6 +2277,15 @@ class TdClient {
     }
     if (timeout <= Duration.zero) {
       throw ArgumentError.value(timeout, 'timeout', 'must be positive');
+    }
+    final debugQuery = _debugQueryOverride;
+    if (debugQuery != null) {
+      final result = await debugQuery(
+        Map<String, dynamic>.from(request),
+        clientId,
+      );
+      if (result.type == 'error') throw TdError(result);
+      return result;
     }
     final proxy = _proxyTransport;
     if (proxy != null) {
