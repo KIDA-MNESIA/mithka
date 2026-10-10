@@ -853,6 +853,14 @@ class _MessageBubbleState extends State<MessageBubble>
   @override
   void didUpdateWidget(covariant MessageBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // A bubble is stateful per list slot, not per message: a list rebinds the
+    // same State object to another message as rows move. The manual reveal is
+    // the reader's confirmation for ONE message, so it must not follow the
+    // slot onto a message that was never confirmed.
+    if (oldWidget.message.id != widget.message.id ||
+        oldWidget.message.chatId != widget.message.chatId) {
+      _showRestrictedContent = false;
+    }
     final oldController =
         oldWidget.sensitiveContentController ??
         SensitiveContentController.shared;
