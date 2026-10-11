@@ -430,4 +430,85 @@ void main() {
       expect(harness.persistedSlots(), isEmpty);
     },
   );
+
+  test(
+    'concurrent GramJS imports of one account share a slot and keep its data',
+    () async {
+      final harness = await _prepare(respond: _steadyResponder(777));
+
+      // Two imports of the same account whose session string names no user
+      // id: without serialization each resolves the other's fresh client as
+      // "the existing account" and both returned slots lose their database.
+      final slots = await Future.wait([
+        harness.client.restoreGramJsSessionSlot(
+          gramJsSessionFromTdSessionString(_syntheticSession(seed: 10)),
+        ),
+        harness.client.restoreGramJsSessionSlot(
+          gramJsSessionFromTdSessionString(_syntheticSession(seed: 11)),
+        ),
+      ]);
+
+      // Both callers are handed the same registered account slot.
+      expect(slots.toSet(), hasLength(1));
+      final kept = slots.first;
+      expect(harness.slotDir(kept).existsSync(), isTrue);
+      expect(
+        File('${harness.slotDir(kept).path}/td.binlog').existsSync(),
+        isTrue,
+        reason: 'the returned slot lost its database',
+      );
+      expect(harness.client.activeSlot, kept);
+      expect(harness.persistedSlots(), containsAll([0, kept]));
+      // The duplicate's directory is gone and its client was closed once.
+      final discarded = kept == 1 ? 2 : 1;
+      expect(harness.slotDir(discarded).existsSync(), isFalse);
+      expect(
+        harness.bindings.sentTo(discarded == 1 ? 100 : 101, 'close'),
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'concurrent GramJS imports of different accounts stay separate',
+    () async {
+      // Each import's client resolves a different account: the first import's
+      // client (100) reports 777, the second's (101) reports 888. The state
+      // responder must mirror the real lifecycle — WaitTdlibParameters until
+      // parameters are sent, then Ready — or the restore loop times out.
+      final parametersSent = <int>{};
+      final harness = await _prepare(
+        respond: (request, clientId) {
+          switch (request['@type']) {
+            case 'getAuthorizationState':
+              if (parametersSent.add(clientId)) return _waitParameters();
+              return _ready();
+            case 'getMe':
+              return _me(clientId == 100 ? 777 : 888);
+            default:
+              return const {'@type': 'ok'};
+          }
+        },
+      );
+
+      final slots = await Future.wait([
+        harness.client.restoreGramJsSessionSlot(
+          gramJsSessionFromTdSessionString(_syntheticSession(seed: 12)),
+        ),
+        harness.client.restoreGramJsSessionSlot(
+          gramJsSessionFromTdSessionString(_syntheticSession(seed: 13)),
+        ),
+      ]);
+
+      expect(slots.toSet(), hasLength(2));
+      for (final slot in slots) {
+        expect(
+          File('${harness.slotDir(slot).path}/td.binlog').existsSync(),
+          isTrue,
+          reason: 'slot $slot lost its database',
+        );
+      }
+      expect(harness.persistedSlots(), containsAll([0, ...slots]));
+    },
+  );
 }
