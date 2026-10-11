@@ -267,6 +267,7 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
                   icon: HeroAppIcons.circleInfo,
                 ),
                 onChanged: (value) => theme.mediaMetadataEnabled = value,
+              ),
               // Reads its own preference store, so the row rebuilds when the
               // switch is flipped from another surface.
               ListenableBuilder(

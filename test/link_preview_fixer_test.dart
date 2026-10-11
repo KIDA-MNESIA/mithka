@@ -270,6 +270,85 @@ void main() {
       );
     });
 
+    test('a plain link before a hidden one is the first link', () {
+      // The composer only sent the TextUrl it made itself; TDLib detects the
+      // plain link in the unannotated text and, walking both kinds of
+      // candidates by position, previews the earlier one.
+      const label = 'Hidden target';
+      const text = 'https://example.com/first $label';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [
+            _textUrl(
+              'https://example.com/first '.length,
+              label.length,
+              'https://x.com/a/status/1',
+            ),
+          ],
+        ),
+        'https://example.com/first',
+      );
+    });
+
+    test('a hidden link before a plain one is the first link', () {
+      // Reverse order: the TextUrl label sits earlier in the text, so its
+      // hidden target takes the preview slot.
+      const label = 'Hidden target';
+      const text = '$label https://example.com/second';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [_textUrl(0, label.length, 'https://x.com/a/status/1')],
+        ),
+        'https://x.com/a/status/1',
+      );
+    });
+
+    test('a plain link inside a bold span still beats a later hidden one', () {
+      // Bold is splittable: TDLib detects a link inside it, and at an earlier
+      // offset than the TextUrl it beats the hidden target.
+      const link = 'https://example.com/first';
+      const label = 'Hidden target';
+      const text = '$link $label';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [
+            const MessageTextEntity(
+              offset: 0,
+              length: 24,
+              type: 'textEntityTypeBold',
+            ),
+            _textUrl('$link '.length, label.length, 'https://x.com/a/status/1'),
+          ],
+        ),
+        'https://example.com/first',
+      );
+    });
+
+    test('a plain link inside code is masked, not first', () {
+      // Code is not splittable: the link inside it is not a candidate, so the
+      // later TextUrl target wins.
+      const coded = 'https://example.com/first';
+      const label = 'Hidden target';
+      const text = '$coded $label';
+      expect(
+        LinkPreviewFixer.firstPreviewableUrl(
+          text,
+          entities: [
+            _code(0, coded.length),
+            _textUrl(
+              '$coded '.length,
+              label.length,
+              'https://x.com/a/status/1',
+            ),
+          ],
+        ),
+        'https://x.com/a/status/1',
+      );
+    });
+
     test('a label spelling an unrelated link is never scanned', () {
       // The label looks like the mirrorable link; the target does not. Reading
       // the label would move the card to a page the sender never linked.

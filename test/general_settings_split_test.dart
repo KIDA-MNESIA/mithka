@@ -73,7 +73,7 @@ void main() {
     );
     expect(
       find.byType(SettingsLeadingIcon),
-      findsNWidgets(11),
+      findsNWidgets(12),
       reason: 'detail rows use the shared accent line-icon treatment',
     );
     expect(

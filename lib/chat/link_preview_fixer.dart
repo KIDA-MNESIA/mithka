@@ -140,15 +140,16 @@ class LinkPreviewFixer extends ChangeNotifier {
   /// override from swapping which link the card shows: a rule matching a later
   /// link is deliberately ignored.
   ///
-  /// Selection follows TDLib's own `get_first_url`
-  /// (td/telegram/MessageEntity.cpp), which walks the message's entities in
-  /// order and takes the first `Url` or `TextUrl` one. A `TextUrl` contributes
-  /// the target hidden behind its label, not the label — so a message whose
-  /// first link is disguised still keeps its preview, and a later link that does
-  /// have a rule cannot steal the slot. mithka only sends the entities its
-  /// composer made, so whatever no entity covers is scanned the way TDLib's
-  /// detector would have; see [_withoutEntitySpans] for which spans that leaves
-  /// out.
+  /// Selection follows TDLib's own `get_first_url` (td/telegram/MessageEntity.cpp)
+  /// over the merged entity list: the client's entities and the links its
+  /// detector finds in the leftover text, walked together in offset order. A
+  /// `TextUrl` contributes the target hidden behind its label, not the label —
+  /// so a message whose first link is disguised still keeps its preview, and a
+  /// later link that does have a rule cannot steal the slot. mithka sends only
+  /// the entities its composer made, so both halves are needed: a supplied
+  /// Url/TextUrl counts at its entity's offset, a link in the un-annotated text
+  /// counts where it sits, and whichever comes first in the text wins; see
+  /// [_withoutEntitySpans] for which spans the scan leaves out.
   @visibleForTesting
   static String? firstPreviewableUrl(
     String text, {
@@ -156,10 +157,33 @@ class LinkPreviewFixer extends ChangeNotifier {
   }) {
     if (text.isEmpty) return null;
     final ordered = _orderedEntities(entities, text.length);
+
+    final detected = _firstDetectedUrl(text, ordered);
+    var url = detected?.$2;
+    var start = detected?.$1 ?? -1;
+
+    // Each supplied Url/TextUrl is a candidate at its entity's offset — for a
+    // TextUrl, where its label sits. One whose URL is not a web link is
+    // skipped and the walk continues, exactly as TDLib walks past it.
     for (final entity in ordered) {
-      final url = _entityUrl(entity, text);
-      if (url != null) return url;
+      final candidate = _entityUrl(entity, text);
+      if (candidate == null) continue;
+      if (start < 0 || entity.offset < start) {
+        url = candidate;
+        start = entity.offset;
+      }
     }
+    return url;
+  }
+
+  /// The first link TDLib's detector would find in [text] outside the spans the
+  /// entities claim, with the offset it starts at — or null when there is none.
+  /// Masking blanks characters without moving any, so the offset is also the
+  /// link's offset in [text].
+  static (int, String)? _firstDetectedUrl(
+    String text,
+    List<MessageTextEntity> ordered,
+  ) {
     final searchable = _withoutEntitySpans(text, ordered);
     final schemed = _schemeUrl.firstMatch(searchable);
     final bare = _bareHost.firstMatch(searchable);
@@ -169,7 +193,8 @@ class LinkPreviewFixer extends ChangeNotifier {
         ? bare.start
         : schemed!.start;
     final url = trimmedUrl(searchable.substring(start));
-    return url.isEmpty ? null : url;
+    if (url.isEmpty) return null;
+    return (start, url);
   }
 
   /// [entities] in the order TDLib walks them: by offset, with anything that

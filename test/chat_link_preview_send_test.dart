@@ -19,10 +19,10 @@ Map<String, dynamic> _codeEntity(String text) => {
   'type': {'@type': 'textEntityTypeCode'},
 };
 
-/// A TDLib `textEntity` hiding [url] behind the first [length] characters.
-Map<String, dynamic> _textUrlEntity(int length, String url) => {
+/// A TDLib `textEntity` hiding [url] behind [length] characters at [offset].
+Map<String, dynamic> _textUrlEntity(int offset, int length, String url) => {
   '@type': 'textEntity',
-  'offset': 0,
+  'offset': offset,
   'length': length,
   'type': {'@type': 'textEntityTypeTextUrl', 'url': url},
 };
@@ -155,7 +155,7 @@ void main() {
     // swap which page the message previews.
     expect(
       await vm.sendFormatted('$label https://x.com/a/status/1', [
-        _textUrlEntity(label.length, 'https://example.test/article'),
+        _textUrlEntity(0, label.length, 'https://example.test/article'),
       ]),
       isTrue,
     );
@@ -170,7 +170,7 @@ void main() {
 
     expect(
       await vm.sendFormatted(label, [
-        _textUrlEntity(label.length, 'https://x.com/a/status/1'),
+        _textUrlEntity(0, label.length, 'https://x.com/a/status/1'),
       ]),
       isTrue,
     );
@@ -182,9 +182,53 @@ void main() {
     expect(sent['text'], label);
     expect(
       (sent['entities'] as List<dynamic>).first,
-      _textUrlEntity(label.length, 'https://x.com/a/status/1'),
+      _textUrlEntity(0, label.length, 'https://x.com/a/status/1'),
     );
     expect(content['link_preview_options'], {
+      '@type': 'linkPreviewOptions',
+      'is_disabled': false,
+      'url': 'https://fixupx.com/a/status/1',
+    });
+  });
+
+  test('a plain link first in the text beats a later hidden mirror', () async {
+    await enableFixer();
+    const label = 'Hidden target';
+    final vm = model();
+
+    // The first URL in the text is example.com — no mirror rule — so the
+    // preview stays on the sender's own first link instead of moving to the
+    // mirror of the X link hidden behind the later label.
+    expect(
+      await vm.sendFormatted('https://example.com/first $label', [
+        _textUrlEntity(
+          'https://example.com/first '.length,
+          label.length,
+          'https://x.com/a/status/1',
+        ),
+      ]),
+      isTrue,
+    );
+
+    expect(sentContent().containsKey('link_preview_options'), isFalse);
+  });
+
+  test('a hidden mirror first in the text still gets the override', () async {
+    await enableFixer();
+    const label = 'Hidden target';
+    final vm = model();
+
+    // Reverse order: the X link is the first URL (hidden behind the label that
+    // starts the text), so the preview moves to its mirror even though a plain
+    // example.com link follows.
+    expect(
+      await vm.sendFormatted('$label https://example.com/second', [
+        _textUrlEntity(0, label.length, 'https://x.com/a/status/1'),
+      ]),
+      isTrue,
+    );
+
+    expect(sentContent()['link_preview_options'], {
       '@type': 'linkPreviewOptions',
       'is_disabled': false,
       'url': 'https://fixupx.com/a/status/1',
@@ -198,7 +242,7 @@ void main() {
 
     expect(
       await vm.sendFormatted('$label and more words', [
-        _textUrlEntity(label.length, 'https://example.test/doc'),
+        _textUrlEntity(0, label.length, 'https://example.test/doc'),
       ]),
       isTrue,
     );
