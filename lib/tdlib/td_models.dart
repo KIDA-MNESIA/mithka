@@ -1715,8 +1715,7 @@ abstract final class TDParse {
         video: media.video,
         videoDuration: media.videoDuration,
         videoFileSize: media.videoFileSize,
-        hasSpoiler:
-            !isContentRestricted && (content?.boolean('has_spoiler') ?? false),
+        hasSpoiler: content?.boolean('has_spoiler') ?? false,
         videoNoteTranscription: videoNoteSpeech(content).$1,
         videoNoteTranscriptionPending: videoNoteSpeech(content).$2,
         videoNoteTranscriptionError: videoNoteSpeech(content).$3,

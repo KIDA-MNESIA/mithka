@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mithka/chat/media_spoiler.dart';
 import 'package:mithka/chat/message_bubble.dart';
 import 'package:mithka/components/photo_avatar.dart';
 import 'package:mithka/l10n/app_localizations.dart';
@@ -18,42 +19,44 @@ const _notice =
 
 /// A restricted photo whose retained file is NOT local, so rendering it can
 /// only go through the media loader's TDLib requests.
-ChatMessage _restrictedRemotePhoto(int id) => TDParse.message({
-  '@type': 'message',
-  'id': id,
-  'date': 1,
-  'content': {
-    '@type': 'messagePhoto',
-    'photo': {
-      '@type': 'photo',
-      'sizes': [
-        {
-          '@type': 'photoSize',
-          'type': 'x',
-          'width': 800,
-          'height': 600,
-          'photo': {
-            '@type': 'file',
-            'id': 7000 + id,
-            'size': 100,
-            'local': {
-              '@type': 'localFile',
-              'path': '',
-              'is_downloading_completed': false,
+ChatMessage _restrictedRemotePhoto(int id, {bool hasSpoiler = false}) =>
+    TDParse.message({
+      '@type': 'message',
+      'id': id,
+      'date': 1,
+      'content': {
+        '@type': 'messagePhoto',
+        if (hasSpoiler) 'has_spoiler': true,
+        'photo': {
+          '@type': 'photo',
+          'sizes': [
+            {
+              '@type': 'photoSize',
+              'type': 'x',
+              'width': 800,
+              'height': 600,
+              'photo': {
+                '@type': 'file',
+                'id': 7000 + id,
+                'size': 100,
+                'local': {
+                  '@type': 'localFile',
+                  'path': '',
+                  'is_downloading_completed': false,
+                },
+                'remote': {'@type': 'remoteFile', 'id': 'remote-$id'},
+              },
             },
-            'remote': {'@type': 'remoteFile', 'id': 'remote-$id'},
-          },
+          ],
         },
-      ],
-    },
-    'caption': {'@type': 'formattedText', 'text': ''},
-  },
-  'restriction_info': {
-    '@type': 'restrictionInfo',
-    'reason': 'terms',
-    'restriction_reason': _notice,
-  },
-})!;
+        'caption': {'@type': 'formattedText', 'text': ''},
+      },
+      'restriction_info': {
+        '@type': 'restrictionInfo',
+        'reason': 'terms',
+        'restriction_reason': _notice,
+      },
+    })!;
 
 void main() {
   // Every TDLib request in this file is answered by the recording proxy; the
@@ -194,4 +197,58 @@ void main() {
       await tester.pump(const Duration(seconds: 16));
     },
   );
+
+  testWidgets('revealing a restricted photo keeps the sender spoiler covered', (
+    tester,
+  ) async {
+    final controllerRequests = <Map<String, dynamic>>[];
+    // The sender's spoiler is an independent concealment: parsing a
+    // restricted message must keep the bit, so the auto-reveal of the
+    // restriction can never implicitly confirm the spoiler.
+    final message = _restrictedRemotePhoto(2, hasSpoiler: true);
+    expect(message.hasSpoiler, isTrue);
+    expect(message.isContentRestricted, isTrue);
+    expect(message.image, isNotNull);
+    final (theme, controller) = await pump(
+      tester,
+      message: message,
+      autoReveal: true,
+      controllerRequests: controllerRequests,
+    );
+    addTearDown(theme.dispose);
+    addTearDown(controller.dispose);
+
+    // Revealed by the preference: the sender's spoiler still covers the
+    // photo. The cover keeps hidden media unmounted, so the image loader
+    // never engages — the restriction reveal cannot confirm the spoiler.
+    await tester.pump();
+    await tester.pump();
+    expect(find.byType(MediaSpoiler), findsOneWidget);
+    expect(find.byType(TDImage), findsNothing);
+    loaderRequests.clear();
+    await tester.pump();
+    expect(loaderRequests, isEmpty);
+
+    // Let the cover's dust animation advance a frame so no fake timer is
+    // pending at teardown.
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  test('a non-restricted photo keeps its spoiler bit independently', () {
+    // The same parsed content without restriction_info: the spoiler bit
+    // survives on its own, no matter what the restriction path does.
+    final message = TDParse.message({
+      '@type': 'message',
+      'id': 3,
+      'date': 1,
+      'content': {
+        '@type': 'messagePhoto',
+        'has_spoiler': true,
+        'photo': const <String, dynamic>{'@type': 'photo', 'sizes': []},
+        'caption': {'@type': 'formattedText', 'text': ''},
+      },
+    });
+    expect(message!.isContentRestricted, isFalse);
+    expect(message.hasSpoiler, isTrue);
+  });
 }

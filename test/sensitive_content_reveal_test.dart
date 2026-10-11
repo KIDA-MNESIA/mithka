@@ -658,6 +658,72 @@ void main() {
     },
   );
 
+  testWidgets(
+    'a parsed restricted photo keeps its sender spoiler under auto reveal',
+    (tester) async {
+      final controller = SensitiveContentController.forTesting(
+        query: (_) async => {'@type': 'ok'},
+      );
+      addTearDown(controller.dispose);
+      // The exact repro: TDParse hands down restriction_info AND
+      // has_spoiler on the same messagePhoto. Parsing must keep both flags,
+      // and the auto-reveal of the restriction must not strip the spoiler.
+      final parsed = TDParse.message({
+        '@type': 'message',
+        'id': 105,
+        'date': 1,
+        'content': {
+          '@type': 'messagePhoto',
+          'has_spoiler': true,
+          'photo': {
+            '@type': 'photo',
+            'sizes': [
+              {
+                '@type': 'photoSize',
+                'type': 'x',
+                'width': 800,
+                'height': 600,
+                'photo': {
+                  '@type': 'file',
+                  'id': 9500,
+                  'size': 100,
+                  'local': {
+                    '@type': 'localFile',
+                    'path': '',
+                    'is_downloading_completed': false,
+                  },
+                  'remote': {'@type': 'remoteFile', 'id': 'r105'},
+                },
+              },
+            ],
+          },
+          'caption': {'@type': 'formattedText', 'text': 'Retained text'},
+        },
+        'restriction_info': {
+          '@type': 'restrictionInfo',
+          'reason': 'terms',
+          'restriction_reason': _termsNotice,
+        },
+      })!;
+      expect(parsed.isContentRestricted, isTrue);
+      expect(parsed.hasSpoiler, isTrue);
+
+      final theme = await _pumpMessages(
+        tester,
+        controller: controller,
+        messages: [parsed],
+        initialPreferences: const {'autoRevealRestrictedMedia': true},
+      );
+      addTearDown(theme.dispose);
+
+      // The restriction is revealed, but the sender's spoiler keeps its
+      // cover over the retained photo.
+      expect(_richText(_termsNotice), findsNothing);
+      expect(find.byType(MediaSpoiler), findsOneWidget);
+      await tester.pump(const Duration(milliseconds: 100));
+    },
+  );
+
   testWidgets('an album keeps its explicit spoilers under auto reveal', (
     tester,
   ) async {
