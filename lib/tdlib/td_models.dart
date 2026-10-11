@@ -21,6 +21,7 @@ class TdFileRef {
     this.localPath,
     this.fileName,
     this.mimeType,
+    this.size,
     this.miniThumb,
     this.thumbnail,
     this.hasAnimation = false,
@@ -30,6 +31,10 @@ class TdFileRef {
   final String? localPath;
   final String? fileName;
   final String? mimeType;
+
+  /// Bytes TDLib knows for this file: the real size once it is known,
+  /// otherwise the server's estimate. Null when neither is available.
+  final int? size;
   final bool hasAnimation;
   final int? photoId;
   Uint8List? miniThumb; // decoded JPEG for instant placeholder
@@ -41,6 +46,7 @@ class TdFileRef {
       localPath: _usablePath(localPath) ?? _usablePath(previous?.localPath),
       fileName: _usablePath(fileName) ?? _usablePath(previous?.fileName),
       mimeType: _usablePath(mimeType) ?? _usablePath(previous?.mimeType),
+      size: size ?? previous?.size,
       miniThumb: miniThumb ?? previous?.miniThumb,
       hasAnimation: hasAnimation || (previous?.hasAnimation ?? false),
       photoId: photoId ?? previous?.photoId,
@@ -4183,6 +4189,7 @@ abstract final class TDParse {
     return TdFileRef(
       id: ref.id,
       localPath: ref.localPath,
+      size: ref.size,
       miniThumb: ref.miniThumb,
       thumbnail: ref.thumbnail,
       hasAnimation: photoInfo.boolean('has_animation') ?? false,
@@ -4214,6 +4221,7 @@ abstract final class TDParse {
       localPath: completedLocalPath,
       fileName: fileName,
       mimeType: mimeType,
+      size: _fileSize(file),
       miniThumb: miniThumb,
       thumbnail: normalizedThumbnail,
     );

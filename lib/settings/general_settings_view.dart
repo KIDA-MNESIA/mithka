@@ -267,6 +267,16 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
                 // preference, so the switch the user sees is the live state.
                 onChanged: (value) => theme.forwardRichMarkdown = value,
               ),
+              SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-media-metadata'),
+                title: AppStringKeys.generalMediaMetadata,
+                subtitle: AppStringKeys.generalMediaMetadataHint,
+                value: theme.mediaMetadataEnabled,
+                leading: const SettingsLeadingIcon(
+                  icon: HeroAppIcons.circleInfo,
+                ),
+                onChanged: (value) => theme.mediaMetadataEnabled = value,
+              ),
               // Only mobile composers offer a camera button, so only they can
               // put a capture in the system album.
               if (!isDesktopTargetPlatform(Theme.of(context).platform))
