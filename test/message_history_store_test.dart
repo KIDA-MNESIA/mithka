@@ -40,6 +40,54 @@ class _StubResolver implements TosAccountUserIdResolver {
   Future<int?> resolve(int clientId) async => ids[clientId];
 }
 
+/// Stub resolver whose per-client lookups complete only when the test
+/// releases the held completer, so interleavings around identity resolution
+/// become deterministic.
+class _GatedResolver implements TosAccountUserIdResolver {
+  _GatedResolver(this.ids);
+
+  final Map<int, Completer<int?>> ids;
+
+  @override
+  Future<int?> resolve(int clientId) => ids[clientId]!.future;
+}
+
+/// Stub resolver that fails every lookup for [failing] clients; used to pin
+/// that a failed identity resolution never writes anything and that later
+/// events of the same client retry instead of caching the failure forever.
+class _FailingResolver implements TosAccountUserIdResolver {
+  _FailingResolver(this.ids, {this.failing = const {}});
+
+  final Map<int, int?> ids;
+  final Set<int> failing;
+
+  @override
+  Future<int?> resolve(int clientId) async {
+    if (failing.contains(clientId)) throw StateError('getMe lost');
+    return ids[clientId];
+  }
+}
+
+/// Stub resolver whose FIRST lookup per client is held until the test
+/// releases it; later lookups for the same client complete immediately —
+/// the shape of concurrent getMe calls where only the first is stuck.
+class _HoldFirstResolver implements TosAccountUserIdResolver {
+  _HoldFirstResolver(this.ids);
+
+  final Map<int, int?> ids;
+  final Map<int, Completer<int?>> _gates = {};
+
+  void release(int clientId, int? userId) => _gates[clientId]!.complete(userId);
+
+  @override
+  Future<int?> resolve(int clientId) {
+    if (_gates.containsKey(clientId)) return Future.value(ids[clientId]);
+    final gate = Completer<int?>();
+    _gates[clientId] = gate;
+    return gate.future;
+  }
+}
+
 Map<String, dynamic> _message(
   int chatId,
   int messageId, {
@@ -747,4 +795,242 @@ void main() {
     expect(entry.events[0].newText, 'v1');
     expect(entry.events[1].newText, 'v2');
   });
+
+  // ---------------------------------------------------------------------------
+  // Pending-work invalidation, arrival ordering, failed resolutions
+  // (second review round)
+  // ---------------------------------------------------------------------------
+
+  test(
+    'removeAccount during a held identity lookup keeps the mirror empty',
+    () async {
+      final gates = {_clientA: Completer<int?>(), _clientB: Completer<int?>()};
+      store.accountUserIdResolver = _GatedResolver(gates);
+      await start();
+      gates[_clientA]!.complete(_accountA);
+      await pump();
+      notifications = 0;
+
+      // The new message for account B arrives while its client identity is
+      // still being resolved.
+      emitAs(_clientB, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'from B'),
+      });
+      await pump();
+
+      // The slot is logged out / removed before the lookup completes.
+      store.removeAccount(_accountB);
+      expect(store.entryCount, 0);
+      await pump();
+      expect(store.entryCount, 0);
+      // The removal's account-context invalidation notifies legitimately.
+      notifications = 0;
+
+      // The lookup completes AFTER the removal: its pending work must be
+      // invalidated, not resurrect the removed account's history.
+      gates[_clientB]!.complete(_accountB);
+      await pump();
+      await pump();
+
+      expect(store.entryCount, 0);
+      expect(store.entries, isEmpty);
+      expect(notifications, 0);
+
+      await store.persistNowForTesting();
+      // No record may have been persisted either: the resurrection would
+      // have armed the batched writer for the removed account's entry.
+      expect(persistedJson()['entries'], isEmpty);
+    },
+  );
+
+  test(
+    'held first lookup does not reorder a client\'s arrival chain',
+    () async {
+      final held = _HoldFirstResolver({
+        _clientA: _accountA,
+        _clientB: _accountB,
+      });
+      store.accountUserIdResolver = held;
+      await start();
+      held.release(_clientA, _accountA);
+      await pump();
+      notifications = 0;
+
+      // One client's updates arrive in this TDLib order.
+      emitAs(_clientB, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'before edit'),
+      });
+      emitAs(_clientB, 'updateMessageEdited', {
+        'chat_id': '11',
+        'message_id': 100,
+        'edit_date': 111,
+      });
+      emitAs(_clientB, 'updateMessageContent', {
+        'chat_id': '11',
+        'message_id': 100,
+        'new_content': {
+          '@type': 'messageText',
+          'text': {'@type': 'formattedText', 'text': 'after edit'},
+        },
+      });
+      await pump();
+
+      // Identity resolution completes only now; the already-arrived chain
+      // must still apply in arrival order.
+      held.release(_clientB, _accountB);
+      await pump();
+      await pump();
+
+      store.debugSetActiveAccount(_accountB);
+      final entry = store.entry(11, 100)!;
+      expect(entry.text, 'after edit');
+      expect(entry.isEdited, isTrue, reason: 'the edit event must survive');
+      expect(entry.events.single.editDate, 111);
+      expect(entry.events.single.oldText, 'before edit');
+      expect(entry.events.single.newText, 'after edit');
+    },
+  );
+
+  test('a failing resolution drops the updates and later ones retry', () async {
+    final gates = {_clientA: Completer<int?>(), _clientB: Completer<int?>()};
+    store.accountUserIdResolver = _GatedResolver(gates);
+    await start();
+    gates[_clientA]!.complete(_accountA);
+    await pump();
+
+    emitAs(_clientB, 'updateNewMessage', {
+      'message': _message(11, 100, text: 'from B'),
+    });
+    await pump();
+    // Failing the first lookup drops that client's queued events; nothing
+    // may be written, guessed or partially recorded.
+    gates[_clientB]!.completeError(StateError('getMe lost'));
+    await pump();
+    await pump();
+    expect(store.entryCount, 0);
+    expect(store.entries, isEmpty);
+
+    // The next event starts a fresh resolution attempt.
+    gates[_clientB] = Completer<int?>()..complete(_accountB);
+    emitAs(_clientB, 'updateNewMessage', {
+      'message': _message(11, 100, text: 'second attempt'),
+    });
+    await pump();
+    await pump();
+    store.debugSetActiveAccount(_accountB);
+    expect(store.entry(11, 100)!.text, 'second attempt');
+  });
+
+  test('a throwing resolver keeps the mirror inert on every attempt', () async {
+    store.accountUserIdResolver = _FailingResolver(
+      {_clientA: _accountA, _clientB: _accountB},
+      failing: {_clientB},
+    );
+    await start();
+    notifications = 0;
+
+    emitAs(_clientB, 'updateNewMessage', {
+      'message': _message(11, 100, text: 'from B'),
+    });
+    emitAs(_clientB, 'updateDeleteMessages', {
+      'chat_id': '11',
+      'message_ids': ['100'],
+      'is_permanent': true,
+      'from_cache': false,
+    });
+    await pump();
+    await pump();
+    await pump();
+
+    expect(store.entryCount, 0);
+    expect(store.entries, isEmpty);
+    expect(notifications, 0);
+
+    // A resolvable client keeps recording next to the failing one.
+    emitAs(_clientA, 'updateNewMessage', {
+      'message': _message(11, 100, text: 'from A'),
+    });
+    await pump();
+    expect(store.entryCount, 1);
+    store.debugSetActiveAccount(_accountA);
+    expect(store.entries.single.text, 'from A');
+  });
+
+  test(
+    'an active account whose re-resolution fails keeps the viewer empty',
+    () async {
+      final gates = {_clientA: Completer<int?>(), _clientB: Completer<int?>()};
+      store.accountUserIdResolver = _GatedResolver(gates);
+      await start();
+      gates[_clientA]!.complete(_accountA);
+      await pump();
+
+      emitAs(_clientA, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'from A'),
+      });
+      await pump();
+      store.debugSetActiveAccount(_accountA);
+      expect(store.entries.single.text, 'from A');
+      notifications = 0;
+
+      // Switch the active client to B; the store must drop to unresolved
+      // (empty) and notify the viewer IMMEDIATELY, not only when the
+      // resolution lands.
+      store.activeClientIdProvider = () => _clientB;
+      activeSlotChanges.add(_clientB);
+      await pump();
+      expect(store.activeAccountUserId, isNull);
+      expect(store.entries, isEmpty);
+      expect(notifications, greaterThan(0));
+
+      // B's resolution fails: still empty, still notified, never A's rows.
+      notifications = 0;
+      gates[_clientB]!.completeError(StateError('getMe lost'));
+      await pump();
+      await pump();
+      expect(store.activeAccountUserId, isNull);
+      expect(store.entries, isEmpty);
+      expect(store.entryCount, 1, reason: 'A’s copy must be untouched');
+      expect(notifications, greaterThan(0));
+
+      // Recovering the resolution on a later attempt shows B's rows.
+      gates[_clientB] = Completer<int?>()..complete(_accountB);
+      emitAs(_clientB, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'from B'),
+      });
+      await pump();
+      await pump();
+      expect(store.activeAccountUserId, _accountB);
+      expect(store.entries.single.text, 'from B');
+    },
+  );
+
+  test(
+    'a switch away clears the active scope immediately, before resolution',
+    () async {
+      final gates = {
+        _clientA: Completer<int?>()..complete(_accountA),
+        _clientB: Completer<int?>(),
+      };
+      store.accountUserIdResolver = _GatedResolver(gates);
+      await start();
+      await pump();
+
+      emitAs(_clientA, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'from A'),
+      });
+      await pump();
+      expect(store.entries.single.text, 'from A');
+
+      // The slot switches to an unresolved client: the accessors must read
+      // empty from that very moment (they do), and the switch itself must
+      // notify so listeners re-read them.
+      notifications = 0;
+      store.activeClientIdProvider = () => _clientB;
+      activeSlotChanges.add(_clientB);
+      await pump();
+      expect(store.entries, isEmpty);
+      expect(notifications, greaterThan(0));
+    },
+  );
 }

@@ -8,6 +8,7 @@
 //  feature does not exist, so the whole file skips.
 //
 
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -84,6 +85,17 @@ String _editStamp(int unixSeconds) {
   final t = DateTime.fromMillisecondsSinceEpoch(unixSeconds * 1000).toLocal();
   String two(int v) => v.toString().padLeft(2, '0');
   return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
+}
+
+/// Resolver stub whose lookups are held until released, so the viewer test
+/// can pin the unresolved-account rendering path.
+class _GatedResolver implements TosAccountUserIdResolver {
+  _GatedResolver(this.ids);
+
+  final Map<int, Completer<int?>> ids;
+
+  @override
+  Future<int?> resolve(int clientId) => ids[clientId]!.future;
 }
 
 void main() {
@@ -249,4 +261,49 @@ void main() {
 
     expect(store.isChatExcluded(11), isFalse);
   });
+
+  testWidgets(
+    'a failed re-resolution of the active account clears the rendered rows',
+    (tester) async {
+      final gates = {
+        101: Completer<int?>()..complete(7001),
+        202: Completer<int?>(),
+      };
+      final slotChanges = StreamController<int>.broadcast();
+      addTearDown(slotChanges.close);
+      store.accountUserIdResolver = _GatedResolver(gates);
+      store.activeClientIdProvider = () => 101;
+      store.updateSource = (_) => const Stream.empty();
+      store.activeSlotChangeSource = () => slotChanges.stream;
+      store.startObserving();
+      await tester.pump();
+
+      // Account A's rows are on screen, the way the viewer legitimately
+      // looks while its account is resolved.
+      store.debugSeed([_entry(11, 100, accountUserId: 7001, text: 'kept one')]);
+      await _pumpViewer(tester, store);
+      expect(find.text('kept one'), findsOneWidget);
+
+      // The active client switches to B while B's identity is unresolved:
+      // the store drops to empty and must notify the viewer NOW, so the
+      // rows of the previous account leave the screen at once.
+      store.activeClientIdProvider = () => 202;
+      slotChanges.add(202);
+      await tester.pump();
+
+      // B's resolution FAILS: the empty state must be the terminal one.
+      // (Store.entries already reads [] while unresolved; the regression
+      // was that no notification ever reached the real listeners.)
+      gates[202]!.completeError(StateError('getMe lost'));
+      await tester.pump();
+      await tester.pump();
+
+      expect(store.entries, isEmpty);
+      expect(find.text('kept one'), findsNothing);
+      expect(
+        find.text(AppStringKeys.historyEmpty.l10n(_contextOf(tester))),
+        findsOneWidget,
+      );
+    },
+  );
 }

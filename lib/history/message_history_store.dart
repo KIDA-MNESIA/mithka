@@ -311,9 +311,25 @@ class MessageHistoryStore extends ChangeNotifier {
   /// entry even when the chat/message ids are identical.
   final Map<String, int> _pendingEditDates = {};
 
-  /// Per-account update ordering: every account's updates are handled one
-  /// after another, so a burst of edits and deletions cannot interleave.
-  final Map<int, Future<void>> _accountWorkers = {};
+  /// Identity resolution state per TDLib client. While a lookup is in
+  /// flight every arrival of that client shares it; a known identity stays
+  /// memoized for later events, a failed one is dropped so the next
+  /// arrival starts a fresh attempt instead of caching the failure.
+  final Map<int, Future<int?>> _identityFutures = {};
+
+  /// Per-CLIENT arrival chains: an update joins its client's chain before
+  /// identity resolution, so a client's records apply in TDLib arrival
+  /// order no matter how long its getMe takes. Different clients stay
+  /// parallel.
+  final Map<int, Future<void>> _clientWorkers = {};
+
+  /// Generation of the store's contents. Removals, clears and disposal
+  /// bump it; an async continuation captures it when its update ARRIVES
+  /// (or its load starts) and re-checks before writing, so work queued
+  /// before the invalidation can never resurrect the cleared state. Work
+  /// queued after the bump — e.g. updates of a still-connected client
+  /// following a logout — carries the new generation and records again.
+  int _generation = 0;
 
   /// Resolved user id of the active client, kept in sync with
   /// [TosAccountUserIdResolver] results; null while unresolved.
@@ -340,6 +356,7 @@ class MessageHistoryStore extends ChangeNotifier {
   Timer? _persistTimer;
   bool _persisting = false;
   bool _dirtyWhilePersisting = false;
+  bool _disposed = false;
 
   /// Directory holding the mirror file. Resolved lazily; tests inject one.
   Directory? fileDir;
@@ -452,11 +469,18 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Re-resolves the active account's user id when the active client
   /// changes; the viewer and the exclusion APIs read the cached result.
+  /// EVERY terminal state notifies: the switch itself (the account context
+  /// changed, so the viewer must re-read immediately, dropping the previous
+  /// account's rows), success (rows appear) and failure (empty is the
+  /// terminal state, so the stale rows must leave the screen there too).
   void _refreshActiveAccount() {
     final clientId = _currentClientId;
     if (clientId == null) {
+      final hadContext =
+          _activeAccountUserId != null || _activeAccountUserIdSource != null;
       _activeAccountUserId = null;
       _activeAccountUserIdSource = null;
+      if (hadContext) notifyListeners();
       return;
     }
     if (_activeAccountUserIdSource == clientId &&
@@ -465,10 +489,23 @@ class MessageHistoryStore extends ChangeNotifier {
     }
     _activeAccountUserIdSource = clientId;
     _activeAccountUserId = null;
+    notifyListeners();
+    final generation = _generation;
     unawaited(
-      _resolveAccountUserId(clientId).then((userId) {
+      // A test (or a falling-back production) resolver may complete with an
+      // error; the failure is a terminal state of the resolution, so it is
+      // flattened to null here and notified like every other outcome.
+      _resolveAccountUserId(
+        clientId,
+      ).then<int?>((userId) => userId, onError: (Object _) => null).then((
+        userId,
+      ) {
+        if (_disposed || _generation != generation) return;
         // A newer active client may have taken over while this one resolved.
-        if (_currentClientId != clientId || userId == null) return;
+        if (_currentClientId != clientId || userId == null) {
+          notifyListeners();
+          return;
+        }
         _activeAccountUserId = userId;
         notifyListeners();
       }),
@@ -481,6 +518,9 @@ class MessageHistoryStore extends ChangeNotifier {
   @visibleForTesting
   @override
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _generation++;
     _tdSub?.cancel();
     _tdSub = null;
     _activeSlotSub?.cancel();
@@ -530,28 +570,92 @@ class MessageHistoryStore extends ChangeNotifier {
     unawaited(_handleUpdateForClient(clientId, update));
   }
 
-  /// Handles one update for [clientId], preserving per-account ordering:
-  /// each account's updates run strictly one after another, while different
-  /// accounts may resolve concurrently.
+  /// Handles one update for [clientId]. The update joins its client's
+  /// chain BEFORE identity resolution, so a client's records apply in
+  /// TDLib arrival order even when a lookup is slow or stuck; different
+  /// clients resolve and record concurrently. The generation is captured
+  /// at ARRIVAL so invalidations that land while the update is queued or
+  /// resolving can drop it before it writes.
   Future<void> _handleUpdateForClient(
     int clientId,
     Map<String, dynamic> update,
   ) async {
-    final userId = await _resolveAccountUserId(clientId);
-    if (userId == null) return; // unattributable — never guess
-    final previous = _accountWorkers[userId] ?? Future<void>.value();
+    final arrivalGeneration = _generation;
+    final previous = _clientWorkers[clientId] ?? Future<void>.value();
     final worker = previous
         .catchError((_) {})
-        .then((_) => _recordUpdate(userId, update));
-    _accountWorkers[userId] = worker;
+        .then(
+          (_) => _processUpdateForClient(clientId, update, arrivalGeneration),
+        );
+    _clientWorkers[clientId] = worker;
     try {
       await worker;
     } finally {
-      // Removing the chain slot returns the worker future we already await.
-      if (identical(_accountWorkers[userId], worker)) {
-        unawaited(_accountWorkers.remove(userId));
+      if (identical(_clientWorkers[clientId], worker)) {
+        unawaited(_clientWorkers.remove(clientId));
       }
     }
+  }
+
+  /// The chain job of one update: wait for the client's identity (memoized
+  /// per client), then record in arrival order. A failed resolution drops
+  /// this client's queued events for this attempt — unattributable updates
+  /// are never guessed — and the next arrival starts a fresh attempt. An
+  /// invalidation (removal, clear, disposal) that landed after the update
+  /// arrived drops the write: pending work can never resurrect cleared or
+  /// removed history.
+  Future<void> _processUpdateForClient(
+    int clientId,
+    Map<String, dynamic> update,
+    int arrivalGeneration,
+  ) async {
+    final userId = await _identityOf(clientId);
+    if (userId == null) return; // unattributable — never guess
+    if (_disposed || _generation != arrivalGeneration) return;
+    unawaited(_recordUpdate(userId, update));
+    // New evidence about the ACTIVE client's identity: when the active
+    // resolution already failed (or was dropped), a successful resolution
+    // here reconciles the active account instead of leaving the viewer
+    // empty until the next slot switch.
+    if (clientId == _activeAccountUserIdSource &&
+        _activeAccountUserId == null) {
+      _activeAccountUserId = userId;
+      notifyListeners();
+    }
+  }
+
+  /// Identity resolution memoized per client: concurrent events share the
+  /// in-flight lookup, and a KNOWN identity stays cached for the client's
+  /// following events. A failed or unresolved lookup (exception, null,
+  /// invalidation) is dropped from the memo so the next arrival starts a
+  /// fresh attempt instead of caching the failure.
+  Future<int?> _identityOf(int clientId) {
+    final inFlight = _identityFutures[clientId];
+    if (inFlight != null) return inFlight;
+    final generation = _generation;
+    // The lookup starts synchronously (no extra event-loop hop): the chain
+    // job of a just-arrived update must complete within the same drain, the
+    // way the per-account worker did before arrival-order queueing existed.
+    Future<int?> settle(Future<int?> lookup) => lookup.then<int?>((userId) {
+      final invalidated = _disposed || _generation != generation;
+      final resolved = invalidated ? null : userId;
+      if (resolved == null) _identityFutures.remove(clientId);
+      return resolved;
+    });
+    Future<int?> attempt;
+    try {
+      attempt = settle(_resolver.resolve(clientId)).catchError((Object _) {
+        // Resolution failed: forget the attempt so a later event retries.
+        _identityFutures.remove(clientId);
+        return null;
+      });
+    } catch (_) {
+      // A resolver that throws synchronously (instead of returning a failed
+      // future) resolves to nothing; the next arrival starts a new attempt.
+      return Future<int?>.value();
+    }
+    _identityFutures[clientId] = attempt;
+    return attempt;
   }
 
   Future<void> _recordUpdate(int accountUserId, Map<String, dynamic> update) {
@@ -740,7 +844,8 @@ class MessageHistoryStore extends ChangeNotifier {
   }
 
   /// Removes the active account's kept copies of [chatId]; returns how many
-  /// went away.
+  /// went away. Bumps the generation so an in-flight load cannot re-add the
+  /// cleared rows from the mirror file afterwards.
   int clearChat(int chatId) {
     if (!allowTelegramTosViolations) return 0;
     final accountUserId = _activeAccountUserId;
@@ -754,6 +859,7 @@ class MessageHistoryStore extends ChangeNotifier {
     for (final key in keys) {
       _byKey.remove(key);
     }
+    _generation++;
     notifyListeners();
     _schedulePersist();
     return keys.length;
@@ -761,12 +867,15 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Removes every kept copy of every account; returns how many went away.
   /// Deliberately global: "clear everything" must not leave invisible
-  /// mirrors behind.
+  /// mirrors behind. Bumps the generation so pending queued updates and an
+  /// in-flight load cannot resurrect any of it.
   int clearAll() {
     if (!allowTelegramTosViolations) return 0;
     if (_byKey.isEmpty) return 0;
     final removed = _byKey.length;
     _byKey.clear();
+    _pendingEditDates.clear();
+    _generation++;
     notifyListeners();
     _schedulePersist();
     return removed;
@@ -774,7 +883,10 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Forgets an account entirely: its kept copies, its pending edit dates
   /// and its exclusion preference. Called when a slot is logged out or
-  /// removed; account identity is known there, so nothing is guessed.
+  /// removed; account identity is known there, so nothing is guessed. The
+  /// generation bump invalidates every in-flight resolution, queued update
+  /// and load continuation that still targets this account: pending work
+  /// can never recreate history after logout/removal.
   void removeAccount(int accountUserId) {
     if (!allowTelegramTosViolations) return;
     var changed = false;
@@ -791,8 +903,13 @@ class MessageHistoryStore extends ChangeNotifier {
     );
     if (_excludedChatsByAccount.remove(accountUserId) != null) changed = true;
     unawaited(_prefs?.remove('$_prefsKeyPrefix$accountUserId'));
+    _generation++;
+    if (_activeAccountUserId == accountUserId) {
+      _activeAccountUserId = null;
+      _activeAccountUserIdSource = null;
+    }
+    notifyListeners();
     if (changed) {
-      notifyListeners();
       _schedulePersist();
     }
   }
@@ -813,13 +930,18 @@ class MessageHistoryStore extends ChangeNotifier {
 
   Future<void> ensureLoaded() async {
     if (!allowTelegramTosViolations) return;
-    if (_loaded) return;
+    if (_loaded || _disposed) return;
     _loaded = true;
+    final generation = _generation;
     try {
       final dir = fileDir ?? await getApplicationSupportDirectory();
       final file = File('${dir.path}/$_fileName');
       if (!await file.exists()) return;
       final decoded = jsonDecode(await file.readAsString());
+      // The generation re-check drops the load when the store was cleared,
+      // an account removed or disposed while the file was being read: a
+      // fresh on-disk batch must never resurrect the invalidated state.
+      if (_disposed || _generation != generation) return;
       if (decoded is! Map) return;
       final raw = decoded['entries'];
       if (raw is! List) return;
@@ -832,6 +954,7 @@ class MessageHistoryStore extends ChangeNotifier {
     } catch (_) {
       // A corrupt mirror must never break the app; start over on next write.
     }
+    if (_disposed || _generation != generation) return;
     notifyListeners();
   }
 
