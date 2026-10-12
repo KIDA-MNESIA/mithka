@@ -30,8 +30,10 @@ import '../components/confirm_dialog.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../l10n/app_localizations.dart';
 import '../notifications/notification_settings_payload.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -257,6 +259,13 @@ List<int> takeNewlyVisibleForumTopicMessageIds({
   }
   return visible;
 }
+
+/// Whether the viewport report may leave the app: ghost mode (compile-time
+/// opt-in only) withholds it exactly like the ordinary chat read reports.
+/// Kept as a plain function so both flag variants can pin the decision.
+bool shouldReportForumTopicReads(int chatId) =>
+    !(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock);
 
 typedef ForumTopicMessageQuery =
     Future<Map<String, dynamic>> Function(Map<String, dynamic> request);
@@ -1329,6 +1338,9 @@ class _TopicChatViewState extends State<TopicChatView> {
       alreadyReported: _reportedVisibleMessageIds,
     );
     if (visible.isEmpty) return;
+    // Ghost mode withholds the read report for forum topics too; the
+    // locally tracked visible set below keeps working.
+    if (!shouldReportForumTopicReads(widget.chat.id)) return;
     TdClient.shared.send(
       forumTopicViewMessagesRequest(
         chatId: widget.chat.id,

@@ -55,6 +55,7 @@ import 'chat/group_remark_controller.dart';
 import 'chat/music_player_controller.dart';
 import 'chats/chat_folder_tag_controller.dart';
 import 'components/drawer_controller.dart' as dc;
+import 'config/build_flags.dart';
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
 import 'media/video_playback_reporting.dart';
@@ -77,6 +78,7 @@ import 'settings/business_service.dart';
 import 'settings/country_message_filter.dart';
 import 'settings/desktop_hotkey_controller.dart';
 import 'settings/developer_mode_controller.dart';
+import 'settings/ghost_mode_controller.dart';
 import 'settings/hidden_sender_store.dart';
 import 'settings/keyword_blocker.dart';
 import 'settings/safety_notice_controller.dart';
@@ -248,6 +250,11 @@ Future<void> _bootstrapAndRunApp() async {
   KeywordBlocker.shared.initialize(prefs);
   HiddenSenderStore.shared.initialize(prefs);
   CountryMessageFilter.shared.initialize(prefs);
+  // Compile-time gated: reads persisted ghost-mode prefs and pushes the
+  // `online` TDLib option only in opted-in self-built binaries.
+  if (allowTelegramTosViolations) {
+    GhostModeController.shared.initialize(prefs);
+  }
   unawaited(SensitiveContentController.shared.initialize());
   MusicPlayerController.shared.initialize(prefs);
   // Preload Telegram blocked-user list so chat filters have data right away.
@@ -638,6 +645,9 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
         KeywordBlocker.shared.initialize(widget.prefs);
         HiddenSenderStore.shared.initialize(widget.prefs);
         CountryMessageFilter.shared.initialize(widget.prefs);
+        if (allowTelegramTosViolations) {
+          GhostModeController.shared.initialize(widget.prefs);
+        }
         MusicPlayerController.shared.initialize(widget.prefs);
         BlockedUserService.shared.enabled = nextTheme.hideBlockedUserMessages;
         if (nextTheme.hideBlockedUserMessages) {
