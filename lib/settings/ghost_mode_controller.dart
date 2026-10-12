@@ -125,12 +125,20 @@ class GhostModeController extends ChangeNotifier {
               'authorizationStateReady') {
             return;
           }
+          // Initialization deliberately touches no client: at this point no
+          // client's presence has been read, TDLib clients start offline and
+          // master sends nothing, so pushing any value here (true above all)
+          // would drive presence the user never asked for. Clients that log
+          // in afterwards are taken over through the same guarded helper as
+          // a toggle, and only while interception is actually active.
           if (!shouldShareOnline()) return;
           final clientId = update.integer('@client_id');
           if (clientId == null) return;
-          applyOnlineStatusToClient(false, clientId, TdClient.shared);
+          unawaited(_takeOverClientOnline(clientId));
         });
-    unawaited(applyOnlineStatus());
+    // No applyOnlineStatus() here: initialization must stay inert. Persisted
+    // enabled state re-arms on the next real transition (toggle or a client
+    // becoming ready), where the client's own presence can be read first.
   }
 
   /// Resolves [chatId] against the global switch and its exception state.
@@ -181,7 +189,7 @@ class GhostModeController extends ChangeNotifier {
     if (_globalEnabled == value) return;
     _globalEnabled = value;
     await _prefs?.setBool(_globalEnabledKey, value);
-    unawaited(applyOnlineStatus());
+    await _applyOnlineInterception();
     notifyListeners();
   }
 
@@ -210,7 +218,7 @@ class GhostModeController extends ChangeNotifier {
     if (_hideOnline == value) return;
     _hideOnline = value;
     await _prefs?.setBool(_hideOnlineKey, value);
-    unawaited(applyOnlineStatus());
+    await _applyOnlineInterception();
     notifyListeners();
   }
 
@@ -227,19 +235,68 @@ class GhostModeController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Pushes the TDLib `online` option to every registered account client.
-  ///
-  /// `online` is an account-scoped option, not a chat property, so no
-  /// per-chat exception applies.
-  Future<void> applyOnlineStatus({TdClient? client}) async {
+  /// The presence each client had before ghost mode took its `online`
+  /// option over. Keyed by TDLib client id; a missing entry means the client
+  /// was never taken over, so releasing it must not send anything either.
+  final Map<int, bool> _preTakeoverOnline = {};
+
+  /// Applies the current interception state to every registered client:
+  /// turning ON reads and records each client's own presence and forces it
+  /// offline; turning OFF hands the recorded presence back. Clients never
+  /// taken over stay untouched — in particular, disabling ghost mode never
+  /// pushes `online=true` out of nowhere.
+  Future<void> _applyOnlineInterception() async {
     if (!isAvailable) return;
-    final td = client ?? TdClient.shared;
-    final online = !shouldShareOnline();
+    final td = TdClient.shared;
     for (final clientId in td.registeredClientIds.toList()) {
-      applyOnlineStatusToClient(online, clientId, td);
+      if (shouldShareOnline()) {
+        await _takeOverClientOnline(clientId, client: td);
+      } else {
+        _restoreClientOnline(clientId, client: td);
+      }
     }
   }
 
+  /// Forces one client offline while interception is active, after recording
+  /// the presence it had, so releasing it later can restore exactly that.
+  /// Idempotent: a client already taken over is left as-is.
+  Future<void> _takeOverClientOnline(int clientId, {TdClient? client}) async {
+    if (_preTakeoverOnline.containsKey(clientId)) return;
+    final td = client ?? TdClient.shared;
+    bool captured = true;
+    try {
+      final option = await td.queryTo({
+        '@type': 'getOption',
+        'name': 'online',
+      }, clientId);
+      // getOption answers with the optionValueBoolean object itself:
+      // {'@type': 'optionValueBoolean', 'value': <bool>}.
+      captured =
+          option.boolean('value') ??
+          // An unreadable option still means an app user: TDLib's effective
+          // default is the online state the app keeps for its user.
+          true;
+    } catch (_) {
+      captured = true;
+    }
+    // A restore may have raced this read (e.g. the global switch flipped
+    // while the getOption was in flight); honor the latest state instead of
+    // clobbering it with a stale takeover.
+    if (!shouldShareOnline()) return;
+    _preTakeoverOnline[clientId] = captured;
+    applyOnlineStatusToClient(false, clientId, td);
+  }
+
+  /// Hands one client's `online` option back after a takeover. Sends only
+  /// when the client is actually in the takeover map, so ordinary presence
+  /// is never touched, and drops the entry so the next takeover re-reads.
+  void _restoreClientOnline(int clientId, {required TdClient client}) {
+    final recorded = _preTakeoverOnline.remove(clientId);
+    if (recorded == null) return;
+    applyOnlineStatusToClient(recorded, clientId, client);
+  }
+
+  /// Pushes an explicit `online` value to one client. Public for tests.
   @visibleForTesting
   void applyOnlineStatusToClient(bool online, int clientId, TdClient client) {
     client.sendTo({

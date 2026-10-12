@@ -21,21 +21,57 @@ void main() {
 
   final updates = StreamController<Map<String, dynamic>>.broadcast();
   final requests = <Map<String, dynamic>>[];
+  final queries = <Map<String, dynamic>>[];
+  // queries + sends in true arrival order, so a takeover's read-before-write
+  // can be pinned.
+  final wire = <Map<String, dynamic>>[];
+
+  /// Canned getOption('online') answer for the running test: a bool answers
+  /// optionValueBoolean, a map is returned verbatim (e.g. a TDLib error),
+  /// null falls through to the plain 'ok' default (option unreadable).
+  Object? onlineOptionReply;
   late SharedPreferences prefs;
 
   setUpAll(() {
     TdClient.shared.configureProxy(
       TdClientProxyTransport(
         accountSlot: 0,
-        query: (_) async => <String, dynamic>{'@type': 'ok'},
-        send: (request) async => requests.add(request),
+        query: (request) async {
+          queries.add(request);
+          wire.add(request);
+          if (request['@type'] == 'getOption' && request['name'] == 'online') {
+            final reply = onlineOptionReply;
+            if (reply is bool) {
+              return <String, dynamic>{
+                '@type': 'optionValueBoolean',
+                'value': reply,
+              };
+            }
+            if (reply is Map<String, dynamic>) return reply;
+          }
+          return <String, dynamic>{'@type': 'ok'};
+        },
+        send: (request) async {
+          requests.add(request);
+          wire.add(request);
+        },
         updates: updates.stream,
       ),
     );
   });
 
   setUp(() async {
+    // A previous test may have left ghost mode on; turning it off hands the
+    // taken-over clients their captured presence back so every test starts
+    // from empty takeover bookkeeping. Its restore send lands before the
+    // recorders below are cleared.
+    if (GhostModeController.shared.globalEnabled) {
+      await GhostModeController.shared.setGlobalEnabled(false);
+    }
     requests.clear();
+    queries.clear();
+    wire.clear();
+    onlineOptionReply = null;
     SharedPreferences.setMockInitialValues({});
     prefs = await SharedPreferences.getInstance();
     // Reset the shared controller against a clean store for every test.
@@ -70,10 +106,21 @@ void main() {
     });
     prefs = await SharedPreferences.getInstance();
     GhostModeController.shared.initialize(prefs);
-    // initialize() replays the `online` option onto every registered client;
-    // drain that burst so tests observe only their own requests.
+    // No drain needed: initialize() must not touch the `online` option at
+    // all, whatever the persisted state is. Keep one turn so any accidental
+    // microtask still lands before the test's own requests.
     await Future<void>.delayed(Duration.zero);
-    requests.clear();
+  }
+
+  /// Delivers an authorizationStateReady update the way a client logging in
+  /// would, then lets the controller's async takeover run to completion.
+  Future<void> deliverReady() async {
+    updates.add({
+      '@type': 'updateAuthorizationState',
+      'authorization_state': {'@type': 'authorizationStateReady'},
+    });
+    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(Duration.zero);
   }
 
   if (!allowTelegramTosViolations) {
@@ -174,39 +221,204 @@ void main() {
       expect(GhostModeController.shared.shouldShareOnline(), isTrue);
     });
 
-    test('toggle pushes the online option to the registered client', () async {
-      await initializeWith(globalEnabled: false);
-      requests.clear();
-      await GhostModeController.shared.setGlobalEnabled(true);
-      expect(requests.where((request) => request['@type'] == 'setOption'), [
-        {
-          '@type': 'setOption',
-          'name': 'online',
-          'value': {'@type': 'optionValueBoolean', 'value': false},
-        },
-      ]);
+    test(
+      'toggle to enabled takes over and forces the option offline',
+      () async {
+        await initializeWith(globalEnabled: false);
+        requests.clear();
+        wire.clear();
+        queries.clear();
+        await GhostModeController.shared.setGlobalEnabled(true);
+        expect(requests.where((request) => request['@type'] == 'setOption'), [
+          {
+            '@type': 'setOption',
+            'name': 'online',
+            'value': {'@type': 'optionValueBoolean', 'value': false},
+          },
+        ]);
+        // The takeover must READ the client's own presence before writing.
+        expect(
+          queries,
+          everyElement(
+            isA<Map<String, dynamic>>()
+                .having((m) => m['@type'], 'type', 'getOption')
+                .having((m) => m['name'], 'name', 'online'),
+          ),
+        );
+        expect(queries, hasLength(1));
+        expect(wire.first['@type'], 'getOption', reason: 'read before write');
+      },
+    );
+
+    test('toggling off restores the pre-takeover online option', () async {
+      await initializeWith();
+      // The user was offline before ghost mode took over; release must
+      // hand back exactly that, not an unconditional true.
+      onlineOptionReply = false;
+      await deliverReady();
       requests.clear();
       await GhostModeController.shared.setGlobalEnabled(false);
       expect(
         requests
             .where((request) => request['@type'] == 'setOption')
             .single['value']['value'],
-        isTrue,
+        isFalse,
+        reason: 'the captured pre-takeover value is restored, not true',
+      );
+      onlineOptionReply = null;
+    });
+
+    test(
+      'toggling off restores true when the captured value was true',
+      () async {
+        await initializeWith();
+        onlineOptionReply = true;
+        await deliverReady();
+        requests.clear();
+        await GhostModeController.shared.setGlobalEnabled(false);
+        expect(
+          requests
+              .where((request) => request['@type'] == 'setOption')
+              .single['value']['value'],
+          isTrue,
+        );
+        onlineOptionReply = null;
+      },
+    );
+
+    test(
+      'unreadable option restores the TDLib-default true on release',
+      () async {
+        await initializeWith();
+        // The stub falls through to a plain 'ok': no optionValueBoolean
+        // payload, so the capture falls back to the effective default.
+        onlineOptionReply = null;
+        await deliverReady();
+        requests.clear();
+        await GhostModeController.shared.setGlobalEnabled(false);
+        expect(
+          requests
+              .where((request) => request['@type'] == 'setOption')
+              .single['value']['value'],
+          isTrue,
+          reason: 'fallback to the effective default of an app user',
+        );
+      },
+    );
+
+    test('setHideOnline to the same value sends nothing', () async {
+      await initializeWith();
+      requests.clear();
+      await GhostModeController.shared.setHideOnline(true);
+      expect(requests, isEmpty);
+    });
+
+    test(
+      'hide off→on→off restores, takes over, restores without repeats',
+      () async {
+        await initializeWith();
+        // Default reply: the client's own presence reads back as online.
+        await deliverReady();
+        requests.clear();
+        await GhostModeController.shared.setHideOnline(false);
+        await GhostModeController.shared.setHideOnline(true);
+        await GhostModeController.shared.setHideOnline(false);
+        expect(
+          requests
+              .where((request) => request['@type'] == 'setOption')
+              .map((request) => request['value']['value'])
+              .toList(),
+          orderedEquals([isTrue, isFalse, isTrue]),
+          reason: 'restore, takeover, restore — one send per real transition',
+        );
+      },
+    );
+
+    test('new client ready while enabled is taken over once', () async {
+      await initializeWith();
+      await deliverReady();
+      // A repeated ready event (client re-auth) must not re-take-over.
+      await deliverReady();
+      expect(
+        requests
+            .where((request) => request['@type'] == 'setOption')
+            .map((request) => request['value']['value'])
+            .toList(),
+        orderedEquals([isFalse]),
+        reason: 'exactly one takeover send for a repeated-ready client',
       );
     });
 
-    test('toggling off restores the online option', () async {
-      await initializeWith();
-      requests.clear();
-      await GhostModeController.shared.setGlobalEnabled(false);
-      expect(
-        requests
-            .where((request) => request['@type'] == 'setOption')
-            .single['value']['value'],
-        isTrue,
-        reason: 'online goes back to true once ghost mode is off',
-      );
+    test('new client ready while disabled sends nothing', () async {
+      await initializeWith(globalEnabled: false);
+      await deliverReady();
+      expect(requests, isEmpty);
     });
+  });
+
+  group('disabled-initialization regression (PR #209 P1)', () {
+    test(
+      'empty prefs + global OFF: initialize() emits ZERO setOption',
+      () async {
+        SharedPreferences.setMockInitialValues({});
+        prefs = await SharedPreferences.getInstance();
+        requests.clear();
+        GhostModeController.shared.initialize(prefs);
+        // Give any stray applyOnlineStatus() burst several turns to land.
+        for (var i = 0; i < 5; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(
+          requests,
+          isEmpty,
+          reason:
+              'initializing a self-build with ghost mode OFF must not drive '
+              'presence: TDLib clients start offline and master sends '
+              'nothing — setOption(online=true) here is a forced re-online',
+        );
+      },
+    );
+
+    test(
+      'empty prefs + global OFF: initialize() emits zero queries too',
+      () async {
+        SharedPreferences.setMockInitialValues({});
+        prefs = await SharedPreferences.getInstance();
+        queries.clear();
+        wire.clear();
+        GhostModeController.shared.initialize(prefs);
+        for (var i = 0; i < 5; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(
+          queries,
+          isEmpty,
+          reason: 'no presence read is needed when nothing is taken over',
+        );
+      },
+    );
+
+    test(
+      'initialize() with ghost ENABLED does not emit anything either',
+      () async {
+        SharedPreferences.setMockInitialValues({'ghost_mode.enabled': true});
+        prefs = await SharedPreferences.getInstance();
+        requests.clear();
+        queries.clear();
+        wire.clear();
+        GhostModeController.shared.initialize(prefs);
+        for (var i = 0; i < 5; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(
+          requests,
+          isEmpty,
+          reason:
+              'at init no client presence has been read yet; taking over '
+              'without reading would corrupt the restore value',
+        );
+      },
+    );
   });
 
   test(
