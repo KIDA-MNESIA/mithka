@@ -27,11 +27,13 @@ const _enabled = allowTelegramTosViolations;
 MessageHistoryEntry _entry(
   int chatId,
   int messageId, {
+  int accountUserId = 42,
   String text = 'hello',
   bool deleted = false,
   int deletedAt = 0,
   String kindKey = '',
 }) => MessageHistoryEntry(
+  accountUserId: accountUserId,
   chatId: chatId,
   messageId: messageId,
   senderId: 42,
@@ -98,6 +100,7 @@ void main() {
     store.fileDir = dir;
     SharedPreferences.setMockInitialValues(const {});
     store.initialize(await SharedPreferences.getInstance());
+    store.debugSetActiveAccount(42);
   });
 
   tearDown(() async {

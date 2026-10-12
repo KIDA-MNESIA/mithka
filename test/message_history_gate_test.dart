@@ -57,6 +57,7 @@ void main() {
         store.startObserving();
         store.debugSeed([
           const MessageHistoryEntry(
+            accountUserId: 42,
             chatId: 11,
             messageId: 100,
             senderId: 42,
@@ -100,14 +101,21 @@ void main() {
       final store = MessageHistoryStore.forTesting();
       store.fileDir = dir;
       store.updateSource = (_) => controller.stream;
+      store.activeSlotChangeSource = () => const Stream<int>.empty();
+      // Real updates are stamped with the client that observed them; the
+      // gate pins the single-account case where that client is the account.
+      store.accountUserIdResolver = _SingleAccountIdentity();
+      store.activeClientIdProvider = () => 101;
       addTearDown(store.dispose);
       store.initialize(await SharedPreferences.getInstance());
       await store.ensureLoaded();
       store.startObserving();
       await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
 
       controller.add({
         '@type': 'updateNewMessage',
+        '@client_id': 101,
         'message': {
           '@type': 'message',
           'chat_id': '11',
@@ -131,4 +139,11 @@ void main() {
       );
     });
   }
+}
+
+/// Maps every TDLib client to the one test account; the gate pins the
+/// single-account path end to end.
+class _SingleAccountIdentity implements TosAccountUserIdResolver {
+  @override
+  Future<int?> resolve(int clientId) async => 42;
 }

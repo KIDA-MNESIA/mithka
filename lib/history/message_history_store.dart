@@ -7,6 +7,12 @@
 //  written from TDLib updates the account already received, and the kept
 //  copies never leave this device.
 //
+//  Every record is owned by the account that received it: TDLib stamps each
+//  update with '@client_id', the store resolves that to the account's user id
+//  (getMe, cached) and keys entries, pending edit dates and exclusions by it.
+//  Two accounts that see the same chat/message ids therefore keep two
+//  separate records, and the viewer only ever shows the active account's.
+//
 //  The whole feature is a Telegram API Terms section 1.4 exception, so every
 //  entry point — the TDLib subscription, the persisted file, the preference
 //  keys, the settings row and the viewer route — is guarded by the
@@ -85,6 +91,7 @@ class MessageHistoryEvent {
 @immutable
 class MessageHistoryEntry {
   const MessageHistoryEntry({
+    required this.accountUserId,
     required this.chatId,
     required this.messageId,
     required this.senderId,
@@ -95,6 +102,10 @@ class MessageHistoryEntry {
     required this.deletedAt,
     required this.events,
   });
+
+  /// User id of the account that received the message. Two accounts that see
+  /// the same chat/message ids keep two separate records.
+  final int accountUserId;
 
   final int chatId;
   final int messageId;
@@ -124,11 +135,12 @@ class MessageHistoryEntry {
 
   bool get isEdited => events.isNotEmpty;
 
-  String get key => '$chatId:$messageId';
+  String get key => '$accountUserId:$chatId:$messageId';
 
   @override
   bool operator ==(Object other) =>
       other is MessageHistoryEntry &&
+      other.accountUserId == accountUserId &&
       other.chatId == chatId &&
       other.messageId == messageId &&
       other.senderId == senderId &&
@@ -141,6 +153,7 @@ class MessageHistoryEntry {
 
   @override
   int get hashCode => Object.hash(
+    accountUserId,
     chatId,
     messageId,
     senderId,
@@ -153,6 +166,7 @@ class MessageHistoryEntry {
   );
 
   MessageHistoryEntry copyWith({
+    int? accountUserId,
     String? text,
     String? kindKey,
     int? senderId,
@@ -160,6 +174,7 @@ class MessageHistoryEntry {
     int? deletedAt,
     List<MessageHistoryEvent>? events,
   }) => MessageHistoryEntry(
+    accountUserId: accountUserId ?? this.accountUserId,
     chatId: chatId,
     messageId: messageId,
     senderId: senderId ?? this.senderId,
@@ -172,6 +187,7 @@ class MessageHistoryEntry {
   );
 
   Map<String, Object?> toJson() => {
+    'account': accountUserId,
     'chat': chatId,
     'id': messageId,
     'sender': senderId,
@@ -183,13 +199,22 @@ class MessageHistoryEntry {
     'events': [for (final event in events) event.toJson()],
   };
 
+  /// Entries without an 'account' field (mirror files from before the
+  /// account identity existed) are dropped on load: an entry whose owning
+  /// account is unknown must never be attributed to whichever account
+  /// happens to be active.
   static MessageHistoryEntry? fromJson(Object? json) {
     if (json is! Map) return null;
+    final account = json['account'];
     final chat = json['chat'];
     final id = json['id'];
     final date = json['date'];
     final text = json['text'];
-    if (chat is! int || id is! int || date is! int || text is! String) {
+    if (account is! int ||
+        chat is! int ||
+        id is! int ||
+        date is! int ||
+        text is! String) {
       return null;
     }
     final sender = json['sender'];
@@ -198,6 +223,7 @@ class MessageHistoryEntry {
     final deletedAt = json['deletedAt'];
     final events = json['events'];
     return MessageHistoryEntry(
+      accountUserId: account,
       chatId: chat,
       messageId: id,
       senderId: sender is int ? sender : 0,
@@ -218,6 +244,36 @@ class MessageHistoryEntry {
   }
 }
 
+/// Resolves a TDLib client id to the owning account's user id. Production
+/// asks the client itself (getMe) and caches; tests inject the mapping.
+abstract class TosAccountUserIdResolver {
+  Future<int?> resolve(int clientId);
+
+  /// getMe through the exact client that produced the update. A client that
+  /// is gone (slot removed, shutting down) resolves to null, and updates
+  /// from it are dropped rather than misattributed.
+  static final TosAccountUserIdResolver production = _TdClientUserIdResolver();
+}
+
+class _TdClientUserIdResolver implements TosAccountUserIdResolver {
+  final Map<int, int> _cache = {};
+
+  @override
+  Future<int?> resolve(int clientId) async {
+    final cached = _cache[clientId];
+    if (cached != null) return cached;
+    try {
+      final me = await TdClient.shared.queryTo({'@type': 'getMe'}, clientId);
+      final userId = me.int64('id');
+      if (userId == null) return null;
+      _cache[clientId] = userId;
+      return userId;
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
 /// Owns the mirrored message history: records TDLib updates, keeps the
 /// entries in memory and persists a bounded batch to one JSON file.
 class MessageHistoryStore extends ChangeNotifier {
@@ -228,7 +284,7 @@ class MessageHistoryStore extends ChangeNotifier {
   @visibleForTesting
   factory MessageHistoryStore.forTesting() = MessageHistoryStore._;
 
-  static const _prefsKey = 'messageHistory.excludedChats.v1';
+  static const _prefsKeyPrefix = 'messageHistory.excludedChats.v2.';
   static const _fileName = 'message-history.json';
   static const _tmpSuffix = '.tmp';
 
@@ -245,12 +301,42 @@ class MessageHistoryStore extends ChangeNotifier {
   ];
 
   final Map<String, MessageHistoryEntry> _byKey = {};
-  final Set<int> _excludedChats = {};
+
+  /// Excluded chats per owning account; the read/write APIs operate on the
+  /// active account's set.
+  final Map<int, Set<int>> _excludedChatsByAccount = {};
+
+  /// Pending updateMessageEdited dates, keyed per account. An edit or
+  /// deletion observed on one account can never touch another account's
+  /// entry even when the chat/message ids are identical.
+  final Map<String, int> _pendingEditDates = {};
+
+  /// Per-account update ordering: every account's updates are handled one
+  /// after another, so a burst of edits and deletions cannot interleave.
+  final Map<int, Future<void>> _accountWorkers = {};
+
+  /// Resolved user id of the active client, kept in sync with
+  /// [TosAccountUserIdResolver] results; null while unresolved.
+  int? _activeAccountUserId;
+  int? _activeAccountUserIdSource;
+
+  /// Injected per-account id mapping (tests); defaults to getMe per client.
+  @visibleForTesting
+  TosAccountUserIdResolver? accountUserIdResolver;
+
+  /// The active TDLib client id (tests); defaults to the shared client.
+  @visibleForTesting
+  int Function()? activeClientIdProvider;
+
+  /// The active-slot change stream (tests); defaults to the shared client.
+  @visibleForTesting
+  Stream<int> Function()? activeSlotChangeSource;
 
   SharedPreferences? _prefs;
   bool _loaded = false;
   bool _observing = false;
   StreamSubscription<Map<String, dynamic>>? _tdSub;
+  StreamSubscription<int>? _activeSlotSub;
   Timer? _persistTimer;
   bool _persisting = false;
   bool _dirtyWhilePersisting = false;
@@ -258,41 +344,79 @@ class MessageHistoryStore extends ChangeNotifier {
   /// Directory holding the mirror file. Resolved lazily; tests inject one.
   Directory? fileDir;
 
-  /// Every kept copy, oldest first — the order the mirror saw the messages.
-  /// Bounded by [maxEntries]; the viewer reverses for display.
-  List<MessageHistoryEntry> get entries =>
-      List.unmodifiable(_byKey.values.take(maxEntries));
+  TosAccountUserIdResolver get _resolver =>
+      accountUserIdResolver ?? TosAccountUserIdResolver.production;
 
-  /// Newest first, one chat, excluded chats are hidden.
-  List<MessageHistoryEntry> entriesFor(int chatId) =>
-      _excludedChats.contains(chatId)
+  int? get _currentClientId {
+    final provider = activeClientIdProvider;
+    if (provider != null) {
+      final clientId = provider();
+      return clientId == 0 ? null : clientId;
+    }
+    final clientId = TdClient.shared.activeClientId;
+    return clientId == 0 ? null : clientId;
+  }
+
+  /// User id of the active account once resolved; null before that.
+  int? get activeAccountUserId => _activeAccountUserId;
+
+  /// Every kept copy of the ACTIVE account, oldest first — the order the
+  /// mirror saw the messages. Bounded by [maxEntries]; the viewer reverses
+  /// for display. Records of other accounts are never surfaced here.
+  List<MessageHistoryEntry> get entries => List.unmodifiable(
+    _byKey.values.where((entry) => entry.accountUserId == _activeAccountUserId),
+  );
+
+  /// Newest first, one chat of the active account, excluded chats are hidden.
+  List<MessageHistoryEntry> entriesFor(int chatId) => isChatExcluded(chatId)
       ? const []
       : List.unmodifiable(
-          _byKey.values.where((entry) => entry.chatId == chatId),
+          _byKey.values.where(
+            (entry) =>
+                entry.accountUserId == _activeAccountUserId &&
+                entry.chatId == chatId,
+          ),
         );
 
+  /// Looks up an entry of the ACTIVE account.
   MessageHistoryEntry? entry(int chatId, int messageId) =>
-      _byKey['$chatId:$messageId'];
+      _activeAccountUserId == null
+      ? null
+      : _byKey['$_activeAccountUserId:$chatId:$messageId'];
 
   int get entryCount => _byKey.length;
 
-  bool isChatExcluded(int chatId) => _excludedChats.contains(chatId);
+  bool isChatExcluded(int chatId) =>
+      _activeAccountUserId != null &&
+      (_excludedChatsByAccount[_activeAccountUserId]?.contains(chatId) ??
+          false);
 
-  Set<int> get excludedChats => Set.unmodifiable(_excludedChats);
+  Set<int> get excludedChats => Set.unmodifiable(
+    _excludedChatsByAccount[_activeAccountUserId] ?? const {},
+  );
 
   // ---------------------------------------------------------------------------
   // Bootstrap (guarded — with the flag off nothing below may run)
   // ---------------------------------------------------------------------------
 
-  /// Reads the per-chat exclusions. Called from the app bootstrap with the
-  /// shared prefs; a no-op unless the feature is compiled in.
+  /// Reads the per-account exclusions of every account seen so far. Called
+  /// from the app bootstrap with the shared prefs; a no-op unless the
+  /// feature is compiled in. The pre-account v1 exclusion key is not
+  /// migrated: an exclusion written before account identity existed cannot
+  /// be attributed to an account without guessing.
   void initialize(SharedPreferences prefs) {
     if (!allowTelegramTosViolations) return;
     _prefs = prefs;
-    final raw = prefs.getStringList(_prefsKey) ?? const <String>[];
-    _excludedChats
-      ..clear()
-      ..addAll(raw.map(int.tryParse).whereType<int>());
+    _excludedChatsByAccount.clear();
+    for (final key in prefs.getKeys()) {
+      if (!key.startsWith(_prefsKeyPrefix)) continue;
+      final suffix = key.substring(_prefsKeyPrefix.length);
+      final accountUserId = int.tryParse(suffix);
+      if (accountUserId == null) continue;
+      final raw = prefs.getStringList(key) ?? const <String>[];
+      final excluded = raw.map(int.tryParse).whereType<int>().toSet();
+      _excludedChatsByAccount[accountUserId] = excluded;
+    }
     notifyListeners();
   }
 
@@ -303,6 +427,10 @@ class MessageHistoryStore extends ChangeNotifier {
     if (_observing) return;
     _observing = true;
     _tdSub = _openUpdates(observedUpdateTypes).listen(_onTdUpdate);
+    _activeSlotSub = _openActiveSlotChanges().listen((_) {
+      _refreshActiveAccount();
+    });
+    _refreshActiveAccount();
   }
 
   /// The typed update stream the mirror subscribes to. Tests replace this to
@@ -316,15 +444,61 @@ class MessageHistoryStore extends ChangeNotifier {
     return TdClient.shared.updatesOfAny(types);
   }
 
+  Stream<int> _openActiveSlotChanges() {
+    final source = activeSlotChangeSource;
+    if (source != null) return source();
+    return TdClient.shared.subscribeActiveSlotChanges();
+  }
+
+  /// Re-resolves the active account's user id when the active client
+  /// changes; the viewer and the exclusion APIs read the cached result.
+  void _refreshActiveAccount() {
+    final clientId = _currentClientId;
+    if (clientId == null) {
+      _activeAccountUserId = null;
+      _activeAccountUserIdSource = null;
+      return;
+    }
+    if (_activeAccountUserIdSource == clientId &&
+        _activeAccountUserId != null) {
+      return;
+    }
+    _activeAccountUserIdSource = clientId;
+    _activeAccountUserId = null;
+    unawaited(
+      _resolveAccountUserId(clientId).then((userId) {
+        // A newer active client may have taken over while this one resolved.
+        if (_currentClientId != clientId || userId == null) return;
+        _activeAccountUserId = userId;
+        notifyListeners();
+      }),
+    );
+  }
+
+  Future<int?> _resolveAccountUserId(int clientId) =>
+      _resolver.resolve(clientId);
+
   @visibleForTesting
   @override
   void dispose() {
     _tdSub?.cancel();
     _tdSub = null;
+    _activeSlotSub?.cancel();
+    _activeSlotSub = null;
     _observing = false;
     _persistTimer?.cancel();
     _persistTimer = null;
     super.dispose();
+  }
+
+  /// Seeds the active account's identity for tests; stands in for what
+  /// [_refreshActiveAccount] resolves from TDLib in production.
+  @visibleForTesting
+  void debugSetActiveAccount(int accountUserId) {
+    if (!allowTelegramTosViolations) return;
+    _activeAccountUserId = accountUserId;
+    _activeAccountUserIdSource = null;
+    notifyListeners();
   }
 
   /// Seeds in-memory copies for tests; never touches persistence. Guarded
@@ -345,33 +519,78 @@ class MessageHistoryStore extends ChangeNotifier {
 
   void _onTdUpdate(Map<String, dynamic> update) {
     if (!allowTelegramTosViolations) return;
+    // Every TDLib update is stamped with the client that received it
+    // (updatesOfAny(allAccounts:true) documents this); resolving that to an
+    // account user id is what keeps two accounts with identical chat/message
+    // ids in two records. Updates without a client id are dropped: there is
+    // no way to attribute them, and guessing the active account would
+    // misattribute history whenever the active account changes.
+    final clientId = update.integer('@client_id');
+    if (clientId == null || clientId == 0) return;
+    unawaited(_handleUpdateForClient(clientId, update));
+  }
+
+  /// Handles one update for [clientId], preserving per-account ordering:
+  /// each account's updates run strictly one after another, while different
+  /// accounts may resolve concurrently.
+  Future<void> _handleUpdateForClient(
+    int clientId,
+    Map<String, dynamic> update,
+  ) async {
+    final userId = await _resolveAccountUserId(clientId);
+    if (userId == null) return; // unattributable — never guess
+    final previous = _accountWorkers[userId] ?? Future<void>.value();
+    final worker = previous
+        .catchError((_) {})
+        .then((_) => _recordUpdate(userId, update));
+    _accountWorkers[userId] = worker;
+    try {
+      await worker;
+    } finally {
+      // Removing the chain slot returns the worker future we already await.
+      if (identical(_accountWorkers[userId], worker)) {
+        unawaited(_accountWorkers.remove(userId));
+      }
+    }
+  }
+
+  Future<void> _recordUpdate(int accountUserId, Map<String, dynamic> update) {
     switch (update.type) {
       case 'updateNewMessage':
-        recordIncomingMessage(update.obj('message'));
+        _recordIncomingMessage(accountUserId, update.obj('message'));
       case 'updateMessageEdited':
-        _rememberEditDate(update);
+        _rememberEditDate(accountUserId, update);
       case 'updateMessageContent':
-        _recordContentUpdate(update);
+        _recordContentUpdate(accountUserId, update);
       case 'updateDeleteMessages':
-        _recordDeletedMessages(update);
+        _recordDeletedMessages(accountUserId, update);
     }
+    return Future<void>.value();
   }
 
   /// Mirrors one incoming message. Also runs for messages that come back
   /// (cache eviction refetch, album resend): those refresh the copy but keep
   /// the recorded history, and a message deleted earlier becomes active
   /// again because it exists again.
-  void recordIncomingMessage(Map<String, dynamic>? message) {
+  void recordIncomingMessage(Map<String, dynamic>? message) =>
+      _recordIncomingMessage(_activeAccountUserId, message);
+
+  void _recordIncomingMessage(
+    int? accountUserId,
+    Map<String, dynamic>? message,
+  ) {
     if (!allowTelegramTosViolations) return;
-    if (message == null) return;
+    if (accountUserId == null || message == null) return;
     final chatId = message.int64('chat_id');
     // The message object carries its own id in `id` (message_id is the field
     // name on the update wrappers, not on message).
     final messageId = message.integer('id');
     if (chatId == null || messageId == null) return;
-    if (_excludedChats.contains(chatId)) return;
+    if (_excludedChatsByAccount[accountUserId]?.contains(chatId) ?? false) {
+      return;
+    }
 
-    final key = '$chatId:$messageId';
+    final key = '$accountUserId:$chatId:$messageId';
     final existing = _byKey[key];
     if (existing != null) {
       final refreshed = existing.copyWith(
@@ -391,6 +610,7 @@ class MessageHistoryStore extends ChangeNotifier {
     final date = message.integer('date') ?? 0;
     final content = message.obj('content');
     _byKey[key] = MessageHistoryEntry(
+      accountUserId: accountUserId,
       chatId: chatId,
       messageId: messageId,
       senderId: _senderId(message) ?? 0,
@@ -409,24 +629,26 @@ class MessageHistoryStore extends ChangeNotifier {
   /// updateMessageEdited carries the edit time but not the content; the new
   /// content arrives in a following updateMessageContent. Only that pair —
   /// not TDLib's own content generations (dice rolls, live locations) —
-  /// produces an edit event.
-  final Map<String, int> _pendingEditDates = {};
-
-  void _rememberEditDate(Map<String, dynamic> update) {
+  /// produces an edit event. Pending dates are owned by the account whose
+  /// client observed the edit.
+  void _rememberEditDate(int accountUserId, Map<String, dynamic> update) {
     final chatId = update.int64('chat_id');
     final messageId = update.integer('message_id');
     if (chatId == null || messageId == null) return;
-    _pendingEditDates['$chatId:$messageId'] = update.integer('edit_date') ?? 0;
+    _pendingEditDates['$accountUserId:$chatId:$messageId'] =
+        update.integer('edit_date') ?? 0;
   }
 
-  void _recordContentUpdate(Map<String, dynamic> update) {
+  void _recordContentUpdate(int accountUserId, Map<String, dynamic> update) {
     final chatId = update.int64('chat_id');
     final messageId = update.integer('message_id');
     if (chatId == null || messageId == null) return;
-    final key = '$chatId:$messageId';
+    final key = '$accountUserId:$chatId:$messageId';
     final editDate = _pendingEditDates.remove(key);
     if (editDate == null) return;
 
+    // Re-read after the await in [_handleUpdateForClient]: the mirror may
+    // have loaded or changed since the update was received.
     final existing = _byKey[key];
     if (existing == null || existing.state == MessageHistoryState.deleted) {
       return;
@@ -457,8 +679,9 @@ class MessageHistoryStore extends ChangeNotifier {
   /// became inaccessible or were cache-evicted (`is_permanent: false`,
   /// `from_cache: true`); both belong in the mirror — the mirror's job is
   /// precisely to keep what the chat no longer shows. A message that really
-  /// comes back re-activates through [recordIncomingMessage].
-  void _recordDeletedMessages(Map<String, dynamic> update) {
+  /// comes back re-activates through [recordIncomingMessage]. Deletions only
+  /// ever touch the observing account's copy.
+  void _recordDeletedMessages(int accountUserId, Map<String, dynamic> update) {
     final chatId = update.int64('chat_id');
     if (chatId == null) return;
     final ids = update.int64Array('message_ids') ?? const <int>[];
@@ -466,7 +689,7 @@ class MessageHistoryStore extends ChangeNotifier {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     var changed = false;
     for (final messageId in ids) {
-      final key = '$chatId:$messageId';
+      final key = '$accountUserId:$chatId:$messageId';
       final existing = _byKey[key];
       if (existing == null) continue;
       if (existing.state == MessageHistoryState.deleted) continue;
@@ -485,30 +708,47 @@ class MessageHistoryStore extends ChangeNotifier {
   // Exclusions, clearing
   // ---------------------------------------------------------------------------
 
-  /// Stops recording [chatId] and drops its kept copies — an excluded chat
-  /// must have no mirror at all, not just a paused one.
+  /// Stops the ACTIVE account from recording [chatId] and drops its kept
+  /// copies of that chat — an excluded chat must have no mirror at all, not
+  /// just a paused one. Other accounts' copies of the same chat are kept.
   void excludeChat(int chatId) {
     if (!allowTelegramTosViolations) return;
-    if (!_excludedChats.add(chatId)) return;
-    _byKey.removeWhere((_, entry) => entry.chatId == chatId);
-    _persistExcludedChats();
+    final accountUserId = _activeAccountUserId;
+    if (accountUserId == null) return;
+    final excluded = _excludedChatsByAccount.putIfAbsent(
+      accountUserId,
+      () => <int>{},
+    );
+    if (!excluded.add(chatId)) return;
+    _byKey.removeWhere(
+      (key, entry) =>
+          entry.accountUserId == accountUserId && entry.chatId == chatId,
+    );
+    _persistExcludedChats(accountUserId);
     notifyListeners();
     _schedulePersist();
   }
 
   void includeChat(int chatId) {
     if (!allowTelegramTosViolations) return;
-    if (!_excludedChats.remove(chatId)) return;
-    _persistExcludedChats();
+    final accountUserId = _activeAccountUserId;
+    if (accountUserId == null) return;
+    final excluded = _excludedChatsByAccount[accountUserId];
+    if (excluded == null || !excluded.remove(chatId)) return;
+    _persistExcludedChats(accountUserId);
     notifyListeners();
   }
 
-  /// Removes every kept copy of [chatId]; returns how many went away.
+  /// Removes the active account's kept copies of [chatId]; returns how many
+  /// went away.
   int clearChat(int chatId) {
     if (!allowTelegramTosViolations) return 0;
+    final accountUserId = _activeAccountUserId;
+    if (accountUserId == null) return 0;
     final keys = [
       for (final entry in _byKey.values)
-        if (entry.chatId == chatId) entry.key,
+        if (entry.accountUserId == accountUserId && entry.chatId == chatId)
+          entry.key,
     ];
     if (keys.isEmpty) return 0;
     for (final key in keys) {
@@ -519,7 +759,9 @@ class MessageHistoryStore extends ChangeNotifier {
     return keys.length;
   }
 
-  /// Removes every kept copy of every chat; returns how many went away.
+  /// Removes every kept copy of every account; returns how many went away.
+  /// Deliberately global: "clear everything" must not leave invisible
+  /// mirrors behind.
   int clearAll() {
     if (!allowTelegramTosViolations) return 0;
     if (_byKey.isEmpty) return 0;
@@ -530,14 +772,43 @@ class MessageHistoryStore extends ChangeNotifier {
     return removed;
   }
 
-  void _persistExcludedChats() {
-    _prefs?.setStringList(_prefsKey, [
-      for (final chatId in _excludedChats) '$chatId',
+  /// Forgets an account entirely: its kept copies, its pending edit dates
+  /// and its exclusion preference. Called when a slot is logged out or
+  /// removed; account identity is known there, so nothing is guessed.
+  void removeAccount(int accountUserId) {
+    if (!allowTelegramTosViolations) return;
+    var changed = false;
+    final keys = [
+      for (final entry in _byKey.values)
+        if (entry.accountUserId == accountUserId) entry.key,
+    ];
+    for (final key in keys) {
+      _byKey.remove(key);
+    }
+    if (keys.isNotEmpty) changed = true;
+    _pendingEditDates.removeWhere(
+      (key, _) => key.startsWith('$accountUserId:'),
+    );
+    if (_excludedChatsByAccount.remove(accountUserId) != null) changed = true;
+    unawaited(_prefs?.remove('$_prefsKeyPrefix$accountUserId'));
+    if (changed) {
+      notifyListeners();
+      _schedulePersist();
+    }
+  }
+
+  void _persistExcludedChats(int accountUserId) {
+    _prefs?.setStringList('$_prefsKeyPrefix$accountUserId', [
+      for (final chatId
+          in _excludedChatsByAccount[accountUserId] ?? const <int>{})
+        '$chatId',
     ]);
   }
 
   // ---------------------------------------------------------------------------
-  // Persistence — one JSON file, batched, written atomically via rename
+  // Persistence — one JSON file for every account, batched, written
+  // atomically via rename. Keys are account-scoped, so accounts share the
+  // file without ever overwriting each other.
   // ---------------------------------------------------------------------------
 
   Future<void> ensureLoaded() async {
@@ -582,7 +853,7 @@ class MessageHistoryStore extends ChangeNotifier {
       final dir = fileDir ?? await getApplicationSupportDirectory();
       final tmp = File('${dir.path}/$_fileName$_tmpSuffix');
       final batch = {
-        'version': 1,
+        'version': 2,
         'entries': [
           for (final entry in _byKey.values.take(persistBatch)) entry.toJson(),
         ],
