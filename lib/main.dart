@@ -55,6 +55,8 @@ import 'chat/group_remark_controller.dart';
 import 'chat/music_player_controller.dart';
 import 'chats/chat_folder_tag_controller.dart';
 import 'components/drawer_controller.dart' as dc;
+import 'config/build_flags.dart';
+import 'history/message_history_store.dart';
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
 import 'media/video_playback_reporting.dart';
@@ -250,6 +252,14 @@ Future<void> _bootstrapAndRunApp() async {
   CountryMessageFilter.shared.initialize(prefs);
   unawaited(SensitiveContentController.shared.initialize());
   MusicPlayerController.shared.initialize(prefs);
+  // Telegram §1.4 exception: the deleted/edited message mirror exists only in
+  // opted-in self-builds — with the flag off nothing is subscribed, read or
+  // written, and old saved state stays inert.
+  if (allowTelegramTosViolations) {
+    MessageHistoryStore.shared.initialize(prefs);
+    unawaited(MessageHistoryStore.shared.ensureLoaded());
+    MessageHistoryStore.shared.startObserving();
+  }
   // Preload Telegram blocked-user list so chat filters have data right away.
   unawaited(BlockedUserService.shared.loadBlockedUsers());
   // Firebase + analytics + Sentry tags are several platform-channel round
