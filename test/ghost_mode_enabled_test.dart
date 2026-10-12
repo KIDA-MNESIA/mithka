@@ -27,8 +27,10 @@ void main() {
   final wire = <Map<String, dynamic>>[];
 
   /// Canned getOption('online') answer for the running test: a bool answers
-  /// optionValueBoolean, a map is returned verbatim (e.g. a TDLib error),
-  /// null falls through to the plain 'ok' default (option unreadable).
+  /// optionValueBoolean, a map is returned verbatim (e.g. a TDLib error), a
+  /// [Completer] holds the read open until the test completes it (an
+  /// in-flight takeover), null falls through to the plain 'ok' default
+  /// (option unreadable).
   Object? onlineOptionReply;
   late SharedPreferences prefs;
 
@@ -41,6 +43,7 @@ void main() {
           wire.add(request);
           if (request['@type'] == 'getOption' && request['name'] == 'online') {
             final reply = onlineOptionReply;
+            if (reply is Completer<Map<String, dynamic>>) return reply.future;
             if (reply is bool) {
               return <String, dynamic>{
                 '@type': 'optionValueBoolean',
@@ -286,23 +289,171 @@ void main() {
       },
     );
 
+    test('unreadable option captures unknown: release sends NOTHING', () async {
+      await initializeWith();
+      // The stub falls through to a plain 'ok': no optionValueBoolean
+      // payload, so the read never learns the client's own presence.
+      onlineOptionReply = null;
+      await deliverReady();
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption'),
+        isEmpty,
+        reason:
+            'an unknown capture must not be restored: sending true would '
+            'manufacture presence, sending false would assert offline '
+            'forever — the release must stay silent and let the client '
+            'keep whatever TDLib actually holds',
+      );
+      onlineOptionReply = null;
+    });
+
+    test('failed getOption captures unknown: force-offline still went out, '
+        'release sends NOTHING', () async {
+      await initializeWith(globalEnabled: false);
+      onlineOptionReply = {
+        '@type': 'error',
+        'code': 400,
+        'message': 'OPTION_RUNTIME_UNAVAILABLE',
+      };
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(true);
+      // The takeover still read first, then forced the client offline even
+      // though the read failed: the interception itself must hold.
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': false},
+        },
+        reason: 'failed read never blocks the force-offline',
+      );
+      queries.clear();
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption'),
+        isEmpty,
+        reason:
+            'the controller never learned that client presence, so the '
+            'release must not emit setOption(online=true) — the old '
+            'catch/default true manufactured presence',
+      );
+      onlineOptionReply = null;
+    });
+
     test(
-      'unreadable option restores the TDLib-default true on release',
+      'unknown capture leaves no entry behind: re-enabling re-reads',
       () async {
         await initializeWith();
-        // The stub falls through to a plain 'ok': no optionValueBoolean
-        // payload, so the capture falls back to the effective default.
         onlineOptionReply = null;
         await deliverReady();
         requests.clear();
+        queries.clear();
         await GhostModeController.shared.setGlobalEnabled(false);
         expect(
-          requests
-              .where((request) => request['@type'] == 'setOption')
-              .single['value']['value'],
-          isTrue,
-          reason: 'fallback to the effective default of an app user',
+          requests.where((request) => request['@type'] == 'setOption'),
+          isEmpty,
         );
+        // Re-enable: the dropped unknown entry must force a fresh getOption
+        // instead of reusing the (non-)capture.
+        onlineOptionReply = false;
+        await GhostModeController.shared.setGlobalEnabled(true);
+        expect(queries, hasLength(1), reason: 'a fresh takeover re-reads');
+        expect(
+          requests.where((request) => request['@type'] == 'setOption').single,
+          {
+            '@type': 'setOption',
+            'name': 'online',
+            'value': {'@type': 'optionValueBoolean', 'value': false},
+          },
+        );
+        onlineOptionReply = null;
+      },
+    );
+
+    test('second trigger while a takeover read is in flight cannot overwrite '
+        'the first capture', () async {
+      await initializeWith(globalEnabled: false);
+      final hold = Completer<Map<String, dynamic>>();
+      onlineOptionReply = hold;
+      // First takeover: the global toggle. Its getOption stays in flight.
+      final takeover = GhostModeController.shared.setGlobalEnabled(true);
+      for (var i = 0; i < 10 && queries.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(queries, hasLength(1), reason: 'first read is in flight');
+      // Park a SECOND held answer so a duplicate read (old code) would
+      // grab it and its false could overwrite the first capture.
+      final secondHold = Completer<Map<String, dynamic>>();
+      onlineOptionReply = secondHold;
+      // Second trigger for the SAME client: the ready event. It must not
+      // start (or win) a second capture over the first one.
+      unawaited(deliverReady());
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(
+        queries,
+        hasLength(1),
+        reason:
+            'the second trigger coalesces into the in-flight takeover '
+            'instead of reading again',
+      );
+      // The first read answers online=true; the duplicate's false answer
+      // (old code) must never be able to override it.
+      hold.complete({'@type': 'optionValueBoolean', 'value': true});
+      secondHold.complete({'@type': 'optionValueBoolean', 'value': false});
+      await takeover;
+      await deliverReady();
+      onlineOptionReply = false;
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': true},
+        },
+        reason:
+            'the FIRST capture (true) wins; the false read must be '
+            'coalesced away, not overwrite it',
+      );
+      onlineOptionReply = null;
+    });
+
+    test(
+      'release during an in-flight takeover drops the stale capture',
+      () async {
+        await initializeWith(globalEnabled: false);
+        final hold = Completer<Map<String, dynamic>>();
+        onlineOptionReply = hold;
+        final takeover = GhostModeController.shared.setGlobalEnabled(true);
+        for (var i = 0; i < 10 && queries.isEmpty; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(queries, hasLength(1));
+        // Flip the global switch off while the read is still pending. The
+        // release must not send for a client that was never captured, and
+        // the takeover must abandon its stale read instead of capturing
+        // and forcing the option offline after the user asked for release.
+        final release = GhostModeController.shared.setGlobalEnabled(false);
+        await release;
+        requests.clear();
+        hold.complete({'@type': 'optionValueBoolean', 'value': true});
+        await takeover;
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          requests,
+          isEmpty,
+          reason:
+              'the release pass must stay silent for a never-captured '
+              'client, and the cancelled takeover must not write its stale '
+              'capture afterwards',
+        );
+        onlineOptionReply = null;
       },
     );
 
@@ -317,7 +468,10 @@ void main() {
       'hide off→on→off restores, takes over, restores without repeats',
       () async {
         await initializeWith();
-        // Default reply: the client's own presence reads back as online.
+        // The client's own presence reads back as online, so both restores
+        // hand a KNOWN capture back. (An unreadable read captures unknown
+        // and releases silently — pinned by its own test below.)
+        onlineOptionReply = true;
         await deliverReady();
         requests.clear();
         await GhostModeController.shared.setHideOnline(false);
@@ -331,6 +485,7 @@ void main() {
           orderedEquals([isTrue, isFalse, isTrue]),
           reason: 'restore, takeover, restore — one send per real transition',
         );
+        onlineOptionReply = null;
       },
     );
 

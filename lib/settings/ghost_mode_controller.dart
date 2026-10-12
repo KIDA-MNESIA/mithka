@@ -236,9 +236,19 @@ class GhostModeController extends ChangeNotifier {
   }
 
   /// The presence each client had before ghost mode took its `online`
-  /// option over. Keyed by TDLib client id; a missing entry means the client
-  /// was never taken over, so releasing it must not send anything either.
-  final Map<int, bool> _preTakeoverOnline = {};
+  /// option over, or `null` when the takeover could not read it. Keyed by
+  /// TDLib client id; a missing entry means the client was never taken
+  /// over, so releasing it must not send anything either. A `null` value is
+  /// an explicitly UNKNOWN capture: the read failed or came back unreadable,
+  /// so the controller genuinely does not know that client's requested
+  /// presence and release must also send nothing.
+  final Map<int, bool?> _preTakeoverOnline = {};
+
+  /// Per-client takeovers whose `getOption` read is still in flight. A
+  /// second trigger for the same client awaits the first instead of starting
+  /// its own read, so duplicate pending takeovers can never overwrite the
+  /// original capture.
+  final Map<int, Future<void>> _pendingTakeovers = {};
 
   /// Applies the current interception state to every registered client:
   /// turning ON reads and records each client's own presence and forces it
@@ -259,11 +269,39 @@ class GhostModeController extends ChangeNotifier {
 
   /// Forces one client offline while interception is active, after recording
   /// the presence it had, so releasing it later can restore exactly that.
-  /// Idempotent: a client already taken over is left as-is.
+  /// Idempotent: a client already taken over is left as-is, and concurrent
+  /// triggers serialize behind the in-flight read instead of racing it.
   Future<void> _takeOverClientOnline(int clientId, {TdClient? client}) async {
     if (_preTakeoverOnline.containsKey(clientId)) return;
+    final pending = _pendingTakeovers[clientId];
+    if (pending != null) {
+      // Serialize: the first takeover either completed the capture (the
+      // guard above then turns this trigger into a no-op) or abandoned it
+      // through the mid-flight release re-check (this trigger proceeds and
+      // reads again). Awaiting first is what keeps a duplicate read from
+      // ever overwriting the original capture.
+      await pending;
+      if (_preTakeoverOnline.containsKey(clientId)) return;
+    }
     final td = client ?? TdClient.shared;
-    bool captured = true;
+    final inFlight = _runTakeover(clientId, td);
+    _pendingTakeovers[clientId] = inFlight;
+    try {
+      await inFlight;
+    } finally {
+      if (identical(_pendingTakeovers[clientId], inFlight)) {
+        // unawaited only to discard remove()'s return value: the future is
+        // already awaited (or abandoned) above.
+        unawaited(_pendingTakeovers.remove(clientId));
+      }
+    }
+  }
+
+  /// The read-and-capture half of a takeover. Completing this future is the
+  /// moment the capture (or its deliberate absence) is final, so a waiter
+  /// can never see a settled takeover whose capture has not landed.
+  Future<void> _runTakeover(int clientId, TdClient td) async {
+    bool? captured;
     try {
       final option = await td.queryTo({
         '@type': 'getOption',
@@ -271,26 +309,34 @@ class GhostModeController extends ChangeNotifier {
       }, clientId);
       // getOption answers with the optionValueBoolean object itself:
       // {'@type': 'optionValueBoolean', 'value': <bool>}.
-      captured =
-          option.boolean('value') ??
-          // An unreadable option still means an app user: TDLib's effective
-          // default is the online state the app keeps for its user.
-          true;
+      captured = option.boolean('value');
     } catch (_) {
-      captured = true;
+      // A failed read records explicitly UNKNOWN (null), never an assumed
+      // value: the controller has not learned the client's requested state
+      // and very likely has not even delivered its force-offline through
+      // the same transport, so asserting anything on release would drive
+      // presence the user never asked for (see _preTakeoverOnline).
+      captured = null;
     }
     // A restore may have raced this read (e.g. the global switch flipped
     // while the getOption was in flight); honor the latest state instead of
     // clobbering it with a stale takeover.
     if (!shouldShareOnline()) return;
+    // A client closed while its read was in flight is gone; recording a
+    // capture for it would resurrect bookkeeping nothing can release.
+    if (!td.registeredClientIds.contains(clientId)) return;
     _preTakeoverOnline[clientId] = captured;
     applyOnlineStatusToClient(false, clientId, td);
   }
 
   /// Hands one client's `online` option back after a takeover. Sends only
-  /// when the client is actually in the takeover map, so ordinary presence
-  /// is never touched, and drops the entry so the next takeover re-reads.
+  /// when the client carries a KNOWN capture, so ordinary presence is never
+  /// touched, and drops the entry so the next takeover re-reads. An unknown
+  /// capture releases silently: sending `true` would manufacture presence
+  /// out of a failed read, and sending `false` would pin the client offline
+  /// forever — neither is a restore.
   void _restoreClientOnline(int clientId, {required TdClient client}) {
+    if (!_preTakeoverOnline.containsKey(clientId)) return;
     final recorded = _preTakeoverOnline.remove(clientId);
     if (recorded == null) return;
     applyOnlineStatusToClient(recorded, clientId, client);
