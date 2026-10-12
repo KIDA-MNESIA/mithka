@@ -228,6 +228,7 @@ class _VideoStickerViewState extends State<VideoStickerView>
       diagnostics.initialized(value: c.value);
       await c.setVolume(0);
       disableLoopingMediaAudioTracks(c);
+      applyWebmLoopingDecoderOverride(c);
       if (!_ownsLoad(generation, ref, slot, lease)) {
         await _disposeInitializingLoad(c, lease);
         return;
@@ -323,13 +324,7 @@ class _VideoStickerViewState extends State<VideoStickerView>
     int slot,
     LoopingMediaPlayerLease lease,
   ) =>
-      mounted &&
-      _isEligible &&
-      generation == _generation &&
-      _loadedId == ref.id &&
-      _loadedLocalPath == ref.localPath &&
-      _loadedSlot == slot &&
-      slot == TdClient.shared.activeSlot &&
+      _ownsAttempt(generation, ref, slot) &&
       identical(_lease, lease) &&
       !lease.isReleased;
 
