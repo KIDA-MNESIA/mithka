@@ -459,12 +459,28 @@ void main() {
       );
       expect(harness.client.activeSlot, kept);
       expect(harness.persistedSlots(), containsAll([0, kept]));
-      // The duplicate's directory is gone and its client was closed once.
+      // The duplicate's directory is gone and exactly one client was closed.
+      // Client ids are assigned after asynchronous directory preparation, so
+      // they must be observed, not derived from slot numbers: assert that the
+      // closed client is the one whose parameters pointed at the discarded
+      // slot's database directory — the wrong live database must never be the
+      // deleted one.
       final discarded = kept == 1 ? 2 : 1;
       expect(harness.slotDir(discarded).existsSync(), isFalse);
+      final closedClients = [
+        for (final (id, request) in harness.bindings.sent)
+          if (request['@type'] == 'close') id,
+      ];
+      expect(closedClients, hasLength(1));
+      final parameters = harness.bindings.sentTo(
+        closedClients.single,
+        'setTdlibParameters',
+      );
+      expect(parameters, hasLength(1));
       expect(
-        harness.bindings.sentTo(discarded == 1 ? 100 : 101, 'close'),
-        hasLength(1),
+        parameters.single['database_directory'],
+        harness.slotDir(discarded).path,
+        reason: 'the closed client must belong to the discarded slot',
       );
     },
   );
