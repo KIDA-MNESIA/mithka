@@ -1033,4 +1033,122 @@ void main() {
       expect(notifications, greaterThan(0));
     },
   );
+
+  // ---------------------------------------------------------------------------
+  // Scoped invalidation (third review round): removing one account or
+  // clearing one chat must not cancel unrelated pending work — only the
+  // explicitly global operations (clearAll, dispose) invalidate everything.
+  // ---------------------------------------------------------------------------
+
+  test(
+    'removing one account does not drop another account\'s pending update',
+    () async {
+      final gates = {_clientA: Completer<int?>(), _clientB: Completer<int?>()};
+      store.accountUserIdResolver = _GatedResolver(gates);
+      await start();
+      gates[_clientA]!.complete(_accountA);
+      await pump();
+      // Seed A's mirror so the removal below really removes something.
+      emitAs(_clientA, 'updateNewMessage', {
+        'message': _message(12, 200, text: 'from A'),
+      });
+      await pump();
+      expect(store.entry(12, 200)!.text, 'from A');
+
+      // B's message arrives while B's identity lookup is still held.
+      emitAs(_clientB, 'updateNewMessage', {
+        'message': _message(11, 100, text: 'from B'),
+      });
+      await pump();
+
+      // Removing A invalidates A's scope only.
+      store.removeAccount(_accountA);
+      expect(store.entryCount, 0);
+      await pump();
+      expect(store.entryCount, 0);
+
+      // B was not removed: its queued update must still record.
+      gates[_clientB]!.complete(_accountB);
+      await pump();
+      await pump();
+
+      expect(store.entryCount, 1);
+      store.debugSetActiveAccount(_accountB);
+      expect(store.entry(11, 100)!.text, 'from B');
+    },
+  );
+
+  test(
+    'clearing one chat does not drop a pending update of another chat',
+    () async {
+      // The account is logged in on two slots; the active one is resolved
+      // while the other slot's identity lookup stays held.
+      const clientB2 = 303;
+      final gates = {
+        _clientB: Completer<int?>()..complete(_accountB),
+        clientB2: Completer<int?>(),
+      };
+      store.accountUserIdResolver = _GatedResolver(gates);
+      store.activeClientIdProvider = () => _clientB;
+      await start();
+      await pump();
+      await pump();
+      expect(store.activeAccountUserId, _accountB);
+
+      // Chat 42 has history to clear.
+      emitAs(_clientB, 'updateNewMessage', {
+        'message': _message(42, 400, text: 'chat 42'),
+      });
+      await pump();
+      expect(store.entry(42, 400)!.text, 'chat 42');
+
+      // Chat 77's message arrives on the other slot while ITS identity
+      // lookup is still pending.
+      emitAs(clientB2, 'updateNewMessage', {
+        'message': _message(77, 700, text: 'chat 77'),
+      });
+      await pump();
+
+      // Clearing chat 42 must not touch chat 77's queued update.
+      store.clearChat(42);
+      expect(store.entry(42, 400), isNull);
+
+      gates[clientB2]!.complete(_accountB);
+      await pump();
+      await pump();
+
+      expect(store.entry(42, 400), isNull, reason: 'chat 42 stays cleared');
+      expect(store.entry(77, 700)!.text, 'chat 77');
+    },
+  );
+
+  test('a load after removeAccount restores the other accounts only', () async {
+    await start();
+    emitAs(_clientA, 'updateNewMessage', {
+      'message': _message(12, 200, text: 'from A'),
+    });
+    emitAs(_clientB, 'updateNewMessage', {
+      'message': _message(42, 400, text: 'chat 42'),
+    });
+    emitAs(_clientB, 'updateNewMessage', {
+      'message': _message(77, 700, text: 'chat 77'),
+    });
+    await pump();
+    await store.persistNowForTesting();
+
+    final revived = MessageHistoryStore.forTesting();
+    revived.fileDir = dir;
+    addTearDown(revived.dispose);
+    // Removing A must drop A's disk rows on load but leave the load itself
+    // — and every other account's rows — alive.
+    revived.removeAccount(_accountA);
+    await revived.ensureLoaded();
+
+    expect(revived.entryCount, 2);
+    revived.debugSetActiveAccount(_accountB);
+    expect(revived.entry(42, 400)!.text, 'chat 42');
+    expect(revived.entry(77, 700)!.text, 'chat 77');
+    revived.debugSetActiveAccount(_accountA);
+    expect(revived.entries, isEmpty);
+  });
 }

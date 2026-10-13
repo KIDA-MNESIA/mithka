@@ -323,13 +323,47 @@ class MessageHistoryStore extends ChangeNotifier {
   /// parallel.
   final Map<int, Future<void>> _clientWorkers = {};
 
-  /// Generation of the store's contents. Removals, clears and disposal
-  /// bump it; an async continuation captures it when its update ARRIVES
-  /// (or its load starts) and re-checks before writing, so work queued
-  /// before the invalidation can never resurrect the cleared state. Work
-  /// queued after the bump — e.g. updates of a still-connected client
-  /// following a logout — carries the new generation and records again.
+  /// Generation of the store's contents. Only the explicitly GLOBAL
+  /// operations bump it — [clearAll] and [dispose] — and an async
+  /// continuation captures it when its update ARRIVES (or its load starts)
+  /// and re-checks before writing, so work queued before one of those can
+  /// never resurrect the wiped state. Scoped invalidations (removing one
+  /// account, clearing one chat) must not cancel unrelated accounts' and
+  /// chats' pending work, so they stamp the scope instead — see
+  /// [_scopeEpoch].
   int _generation = 0;
+
+  /// Monotonic epoch of SCOPED invalidations: [removeAccount] and
+  /// [clearChat] stamp the scope with its value instead of touching the
+  /// global generation, so pending updates, loads and active-account
+  /// continuations of every other owner keep running.
+  int _scopeEpoch = 0;
+
+  /// Scope epoch at which each account was removed. A queued update that
+  /// ARRIVED before its account was removed (`removedAt > arrival`) is
+  /// dropped after the identity resolves, so pending work can never
+  /// resurrect removed history; later arrivals record again (the slot may
+  /// have re-registered), as they always did.
+  final Map<int, int> _removedAccountAt = {};
+
+  /// Scope epoch at which each (account, chat) was cleared, keyed
+  /// `'$accountUserId:$chatId'`. A queued update for that chat that arrived
+  /// before the clear is dropped after the identity resolves — a chat the
+  /// user cleared must not be recreated by updates already in flight.
+  /// Later arrivals record again. [includeChat] deliberately does not
+  /// remove a stamp: re-including an excluded chat is not an un-clear, and
+  /// the clear's protection must survive it.
+  final Map<String, int> _clearedChatAt = {};
+
+  /// Scope epoch the PERSISTED mirror file last reflected. Loads compare
+  /// each disk row's scope stamp against this (not the live epoch): rows of
+  /// a scope invalidated after the last persist are stale on disk and are
+  /// dropped, while once the writer has rewritten the file the same load
+  /// rule lets every surviving row — including later rows of a
+  /// re-registered account — apply freely. The stamps are never deleted, so
+  /// a queued update resolving long after the invalidation is still
+  /// classified correctly.
+  int _persistedScopeEpoch = 0;
 
   /// Resolved user id of the active client, kept in sync with
   /// [TosAccountUserIdResolver] results; null while unresolved.
@@ -570,22 +604,28 @@ class MessageHistoryStore extends ChangeNotifier {
     unawaited(_handleUpdateForClient(clientId, update));
   }
 
-  /// Handles one update for [clientId]. The update joins its client's
-  /// chain BEFORE identity resolution, so a client's records apply in
-  /// TDLib arrival order even when a lookup is slow or stuck; different
-  /// clients resolve and record concurrently. The generation is captured
-  /// at ARRIVAL so invalidations that land while the update is queued or
-  /// resolving can drop it before it writes.
+  /// Handles one update for [clientId]. The update joins its client's chain
+  /// BEFORE identity resolution, so a client's records apply in TDLib
+  /// arrival order even when a lookup is slow or stuck; different clients
+  /// resolve and record concurrently. BOTH epochs are captured at ARRIVAL
+  /// so invalidations that land while the update is queued or resolving
+  /// can drop it before it writes.
   Future<void> _handleUpdateForClient(
     int clientId,
     Map<String, dynamic> update,
   ) async {
     final arrivalGeneration = _generation;
+    final arrivalScopeEpoch = _scopeEpoch;
     final previous = _clientWorkers[clientId] ?? Future<void>.value();
     final worker = previous
         .catchError((_) {})
         .then(
-          (_) => _processUpdateForClient(clientId, update, arrivalGeneration),
+          (_) => _processUpdateForClient(
+            clientId,
+            update,
+            arrivalGeneration,
+            arrivalScopeEpoch,
+          ),
         );
     _clientWorkers[clientId] = worker;
     try {
@@ -601,16 +641,31 @@ class MessageHistoryStore extends ChangeNotifier {
   /// per client), then record in arrival order. A failed resolution drops
   /// this client's queued events for this attempt — unattributable updates
   /// are never guessed — and the next arrival starts a fresh attempt. An
-  /// invalidation (removal, clear, disposal) that landed after the update
-  /// arrived drops the write: pending work can never resurrect cleared or
-  /// removed history.
+  /// invalidation that landed after the update arrived drops the write:
+  /// pending work can never resurrect cleared or removed history. The drop
+  /// check is SCOPED — only the removed account's or cleared chat's own
+  /// queued updates are dropped; every other account's and chat's pending
+  /// work records as usual. Only the global generation (clearAll, dispose)
+  /// cancels across all scopes.
   Future<void> _processUpdateForClient(
     int clientId,
     Map<String, dynamic> update,
     int arrivalGeneration,
+    int arrivalScopeEpoch,
   ) async {
     final userId = await _identityOf(clientId);
     if (userId == null) return; // unattributable — never guess
+    final removedAt = _removedAccountAt[userId];
+    if (removedAt != null && removedAt > arrivalScopeEpoch) {
+      return; // its account was removed after the update arrived
+    }
+    final chatId = _updateChatId(update);
+    if (chatId != null) {
+      final clearedAt = _clearedChatAt['$userId:$chatId'];
+      if (clearedAt != null && clearedAt > arrivalScopeEpoch) {
+        return; // its chat was cleared after the update arrived
+      }
+    }
     if (_disposed || _generation != arrivalGeneration) return;
     unawaited(_recordUpdate(userId, update));
     // New evidence about the ACTIVE client's identity: when the active
@@ -624,11 +679,31 @@ class MessageHistoryStore extends ChangeNotifier {
     }
   }
 
+  /// The chat id an update targets, when the update payload carries one
+  /// (all four observed update types do). Null for an update whose payload
+  /// is missing or malformed — there is then no chat scope to check.
+  static int? _updateChatId(Map<String, dynamic> update) {
+    switch (update.type) {
+      case 'updateNewMessage':
+        return update.obj('message')?.int64('chat_id');
+      case 'updateMessageEdited':
+      case 'updateMessageContent':
+      case 'updateDeleteMessages':
+        return update.int64('chat_id');
+    }
+    return null;
+  }
+
   /// Identity resolution memoized per client: concurrent events share the
   /// in-flight lookup, and a KNOWN identity stays cached for the client's
-  /// following events. A failed or unresolved lookup (exception, null,
-  /// invalidation) is dropped from the memo so the next arrival starts a
-  /// fresh attempt instead of caching the failure.
+  /// following events. A failed or unresolved lookup (exception, null) is
+  /// dropped from the memo so the next arrival starts a fresh attempt
+  /// instead of caching the failure; a global wipe (clearAll) or disposal
+  /// forgets in-flight attempts too. SCOPED invalidations (removing one
+  /// account, clearing one chat) touch neither the memo nor in-flight
+  /// lookups — a client's identity does not change when an unrelated
+  /// account is removed — the scope filter runs per resolved account in
+  /// [_processUpdateForClient].
   Future<int?> _identityOf(int clientId) {
     final inFlight = _identityFutures[clientId];
     if (inFlight != null) return inFlight;
@@ -844,8 +919,11 @@ class MessageHistoryStore extends ChangeNotifier {
   }
 
   /// Removes the active account's kept copies of [chatId]; returns how many
-  /// went away. Bumps the generation so an in-flight load cannot re-add the
-  /// cleared rows from the mirror file afterwards.
+  /// went away. Scope-stamps (account, chat) so an in-flight load cannot
+  /// re-add the cleared rows from the mirror file afterwards, and queued
+  /// updates for that chat that arrived before the clear are dropped after
+  /// their identity resolves — without cancelling any other chat's or
+  /// account's pending work.
   int clearChat(int chatId) {
     if (!allowTelegramTosViolations) return 0;
     final accountUserId = _activeAccountUserId;
@@ -859,7 +937,7 @@ class MessageHistoryStore extends ChangeNotifier {
     for (final key in keys) {
       _byKey.remove(key);
     }
-    _generation++;
+    _clearedChatAt['$accountUserId:$chatId'] = ++_scopeEpoch;
     notifyListeners();
     _schedulePersist();
     return keys.length;
@@ -867,8 +945,8 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Removes every kept copy of every account; returns how many went away.
   /// Deliberately global: "clear everything" must not leave invisible
-  /// mirrors behind. Bumps the generation so pending queued updates and an
-  /// in-flight load cannot resurrect any of it.
+  /// mirrors behind. Bumps the generation AND the scope epoch so pending
+  /// queued updates and an in-flight load cannot resurrect any of it.
   int clearAll() {
     if (!allowTelegramTosViolations) return 0;
     if (_byKey.isEmpty) return 0;
@@ -876,6 +954,7 @@ class MessageHistoryStore extends ChangeNotifier {
     _byKey.clear();
     _pendingEditDates.clear();
     _generation++;
+    _scopeEpoch++;
     notifyListeners();
     _schedulePersist();
     return removed;
@@ -883,10 +962,13 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Forgets an account entirely: its kept copies, its pending edit dates
   /// and its exclusion preference. Called when a slot is logged out or
-  /// removed; account identity is known there, so nothing is guessed. The
-  /// generation bump invalidates every in-flight resolution, queued update
-  /// and load continuation that still targets this account: pending work
-  /// can never recreate history after logout/removal.
+  /// removed; account identity is known there, so nothing is guessed.
+  /// Instead of the store-wide generation bump, the removal is SCOPE-stamped
+  /// with the scope epoch: queued updates of THIS account that arrived
+  /// before the removal are dropped once their identity resolves (pending
+  /// work can never recreate history after logout/removal), while every
+  /// other account's queued updates, loads and resolution continuations
+  /// keep running untouched.
   void removeAccount(int accountUserId) {
     if (!allowTelegramTosViolations) return;
     var changed = false;
@@ -903,7 +985,7 @@ class MessageHistoryStore extends ChangeNotifier {
     );
     if (_excludedChatsByAccount.remove(accountUserId) != null) changed = true;
     unawaited(_prefs?.remove('$_prefsKeyPrefix$accountUserId'));
-    _generation++;
+    _removedAccountAt[accountUserId] = ++_scopeEpoch;
     if (_activeAccountUserId == accountUserId) {
       _activeAccountUserId = null;
       _activeAccountUserIdSource = null;
@@ -938,9 +1020,15 @@ class MessageHistoryStore extends ChangeNotifier {
       final file = File('${dir.path}/$_fileName');
       if (!await file.exists()) return;
       final decoded = jsonDecode(await file.readAsString());
-      // The generation re-check drops the load when the store was cleared,
-      // an account removed or disposed while the file was being read: a
-      // fresh on-disk batch must never resurrect the invalidated state.
+      // The generation re-check drops the load when the store was wiped
+      // (clearAll) or disposed while the file was being read: a fresh
+      // on-disk batch must never resurrect the invalidated state. A SCOPED
+      // invalidation (one account removed, one chat cleared) cancels only
+      // its own disk rows below — every other account's and chat's rows
+      // still load. Rows are judged against the scope epoch the FILE
+      // reflects: a row whose scope was invalidated after the last persist
+      // is stale on disk and is dropped even when the invalidation happened
+      // before this load started.
       if (_disposed || _generation != generation) return;
       if (decoded is! Map) return;
       final raw = decoded['entries'];
@@ -948,6 +1036,11 @@ class MessageHistoryStore extends ChangeNotifier {
       for (final json in raw) {
         final entry = MessageHistoryEntry.fromJson(json);
         if (entry == null) continue;
+        final removedAt = _removedAccountAt[entry.accountUserId];
+        if (removedAt != null && removedAt > _persistedScopeEpoch) continue;
+        final clearedAt =
+            _clearedChatAt['${entry.accountUserId}:${entry.chatId}'];
+        if (clearedAt != null && clearedAt > _persistedScopeEpoch) continue;
         _byKey.putIfAbsent(entry.key, () => entry);
       }
       _trim();
@@ -983,6 +1076,9 @@ class MessageHistoryStore extends ChangeNotifier {
       };
       await tmp.writeAsString(jsonEncode(batch), flush: true);
       await tmp.rename('${dir.path}/$_fileName');
+      // The file now reflects this exact invalidation state: loads may
+      // trust every row in it again.
+      _persistedScopeEpoch = _scopeEpoch;
     } catch (_) {
       return;
     } finally {
