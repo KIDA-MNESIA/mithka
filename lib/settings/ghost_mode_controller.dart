@@ -247,8 +247,17 @@ class GhostModeController extends ChangeNotifier {
   /// Per-client takeovers whose `getOption` read is still in flight. A
   /// second trigger for the same client awaits the first instead of starting
   /// its own read, so duplicate pending takeovers can never overwrite the
-  /// original capture.
+  /// original capture. After the awaited attempt settles, a waiter
+  /// revalidates everything before acting on its own: it must not launch a
+  /// fresh read while ghost mode is off (its attempt was cancelled), and it
+  /// rejoins any newer registered attempt instead of racing it.
   final Map<int, Future<void>> _pendingTakeovers = {};
+
+  /// Upper bound on how many strictly newer attempts a resumed waiter may
+  /// join before starting its own read. Joins are bounded so a pathological
+  /// enable/disable cycle cannot leave a waiter spinning forever; the bound
+  /// is far above any real churn.
+  static const _maxTakeoverRejoins = 16;
 
   /// Applies the current interception state to every registered client:
   /// turning ON reads and records each client's own presence and forces it
@@ -282,6 +291,21 @@ class GhostModeController extends ChangeNotifier {
       // ever overwriting the original capture.
       await pending;
       if (_preTakeoverOnline.containsKey(clientId)) return;
+      // The awaited attempt was cancelled mid-flight (a release dropped it
+      // while its read was outstanding). Revalidate before acting on its
+      // own: no fresh read may start while interception is off — the next
+      // enablement starts its own takeover — and any newer registered
+      // attempt is rejoined instead of raced. Each iteration only loops
+      // after joining a strictly newer attempt, and that join ends back in
+      // this loop's rechecks, so the bound below can never truncate a
+      // genuinely newer attempt.
+      for (var i = 0; i < _maxTakeoverRejoins; i++) {
+        if (!shouldShareOnline()) return;
+        final newer = _pendingTakeovers[clientId];
+        if (newer == null) break;
+        await newer;
+        if (_preTakeoverOnline.containsKey(clientId)) return;
+      }
     }
     final td = client ?? TdClient.shared;
     final inFlight = _runTakeover(clientId, td);
@@ -301,32 +325,55 @@ class GhostModeController extends ChangeNotifier {
   /// moment the capture (or its deliberate absence) is final, so a waiter
   /// can never see a settled takeover whose capture has not landed.
   Future<void> _runTakeover(int clientId, TdClient td) async {
-    bool? captured;
+    final attempt = Completer<void>();
+    _pendingTakeovers[clientId] = attempt.future;
     try {
-      final option = await td.queryTo({
-        '@type': 'getOption',
-        'name': 'online',
-      }, clientId);
-      // getOption answers with the optionValueBoolean object itself:
-      // {'@type': 'optionValueBoolean', 'value': <bool>}.
-      captured = option.boolean('value');
-    } catch (_) {
-      // A failed read records explicitly UNKNOWN (null), never an assumed
-      // value: the controller has not learned the client's requested state
-      // and very likely has not even delivered its force-offline through
-      // the same transport, so asserting anything on release would drive
-      // presence the user never asked for (see _preTakeoverOnline).
-      captured = null;
+      bool? captured;
+      try {
+        final option = await td.queryTo({
+          '@type': 'getOption',
+          'name': 'online',
+        }, clientId);
+        // getOption answers with the optionValueBoolean object itself:
+        // {'@type': 'optionValueBoolean', 'value': <bool>}.
+        captured = option.boolean('value');
+      } catch (_) {
+        // A failed read records explicitly UNKNOWN (null), never an assumed
+        // value: the controller has not learned the client's requested state
+        // and very likely has not even delivered its force-offline through
+        // the same transport, so asserting anything on release would drive
+        // presence the user never asked for (see _preTakeoverOnline).
+        captured = null;
+      }
+      // A restore may have raced this read (e.g. the global switch flipped
+      // while the getOption was in flight); honor the latest state instead of
+      // clobbering it with a stale takeover.
+      if (!shouldShareOnline()) {
+        // unawaited only to discard remove()'s return value: the dropped
+        // future belongs to this settling attempt.
+        unawaited(_pendingTakeovers.remove(clientId));
+        attempt.complete();
+        return;
+      }
+      // A client closed while its read was in flight is gone; recording a
+      // capture for it would resurrect bookkeeping nothing can release.
+      if (!td.registeredClientIds.contains(clientId)) {
+        unawaited(_pendingTakeovers.remove(clientId));
+        attempt.complete();
+        return;
+      }
+      _preTakeoverOnline[clientId] = captured;
+      unawaited(_pendingTakeovers.remove(clientId));
+      applyOnlineStatusToClient(false, clientId, td);
+      attempt.complete();
+    } catch (error) {
+      // The map is cleared before the attempt settles on EVERY path, and an
+      // errored attempt surfaces its error to joiners exactly like the
+      // directly-awaited future always did.
+      unawaited(_pendingTakeovers.remove(clientId));
+      attempt.completeError(error);
+      rethrow;
     }
-    // A restore may have raced this read (e.g. the global switch flipped
-    // while the getOption was in flight); honor the latest state instead of
-    // clobbering it with a stale takeover.
-    if (!shouldShareOnline()) return;
-    // A client closed while its read was in flight is gone; recording a
-    // capture for it would resurrect bookkeeping nothing can release.
-    if (!td.registeredClientIds.contains(clientId)) return;
-    _preTakeoverOnline[clientId] = captured;
-    applyOnlineStatusToClient(false, clientId, td);
   }
 
   /// Hands one client's `online` option back after a takeover. Sends only

@@ -511,6 +511,228 @@ void main() {
     });
   });
 
+  group('resumed waiters after a cancelled takeover (PR #209 round 3)', () {
+    test('two ready callbacks parked on a held read, disable, resolve while '
+        'disabled: waiters stay silent; re-enable captures once and restores '
+        'the fresh capture', () async {
+      await initializeWith(globalEnabled: false);
+      final hold = Completer<Map<String, dynamic>>();
+      onlineOptionReply = hold;
+      // First takeover: its getOption(online) read stays in flight.
+      final takeover = GhostModeController.shared.setGlobalEnabled(true);
+      for (var i = 0; i < 10 && queries.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(queries, hasLength(1), reason: 'first read is in flight');
+      // Two authorizationStateReady callbacks for the SAME client: both
+      // waiters must coalesce onto the in-flight first takeover.
+      final waiterA = deliverReady();
+      final waiterB = deliverReady();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(queries, hasLength(1), reason: 'both waiters coalesced');
+      // Disable before the read resolves: the capture is abandoned and
+      // the release must stay silent (nothing was ever captured).
+      await GhostModeController.shared.setGlobalEnabled(false);
+      requests.clear();
+      queries.clear();
+      wire.clear();
+      // The held read resolves while ghost mode is still OFF.
+      hold.complete({'@type': 'optionValueBoolean', 'value': true});
+      await takeover;
+      await waiterA;
+      await waiterB;
+      // Several turns for any wrongly-resumed read to land.
+      for (var i = 0; i < 5; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(
+        queries,
+        isEmpty,
+        reason:
+            'resumed waiters must honor their cancelled attempt: ghost '
+            'mode is off, so neither may start a new getOption read',
+      );
+      expect(
+        requests.where((request) => request['@type'] == 'setOption'),
+        isEmpty,
+        reason: 'a cancelled attempt must not write anything either',
+      );
+      // Re-enable: exactly ONE follow-up read; the answer true is captured.
+      onlineOptionReply = true;
+      await GhostModeController.shared.setGlobalEnabled(true);
+      expect(
+        queries,
+        hasLength(1),
+        reason:
+            'the resumed waiters must rejoin the re-enable takeover '
+            'instead of launching parallel duplicate reads',
+      );
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': false},
+        },
+      );
+      // Disable again: the NEW first capture (true) is restored.
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': true},
+        },
+        reason:
+            'the restore must send the fresh first capture (true), not a '
+            'stale parallel read that raced in after it',
+      );
+      onlineOptionReply = null;
+    });
+
+    test('three ready callbacks with delayed replies coalesce across an off/on '
+        'transition', () async {
+      await initializeWith(globalEnabled: false);
+      final hold = Completer<Map<String, dynamic>>();
+      onlineOptionReply = hold;
+      final takeover = GhostModeController.shared.setGlobalEnabled(true);
+      for (var i = 0; i < 10 && queries.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      // Three ready callbacks while the first read is held: all coalesce.
+      await deliverReady();
+      await deliverReady();
+      await deliverReady();
+      expect(queries, hasLength(1));
+      // The delayed reply lands while ENABLED: one capture, one force-off.
+      hold.complete({'@type': 'optionValueBoolean', 'value': true});
+      await takeover;
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': false},
+        },
+      );
+      // Off: restore the captured true, then on again with the follow-up
+      // read ALSO held — a ready callback arriving mid-flight coalesces.
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': true},
+        },
+      );
+      queries.clear();
+      final hold2 = Completer<Map<String, dynamic>>();
+      onlineOptionReply = hold2;
+      final reenable = GhostModeController.shared.setGlobalEnabled(true);
+      for (var i = 0; i < 10 && queries.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(queries, hasLength(1));
+      await deliverReady();
+      hold2.complete({'@type': 'optionValueBoolean', 'value': true});
+      await reenable;
+      expect(
+        queries,
+        hasLength(1),
+        reason: 'the late ready callback coalesced into the held read',
+      );
+      requests.clear();
+      await GhostModeController.shared.setGlobalEnabled(false);
+      expect(
+        requests.where((request) => request['@type'] == 'setOption').single,
+        {
+          '@type': 'setOption',
+          'name': 'online',
+          'value': {'@type': 'optionValueBoolean', 'value': true},
+        },
+      );
+      // One more cycle: three ready callbacks parked on a held read that
+      // a disable then cancels — none of the waiters may resurrect it.
+      queries.clear();
+      final hold3 = Completer<Map<String, dynamic>>();
+      onlineOptionReply = hold3;
+      final thirdEnable = GhostModeController.shared.setGlobalEnabled(true);
+      for (var i = 0; i < 10 && queries.isEmpty; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      await deliverReady();
+      await deliverReady();
+      await deliverReady();
+      expect(queries, hasLength(1));
+      await GhostModeController.shared.setGlobalEnabled(false);
+      requests.clear();
+      queries.clear();
+      hold3.complete({'@type': 'optionValueBoolean', 'value': true});
+      await thirdEnable;
+      for (var i = 0; i < 5; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(
+        queries,
+        isEmpty,
+        reason: 'three cancelled waiters must not resurrect the read',
+      );
+      expect(
+        requests.where((request) => request['@type'] == 'setOption'),
+        isEmpty,
+      );
+      onlineOptionReply = null;
+    });
+
+    test(
+      'resumed waiters while disabled send nothing until re-enable',
+      () async {
+        await initializeWith(globalEnabled: false);
+        final hold = Completer<Map<String, dynamic>>();
+        onlineOptionReply = hold;
+        final takeover = GhostModeController.shared.setGlobalEnabled(true);
+        for (var i = 0; i < 10 && queries.isEmpty; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        unawaited(deliverReady());
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        await GhostModeController.shared.setGlobalEnabled(false);
+        requests.clear();
+        queries.clear();
+        wire.clear();
+        hold.complete({'@type': 'optionValueBoolean', 'value': false});
+        await takeover;
+        for (var i = 0; i < 8; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(
+          wire,
+          isEmpty,
+          reason:
+              'nothing at all may hit the wire between the cancelled '
+              'takeover and the next real enablement: no getOption, no '
+              'setOption',
+        );
+        onlineOptionReply = true;
+        await GhostModeController.shared.setGlobalEnabled(true);
+        expect(
+          wire.map((request) => request['@type']),
+          ['getOption', 'setOption'],
+          reason:
+              'the first wire traffic after re-enable is the fresh '
+              'read-then-force-off, nothing from the stale waiters',
+        );
+        onlineOptionReply = null;
+      },
+    );
+  });
+
   group('disabled-initialization regression (PR #209 P1)', () {
     test(
       'empty prefs + global OFF: initialize() emits ZERO setOption',
