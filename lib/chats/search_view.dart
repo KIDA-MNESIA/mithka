@@ -59,6 +59,7 @@ class DesktopInlineSearchController extends ChangeNotifier {
       _miniAppSearch = miniAppSearch ?? TelegramMiniAppRecents.search {
     _model.addListener(_handleModelChanged);
     focusNode.addListener(_handleFocusChanged);
+    textController.addListener(_handleSelectionChanged);
   }
 
   static const List<SearchTab> _searchTabs = [
@@ -118,13 +119,27 @@ class DesktopInlineSearchController extends ChangeNotifier {
   /// it remains editable text until the user chooses a suggestion.
   ChatSearchTokenSuggestion? get resolvedSender => _committedSender;
 
-  /// Whether the field is asking to be taught its syntax: focused, empty, and
-  /// carrying no filters yet.
+  /// Whether the field asks to be taught its syntax: focused, empty, and with
+  /// nothing to show.
+  ///
+  /// A committed scope or sender does not close the lesson — the remaining
+  /// tokens still combine with it — but once that filter's results are in, the
+  /// panel answers with them and the hints return only when the field is
+  /// emptied again.
   bool get showsTokenHints =>
       focusNode.hasFocus &&
       _query.trim().isEmpty &&
-      _scope == null &&
-      resolvedSender == null;
+      !_activeTabs.any((tab) => _model.resultsFor(tab).isNotEmpty);
+
+  /// The tokens this field can still state: everything except a filter that
+  /// already sits as a badge (`in:` when scoped, `from:` when a sender is
+  /// committed).
+  List<SearchTokenHint> get visibleHints => [
+    if (scope == null) searchTokenInHint,
+    if (resolvedSender == null) searchTokenFromHint,
+    searchTokenHasHint,
+  ];
+
   bool get panelVisible => showsTokenHints || (_panelVisible && _hasSearch);
   bool get isLoading =>
       _debouncing || _miniAppsLoading || _activeTabs.any(_model.isLoading);
@@ -382,6 +397,18 @@ class DesktopInlineSearchController extends ChangeNotifier {
   void applySuggestion(ChatSearchTokenSuggestion suggestion) {
     final token = _activeToken;
     if (_disposed || token == null) return;
+    if (token.kind == ChatSearchTokenKind.has) {
+      // A `has:` kind is complete text, not a badge — the field keeps the
+      // token so the stated filter stays visible and editable.
+      final applied = applyChatSearchToken(_query, token, suggestion.token);
+      textController.value = TextEditingValue(
+        text: applied.text,
+        selection: TextSelection.collapsed(offset: applied.caret),
+      );
+      focusNode.requestFocus();
+      updateQuery(applied.text);
+      return;
+    }
     if (token.kind == ChatSearchTokenKind.chat) {
       _committedChat = suggestion;
       _scope = ActiveConversationScope(
@@ -519,6 +546,23 @@ class DesktopInlineSearchController extends ChangeNotifier {
     if (!_disposed) notifyListeners();
   }
 
+  void _handleSelectionChanged() {
+    if (_disposed || textController.text != _query) return;
+    final caret = textController.selection.baseOffset;
+    final next = activeChatSearchToken(
+      _query,
+      caret < 0 ? _query.length : caret,
+    );
+    final previous = _activeToken;
+    if ((next?.kind, next?.value, next?.start, next?.end) ==
+        (previous?.kind, previous?.value, previous?.start, previous?.end)) {
+      return;
+    }
+    _activeToken = next;
+    _startSuggestions();
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
@@ -597,112 +641,116 @@ class DesktopInlineSearchField extends StatelessWidget {
         // The width changes in the same frame the chip appears. Animating it
         // would leave the chip overflowing a still-narrow field for the length
         // of the transition.
-        child: Container(
-          key: const ValueKey('desktop-title-bar-search'),
-          width: widthFor(controller),
-          height: height,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          decoration: BoxDecoration(
-            color: c.searchFill,
-            borderRadius: BorderRadius.circular(AppRadius.md),
-            border: Border.all(
-              color: controller.focusNode.hasFocus
-                  ? AppTheme.brand.withValues(alpha: 0.72)
-                  : c.divider.withValues(alpha: 0.55),
-              width: controller.focusNode.hasFocus ? 1.25 : 0.5,
+        child: TextFieldTapRegion(
+          child: Container(
+            key: const ValueKey('desktop-title-bar-search'),
+            width: widthFor(controller),
+            height: height,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: c.searchFill,
+              borderRadius: BorderRadius.circular(AppRadius.md),
+              border: Border.all(
+                color: controller.focusNode.hasFocus
+                    ? AppTheme.brand.withValues(alpha: 0.72)
+                    : c.divider.withValues(alpha: 0.55),
+                width: controller.focusNode.hasFocus ? 1.25 : 0.5,
+              ),
             ),
-          ),
-          child: Row(
-            children: [
-              AppIcon(
-                HeroAppIcons.magnifyingGlass,
-                size: 14,
-                color: c.textTertiary,
-              ),
-              const SizedBox(width: 6),
-              if (scope != null) ...[
-                Flexible(
-                  child: _DesktopInlineSearchTokenChip(
-                    key: const ValueKey('desktop-title-bar-search-scope'),
-                    labelKey: AppStringKeys.desktopSearchScopeIn,
-                    value: scope.title,
-                    onRemove: controller.clearScope,
-                    removeKey: const ValueKey(
-                      'desktop-title-bar-search-scope-remove',
-                    ),
-                  ),
+            child: Row(
+              children: [
+                AppIcon(
+                  HeroAppIcons.magnifyingGlass,
+                  size: 14,
+                  color: c.textTertiary,
                 ),
                 const SizedBox(width: 6),
-              ],
-              if (controller.resolvedSender case final sender?) ...[
-                Flexible(
-                  child: _DesktopInlineSearchTokenChip(
-                    key: const ValueKey('desktop-title-bar-search-from'),
-                    labelKey: AppStringKeys.chatSearchTokenFrom,
-                    value: sender.title,
-                    onRemove: controller.clearSender,
-                    removeKey: const ValueKey(
-                      'desktop-title-bar-search-from-remove',
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-              ],
-              Expanded(
-                child: CupertinoTextField(
-                  key: const ValueKey('desktop-title-bar-search-input'),
-                  controller: controller.textController,
-                  focusNode: controller.focusNode,
-                  autocorrect: false,
-                  textInputAction: TextInputAction.search,
-                  style: TextStyle(fontSize: 13, color: c.textPrimary),
-                  placeholder: AppStrings.t(
-                    scope == null
-                        ? AppStringKeys.chatsSearchPlaceholder
-                        : AppStringKeys.desktopSearchScopePlaceholder,
-                  ),
-                  placeholderStyle: TextStyle(
-                    fontSize: 13,
-                    color: c.textTertiary,
-                  ),
-                  padding: EdgeInsets.zero,
-                  decoration: null,
-                  onTap: controller.focus,
-                  onChanged: controller.updateQuery,
-                  onSubmitted: (value) {
-                    final query = value.trim();
-                    if (query.isEmpty) return;
-                    final scope = controller.scope;
-                    final host = desktopInlineSearchHostContext(context);
-                    controller.dismiss();
-                    if (scope != null) {
-                      if (host != null) {
-                        unawaited(_openScopedChatSearch(host, scope, query));
-                      }
-                      return;
-                    }
-                    unawaited(Future<void>.sync(() => onSearchAll(query)));
-                  },
-                ),
-              ),
-              if (controller.query.isNotEmpty)
-                AppInteractiveSurface(
-                  key: const ValueKey('desktop-title-bar-search-clear'),
-                  semanticLabel: AppStringKeys.desktopSearchClear.l10n(context),
-                  onTap: controller.clear,
-                  borderRadius: BorderRadius.circular(AppRadius.control),
-                  child: SizedBox.square(
-                    dimension: 18,
-                    child: Center(
-                      child: AppIcon(
-                        HeroAppIcons.xmark,
-                        size: 12,
-                        color: c.textTertiary,
+                if (scope != null) ...[
+                  Flexible(
+                    child: _DesktopInlineSearchTokenChip(
+                      key: const ValueKey('desktop-title-bar-search-scope'),
+                      labelKey: AppStringKeys.desktopSearchScopeIn,
+                      value: scope.title,
+                      onRemove: controller.clearScope,
+                      removeKey: const ValueKey(
+                        'desktop-title-bar-search-scope-remove',
                       ),
                     ),
                   ),
+                  const SizedBox(width: 6),
+                ],
+                if (controller.resolvedSender case final sender?) ...[
+                  Flexible(
+                    child: _DesktopInlineSearchTokenChip(
+                      key: const ValueKey('desktop-title-bar-search-from'),
+                      labelKey: AppStringKeys.chatSearchTokenFrom,
+                      value: sender.title,
+                      onRemove: controller.clearSender,
+                      removeKey: const ValueKey(
+                        'desktop-title-bar-search-from-remove',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: CupertinoTextField(
+                    key: const ValueKey('desktop-title-bar-search-input'),
+                    controller: controller.textController,
+                    focusNode: controller.focusNode,
+                    autocorrect: false,
+                    textInputAction: TextInputAction.search,
+                    style: TextStyle(fontSize: 13, color: c.textPrimary),
+                    placeholder: AppStrings.t(
+                      scope == null
+                          ? AppStringKeys.chatsSearchPlaceholder
+                          : AppStringKeys.desktopSearchScopePlaceholder,
+                    ),
+                    placeholderStyle: TextStyle(
+                      fontSize: 13,
+                      color: c.textTertiary,
+                    ),
+                    padding: EdgeInsets.zero,
+                    decoration: null,
+                    onTap: controller.focus,
+                    onChanged: controller.updateQuery,
+                    onSubmitted: (value) {
+                      final query = value.trim();
+                      if (query.isEmpty) return;
+                      final scope = controller.scope;
+                      final host = desktopInlineSearchHostContext(context);
+                      controller.dismiss();
+                      if (scope != null) {
+                        if (host != null) {
+                          unawaited(_openScopedChatSearch(host, scope, query));
+                        }
+                        return;
+                      }
+                      unawaited(Future<void>.sync(() => onSearchAll(query)));
+                    },
+                  ),
                 ),
-            ],
+                if (controller.query.isNotEmpty)
+                  AppInteractiveSurface(
+                    key: const ValueKey('desktop-title-bar-search-clear'),
+                    semanticLabel: AppStringKeys.desktopSearchClear.l10n(
+                      context,
+                    ),
+                    onTap: controller.clear,
+                    borderRadius: BorderRadius.circular(AppRadius.control),
+                    child: SizedBox.square(
+                      dimension: 18,
+                      child: Center(
+                        child: AppIcon(
+                          HeroAppIcons.xmark,
+                          size: 12,
+                          color: c.textTertiary,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       );
@@ -855,24 +903,26 @@ class DesktopInlineSearchPanel extends StatelessWidget {
   /// so a token being typed does not change the shape under the field.
   Widget _panelShell(BuildContext context, {required Widget child}) {
     final c = context.colors;
-    return Container(
-      key: const ValueKey('desktop-inline-search-panel'),
-      width: width,
-      constraints: const BoxConstraints(maxHeight: 540),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        color: c.background,
-        borderRadius: BorderRadius.circular(AppRadius.card),
-        border: Border.all(color: c.divider, width: 0.75),
-        boxShadow: [
-          BoxShadow(
-            color: const Color(0xFF000000).withValues(alpha: 0.22),
-            blurRadius: 24,
-            offset: const Offset(0, 10),
-          ),
-        ],
+    return TextFieldTapRegion(
+      child: Container(
+        key: const ValueKey('desktop-inline-search-panel'),
+        width: width,
+        constraints: const BoxConstraints(maxHeight: 540),
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: c.background,
+          borderRadius: BorderRadius.circular(AppRadius.card),
+          border: Border.all(color: c.divider, width: 0.75),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF000000).withValues(alpha: 0.22),
+              blurRadius: 24,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: child,
       ),
-      child: child,
     );
   }
 
@@ -900,11 +950,7 @@ class DesktopInlineSearchPanel extends StatelessWidget {
         return _panelShell(
           context,
           child: SearchTokenHints(
-            hints: const [
-              searchTokenFromHint,
-              searchTokenInHint,
-              searchTokenHasHint,
-            ],
+            hints: controller.visibleHints,
             onPick: controller.startToken,
           ),
         );
