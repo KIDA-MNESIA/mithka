@@ -15,9 +15,11 @@ import 'package:flutter/services.dart';
 
 import '../app/ipad_window_chrome.dart';
 import '../chats/search_token_views.dart';
+import '../components/app_date_picker.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/photo_avatar.dart';
+import '../components/toast.dart';
 import '../components/ui_components.dart';
 import '../l10n/app_localizations.dart';
 import '../platform/keyboard_modifiers.dart';
@@ -38,6 +40,7 @@ class ChatSearchHeaderBar extends StatelessWidget {
     this.backgroundColor,
     this.showDivider = true,
     this.showSteppers = false,
+    this.onJumpToMessage,
   });
 
   final ChatMessageSearchController controller;
@@ -49,6 +52,13 @@ class ChatSearchHeaderBar extends StatelessWidget {
   /// Wide layouts keep the up/down controls in the header because the composer
   /// stays put; narrow ones get them in [ChatSearchNavigator] instead.
   final bool showSteppers;
+
+  /// Moves the transcript to the message a picked calendar date resolves to.
+  ///
+  /// The date jump is not a search hit — nothing is marked, the counter is
+  /// untouched — so the landing is the caller's plain scroll, not
+  /// [ChatMessageSearchController.onActivateResult].
+  final ValueChanged<ChatMessage>? onJumpToMessage;
 
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
@@ -106,12 +116,87 @@ class ChatSearchHeaderBar extends StatelessWidget {
       Expanded(
         child: _ChatSearchField(controller: controller, onClose: onClose),
       ),
+      if (onJumpToMessage != null) ...[
+        const SizedBox(width: AppSpacing.xs),
+        _ChatSearchDateJump(
+          controller: controller,
+          onJumpToMessage: onJumpToMessage!,
+        ),
+      ],
       if (showSteppers) ...[
         const SizedBox(width: AppSpacing.sm),
         ChatSearchSteppers(controller: controller),
       ],
     ],
   );
+}
+
+/// The calendar affordance beside the search field: pick a date, land on the
+/// first message of that day — the same jump the official clients keep behind
+/// a calendar icon in search.
+class _ChatSearchDateJump extends StatelessWidget {
+  const _ChatSearchDateJump({
+    required this.controller,
+    required this.onJumpToMessage,
+  });
+
+  final ChatMessageSearchController controller;
+  final ValueChanged<ChatMessage> onJumpToMessage;
+
+  Future<void> _pick(BuildContext context) async {
+    final session = controller.sessionToken;
+    if (session == 0) return;
+    final now = DateTime.now();
+    final date = await showAppDatePicker(
+      context,
+      title: AppStringKeys.chatSearchJumpToDate.l10n(context),
+      initialDate: now,
+      firstDate: DateTime(2009, 8),
+      lastDate: now,
+    );
+    if (date == null || !context.mounted) return;
+    if (!controller.isCurrentSession(session)) return;
+    final lookup = await controller.messageAtDate(date);
+    // A lookup superseded by a close/reopen (or a newer pick) must neither
+    // land nor toast: the answer belongs to a session the user left behind.
+    if (!lookup.current || !controller.isCurrentSession(session)) return;
+    if (!context.mounted) return;
+    final message = lookup.message;
+    if (message == null) {
+      // "No messages on that date" is only true when the day was proven
+      // empty. A walk that failed or stopped moving must say so instead of
+      // pretending the day had nothing.
+      showToast(
+        context,
+        lookup.emptyDay
+            ? AppStringKeys.chatSearchNoMessagesAtDate.l10n(context)
+            : AppStringKeys.chatSearchDateJumpFailed.l10n(context),
+      );
+      return;
+    }
+    onJumpToMessage(message);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return AppInteractiveSurface(
+      key: const ValueKey('chatSearchDateJump'),
+      semanticLabel: AppStringKeys.chatSearchJumpToDate.l10n(context),
+      onTap: () => unawaited(_pick(context)),
+      borderRadius: BorderRadius.circular(AppRadius.pill),
+      child: SizedBox.square(
+        dimension: 20,
+        child: Center(
+          child: AppIcon(
+            HeroAppIcons.calendarDays,
+            size: AppIconSize.xs,
+            color: c.textTertiary,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// A resolved `from:` token, shown so the narrowed search is visible rather
