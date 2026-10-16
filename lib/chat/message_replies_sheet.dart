@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 
@@ -189,11 +190,38 @@ class _MessageRepliesSheet extends StatefulWidget {
   State<_MessageRepliesSheet> createState() => _MessageRepliesSheetState();
 }
 
+/// How far one sweep step of the in-sheet jump moves, as a fraction of the
+/// viewport. The step is applied only in the direction the materialized window
+/// proves the target lies in, so the sweep always makes progress.
+const double _sheetReplyScrollStepFraction = 0.8;
+
+/// Frame budget of the in-sheet jump. The sweep steps toward the target by
+/// less than a viewport at a time and each step is decided by the rows the
+/// sliver actually built, so a whole 100-row thread is reachable well inside
+/// this budget; exceeding it means the target cannot be reached at all.
+const int _sheetReplyScrollMaxSteps = 240;
+
+/// Precision below which two scroll offsets count as the same position.
+const double _sheetReplyScrollTolerance = 0.5;
+
+/// Test seam: makes the in-sheet reply jump report failure, so the verified
+/// navigation fallback can be exercised without an unreachable row.
+@visibleForTesting
+bool debugForceSheetReplyScrollFailure = false;
+
+/// Identity of a reply-sheet row: a channel post and a discussion comment can
+/// carry the same numeric message id, so every row key, cache and lookup in
+/// the sheet must be scoped by the chat owning the message.
+typedef _SheetMessageKey = ({int chatId, int messageId});
+
 class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
   final _replyController = TextEditingController();
   final _replyFocus = FocusNode();
+  final _scrollController = ScrollController();
   final _messages = <ChatMessage>[];
+  final _rowKeys = <_SheetMessageKey, GlobalKey>{};
   final _senders = <int, _ReplySender>{};
+  final _chatTitles = <int, String>{};
   _ReplyThreadTarget? _replyTarget;
   String? _replyTargetTitle;
   ChatMessage? _replyTo;
@@ -216,6 +244,7 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
   void dispose() {
     _replyController.dispose();
     _replyFocus.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -264,31 +293,87 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
               .map(TDParse.message)
               .whereType<ChatMessage>()
               .where((message) => !message.isService)
-              .where((message) => message.id != widget.message.id)
-              .where(
-                (message) => message.id != replyTarget?.historyRootMessageId,
-              )
+              // The channel root and a discussion comment can share a numeric
+              // message id; only the composite identity proves a row IS one of
+              // the thread's roots, so a same-id comment of another chat is
+              // kept instead of vanishing with the root.
+              .where((message) => !_isSheetRootMessage(message, replyTarget))
               .toList()
             ..sort((a, b) => a.date.compareTo(b.date));
+      await _hydrateMessageSender(widget.message);
       for (final message in loaded) {
-        final senderId = message.senderId;
-        if (senderId == null) continue;
-        var sender = _senders[senderId];
-        if (sender == null) {
-          sender = await _resolveSender(senderId);
-          if (sender != null) _senders[senderId] = sender;
+        await _hydrateMessageSender(message);
+      }
+      final byChatAndId = <({int chatId, int messageId}), ChatMessage>{
+        (chatId: widget.chatId, messageId: widget.message.id): widget.message,
+        for (final message in loaded)
+          (
+            chatId: message.chatId ?? replyTarget?.chatId ?? widget.chatId,
+            messageId: message.id,
+          ): message,
+      };
+      final missingByChatId = <int, Set<int>>{};
+      for (final message in loaded) {
+        final rid = message.replyToMessageId;
+        if (rid == null) continue;
+        final rChatId =
+            message.replyToChatId ??
+            message.chatId ??
+            replyTarget?.chatId ??
+            widget.chatId;
+        if (byChatAndId.containsKey((chatId: rChatId, messageId: rid))) {
+          continue;
         }
-        if (sender != null) {
-          message.senderName ??= sender.name;
-          message.senderPhoto ??= sender.photo;
+        missingByChatId.putIfAbsent(rChatId, () => <int>{}).add(rid);
+      }
+      for (final entry in missingByChatId.entries) {
+        try {
+          final res = await TdClient.shared.query({
+            '@type': 'getMessages',
+            'chat_id': entry.key,
+            'message_ids': entry.value.toList(),
+          });
+          for (final raw
+              in res.objects('messages') ?? const <Map<String, dynamic>>[]) {
+            final quoted = TDParse.message(raw);
+            if (quoted == null) continue;
+            await _hydrateMessageSender(quoted);
+            final qChatId = quoted.chatId ?? entry.key;
+            byChatAndId[(chatId: qChatId, messageId: quoted.id)] = quoted;
+          }
+        } catch (_) {}
+      }
+      final extraChatIds = <int>{
+        for (final message in loaded)
+          if (message.replyToChatId case final rChatId?
+              when rChatId != widget.chatId && rChatId != replyTarget?.chatId)
+            rChatId,
+      };
+      for (final chatId in extraChatIds) {
+        if (_chatTitles.containsKey(chatId)) continue;
+        final info = await _targetChatInfo(chatId);
+        final title = info?.title?.trim();
+        if (title != null && title.isNotEmpty) {
+          _chatTitles[chatId] = title;
         }
       }
-      final byId = {for (final message in loaded) message.id: message};
       for (final message in loaded) {
-        final quoted = byId[message.replyToMessageId];
+        final rid = message.replyToMessageId;
+        if (rid == null) continue;
+        final rChatId =
+            message.replyToChatId ??
+            message.chatId ??
+            replyTarget?.chatId ??
+            widget.chatId;
+        final quoted = byChatAndId[(chatId: rChatId, messageId: rid)];
         if (quoted == null) continue;
-        message.replyToSender ??=
-            quoted.senderName ?? quoted.senderTitle ?? widget.peerTitle;
+        // The sender name is a trust boundary of the same quote: a
+        // restriction-redacted parent must not lend its cached plaintext or
+        // identity to the row quoting it.
+        message.replyToSender ??= quoted.isContentRestricted
+            ? widget.peerTitle
+            : quoted.senderName ?? quoted.senderTitle ?? widget.peerTitle;
+        if (quoted.isContentRestricted) continue;
         message.replyToPreview ??= quoted.text;
         message.replyToDate ??= quoted.date;
         message.replyToEntities = quoted.textEntities;
@@ -306,6 +391,10 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
         _messages
           ..clear()
           ..addAll(loaded);
+        final loadedKeys = <_SheetMessageKey>{
+          for (final message in loaded) _sheetKeyFor(message),
+        };
+        _rowKeys.removeWhere((key, _) => !loadedKeys.contains(key));
         _loading = false;
       });
     } on _RepliesUnavailable {
@@ -372,19 +461,23 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
         '@type': 'getChat',
         'chat_id': chatId,
       });
+      final title = chat.str('title');
+      if (title != null && title.trim().isNotEmpty) {
+        _chatTitles[chatId] = title.trim();
+      }
       return _ReplyTargetChatInfo(
         canSend:
             chat.obj('permissions')?.boolean('can_send_basic_messages') ?? true,
-        title: chat.str('title'),
+        title: title,
       );
     } catch (_) {
       return null;
     }
   }
 
-  MessageRepliesViewTarget _viewInChatTarget() {
+  MessageRepliesViewTarget _viewInChatTarget({int? targetMessageId}) {
     final target = _replyTarget;
-    return resolveMessageRepliesViewTarget(
+    final viewTarget = resolveMessageRepliesViewTarget(
       sourceChatId: widget.chatId,
       sourceMessageId: widget.message.id,
       sourceTitle: widget.peerTitle,
@@ -393,6 +486,26 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
       rootReplyToMessageId: target?.rootReplyToMessageId,
       threadTitle: _replyTargetTitle,
     );
+    if (targetMessageId == null) return viewTarget;
+    return MessageRepliesViewTarget(
+      chatId: viewTarget.chatId,
+      messageId: targetMessageId,
+      title: viewTarget.title,
+    );
+  }
+
+  Future<void> _hydrateMessageSender(ChatMessage message) async {
+    final senderId = message.senderId;
+    if (senderId == null) return;
+    var sender = _senders[senderId];
+    if (sender == null) {
+      sender = await _resolveSender(senderId);
+      if (sender != null) _senders[senderId] = sender;
+    }
+    if (sender != null) {
+      message.senderName ??= sender.name;
+      message.senderPhoto ??= sender.photo;
+    }
   }
 
   Future<_ReplySender?> _resolveSender(int senderId) async {
@@ -675,6 +788,7 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
       return _emptyState(AppStringKeys.messageRepliesEmpty);
     }
     return ListView.separated(
+      controller: _scrollController,
       padding: const EdgeInsets.fromLTRB(4, 7, 4, 12),
       itemCount: _messages.length,
       separatorBuilder: (_, _) => const SizedBox.shrink(),
@@ -1093,29 +1207,278 @@ class _MessageRepliesSheetState extends State<_MessageRepliesSheet> {
         widget.peerTitle;
     message.senderName ??= senderName;
     message.senderPhoto ??= sender?.photo;
-    return MessageReplySheetItem(
-      message: message,
-      peerTitle: widget.peerTitle,
-      senderName: senderName,
-      senderPhoto: sender?.photo ?? message.senderPhoto,
-      onReply: _canReply ? _beginReply : null,
-      onLongPress: (message, _, source) => unawaited(_showMessageMenu(message)),
-      onAvatarTap: widget.onAvatarTap,
-      onOpenReply: widget.onOpenReply == null
-          ? null
-          : (messageId) {
-              Navigator.of(context).pop();
-              widget.onOpenReply!(messageId);
-            },
-      onOpenImage: _openImage,
-      onOpenImageGallery: _openImageGallery,
-      onOpenSticker: widget.onOpenSticker,
-      onPlayVideo: widget.onPlayVideo,
-      onPlayMusic: widget.onPlayMusic,
-      onButtonTap: widget.onButtonTap,
-      onBotCommandTap: widget.onBotCommandTap,
-      onHashtagTap: widget.onHashtagTap,
+    final rowKey = _rowKeys.putIfAbsent(_sheetKeyFor(message), GlobalKey.new);
+    final replyTargetChatId =
+        message.replyToChatId ??
+        message.chatId ??
+        _replyTarget?.chatId ??
+        widget.chatId;
+    final hasInSheetReplyTarget =
+        message.replyToMessageId != null &&
+        _messages.any(
+          (candidate) =>
+              candidate.id == message.replyToMessageId &&
+              (candidate.chatId ?? _replyTarget?.chatId ?? widget.chatId) ==
+                  replyTargetChatId,
+        );
+    // A row's reply target resolves inside the sheet when the sheet's own chat
+    // owns a row with that message id.
+    final canOpenReply =
+        (message.replyToMessageId != null &&
+            _sheetRowIndexOf(message.replyToMessageId!) >= 0) ||
+        widget.onOpenReply != null ||
+        widget.onViewInChat != null ||
+        hasInSheetReplyTarget;
+    return KeyedSubtree(
+      key: rowKey,
+      child: MessageReplySheetItem(
+        message: message,
+        peerTitle: widget.peerTitle,
+        senderName: senderName,
+        senderPhoto: sender?.photo ?? message.senderPhoto,
+        onReply: _canReply ? _beginReply : null,
+        onLongPress: (message, _, source) =>
+            unawaited(_showMessageMenu(message)),
+        onAvatarTap: widget.onAvatarTap,
+        onOpenReply: canOpenReply
+            ? (messageId) => unawaited(_openReplyTarget(message, messageId))
+            : null,
+        onOpenImage: _openImage,
+        onOpenImageGallery: _openImageGallery,
+        onOpenSticker: widget.onOpenSticker,
+        onPlayVideo: widget.onPlayVideo,
+        onPlayMusic: widget.onPlayMusic,
+        onButtonTap: widget.onButtonTap,
+        onBotCommandTap: widget.onBotCommandTap,
+        onHashtagTap: widget.onHashtagTap,
+      ),
     );
+  }
+
+  Future<void> _openReplyTarget(ChatMessage source, int targetMessageId) async {
+    final targetChatId =
+        source.replyToChatId ??
+        source.chatId ??
+        _replyTarget?.chatId ??
+        widget.chatId;
+    // The sheet lists one chat's rows, so an in-sheet target is identified by
+    // (row chat == sheet chat, message id) — never by the id alone, which a
+    // cross-chat reply can collide with.
+    final targetIndex = targetChatId == _sheetChatId
+        ? _sheetRowIndexOf(targetMessageId, chatId: targetChatId)
+        : -1;
+    if (targetIndex >= 0) {
+      final reached = await _scrollToSheetReply(targetIndex, targetMessageId);
+      if (reached) return;
+      if (!mounted) return;
+      // The in-sheet sweep could not prove the target visible. Do not swallow
+      // the tap: fall through to the explicit navigation below, which opens
+      // the same (chat, message) pair through a verified route.
+    }
+    if (!mounted) return;
+    if (targetChatId != widget.chatId && widget.onViewInChat != null) {
+      final resolvedTitle = targetChatId == _replyTarget?.chatId
+          ? (_replyTargetTitle?.trim().isNotEmpty == true
+                ? _replyTargetTitle!.trim()
+                : widget.peerTitle)
+          : (_chatTitles[targetChatId] ?? widget.peerTitle);
+      final viewTarget = MessageRepliesViewTarget(
+        chatId: targetChatId,
+        messageId: targetMessageId,
+        title: resolvedTitle,
+      );
+      Navigator.of(context).pop();
+      widget.onViewInChat!(viewTarget);
+      return;
+    }
+    if (widget.onOpenReply != null) {
+      Navigator.of(context).pop();
+      widget.onOpenReply!(targetMessageId);
+      return;
+    }
+    if (widget.onViewInChat != null) {
+      Navigator.of(context).pop();
+      widget.onViewInChat!(
+        MessageRepliesViewTarget(
+          chatId: targetChatId,
+          messageId: targetMessageId,
+          title: widget.peerTitle,
+        ),
+      );
+    }
+  }
+
+  /// The chat whose messages this sheet lists: the linked discussion group
+  /// when the thread root resolves to another chat, else the source chat.
+  int get _sheetChatId => _replyTarget?.chatId ?? widget.chatId;
+
+  /// Identity of a sheet row. Messages parsed from this thread's history carry
+  /// their own chat id; older/local fixtures leave it null and belong to the
+  /// sheet's chat.
+  ({int chatId, int messageId}) _sheetKeyFor(ChatMessage message) =>
+      (chatId: message.chatId ?? _sheetChatId, messageId: message.id);
+
+  /// Index of the in-sheet row with [messageId] owned by [chatId] (the sheet's
+  /// own chat when the caller has none), or -1 when the sheet has no such row.
+  int _sheetRowIndexOf(int messageId, {int? chatId}) {
+    final expectedChatId = chatId ?? _sheetChatId;
+    for (var index = 0; index < _messages.length; index++) {
+      final candidate = _messages[index];
+      if (candidate.id != messageId) continue;
+      if ((candidate.chatId ?? _sheetChatId) == expectedChatId) return index;
+    }
+    return -1;
+  }
+
+  /// Whether [message], parsed out of this thread's history, IS one of the
+  /// thread's roots. The comparison is (chatId, messageId): a discussion
+  /// comment that reuses the channel post's numeric id is a real row and must
+  /// not be dropped with the root.
+  bool _isSheetRootMessage(ChatMessage message, _ReplyThreadTarget? target) {
+    final sheetChatId = target?.chatId ?? widget.chatId;
+    final key = (chatId: message.chatId ?? sheetChatId, messageId: message.id);
+    if (key == (chatId: widget.chatId, messageId: widget.message.id)) {
+      return true;
+    }
+    final historyRoot = target?.historyRootMessageId;
+    return historyRoot != null &&
+        key == (chatId: sheetChatId, messageId: historyRoot);
+  }
+
+  /// Scrolls the sheet until the row at [targetIndex] is on screen, and
+  /// reports whether it actually got there.
+  ///
+  /// A row that has never been materialized has no render object, and with
+  /// strongly non-uniform heights neither a proportional offset nor an
+  /// estimate of the remaining extent can stand in for its position: ten
+  /// hundred-line comments followed by ninety short ones make any pixel guess
+  /// wrong by thousands of pixels. So nothing here is estimated. Every step is
+  /// decided by the window the sliver has actually built:
+  ///
+  /// - the target is materialized: jump to its measured reveal offset and the
+  ///   visibility check decides;
+  /// - the target is above that window: step up by most of a viewport;
+  /// - the target is below it: step down by most of a viewport.
+  ///
+  /// Scroll offset is monotone in item index, so each step moves strictly
+  /// toward the target and the sweep terminates. Success is only reported when
+  /// the target row is materialized AND intersects the viewport — never because
+  /// some offset changed.
+  Future<bool> _scrollToSheetReply(int targetIndex, int targetMessageId) async {
+    if (debugForceSheetReplyScrollFailure) return false;
+    if (!mounted || !_scrollController.hasClients) return false;
+    if (targetIndex < 0 || targetIndex >= _messages.length) return false;
+
+    for (var step = 0; step < _sheetReplyScrollMaxSteps; step++) {
+      if (!mounted || !_scrollController.hasClients) return false;
+
+      // Materialized: land on the row itself, by measurement.
+      final reveal = _revealOffsetFor(targetIndex, targetMessageId);
+      if (reveal != null) {
+        final position = _scrollController.position;
+        final target = reveal.clamp(
+          position.minScrollExtent,
+          position.maxScrollExtent,
+        );
+        if ((target - position.pixels).abs() >= _sheetReplyScrollTolerance) {
+          _scrollController.jumpTo(target);
+          await WidgetsBinding.instance.endOfFrame;
+        }
+        if (_sheetReplyVisible(targetIndex, targetMessageId)) return true;
+        // The measured reveal did not bring it into view (the row can be
+        // taller than the viewport): fall through to the sweep below, which
+        // still only moves in a proven direction.
+      }
+
+      if (!mounted || !_scrollController.hasClients) return false;
+      final position = _scrollController.position;
+      final window = _sheetMaterializedRange();
+      final viewportStep =
+          position.viewportDimension * _sheetReplyScrollStepFraction;
+      final double next;
+      if (window == null || targetIndex < window.$1) {
+        // Nothing built, or the target sits above what is built.
+        next = position.pixels - viewportStep;
+      } else if (targetIndex > window.$2) {
+        next = position.pixels + viewportStep;
+      } else {
+        // Inside the built range yet not visible: the row's own reveal offset
+        // was already tried, so step toward the side it was measured on.
+        final measuredBelow = reveal == null || reveal > position.pixels;
+        next = position.pixels + (measuredBelow ? viewportStep : -viewportStep);
+      }
+      final clamped = next.clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((clamped - position.pixels).abs() < _sheetReplyScrollTolerance) {
+        // The scroll range ends here and the target was not reached.
+        return _sheetReplyVisible(targetIndex, targetMessageId);
+      }
+      _scrollController.jumpTo(clamped);
+      await WidgetsBinding.instance.endOfFrame;
+      if (_sheetReplyVisible(targetIndex, targetMessageId)) return true;
+    }
+    return _sheetReplyVisible(targetIndex, targetMessageId);
+  }
+
+  /// Inclusive index range of the rows the sliver currently has built, or null
+  /// when none is measurable. Used to decide which way the jump must sweep;
+  /// the heights themselves are never assumed.
+  (int, int)? _sheetMaterializedRange() {
+    int? first;
+    int? last;
+    for (var i = 0; i < _messages.length; i++) {
+      final render = _rowRenderObject(i, _messages[i].id);
+      if (render == null) continue;
+      first ??= i;
+      last = i;
+    }
+    return first == null || last == null ? null : (first, last);
+  }
+
+  double? _revealOffsetFor(int targetIndex, int targetMessageId) {
+    final render = _rowRenderObject(targetIndex, targetMessageId);
+    if (render == null) return null;
+    final viewport = RenderAbstractViewport.maybeOf(render);
+    if (viewport == null) return null;
+    return viewport.getOffsetToReveal(render, 0.15).offset;
+  }
+
+  RenderBox? _rowRenderObject(int targetIndex, int targetMessageId) {
+    final context = _rowContextFor(targetIndex, targetMessageId);
+    if (context == null) return null;
+    final render = context.findRenderObject();
+    return render is RenderBox && render.hasSize && render.attached
+        ? render
+        : null;
+  }
+
+  /// Mounted element of the row at [targetIndex] when it is the row carrying
+  /// [targetMessageId]. The key comes from the row's OWN composite identity, so
+  /// a same-id row of another chat can never stand in for this target.
+  BuildContext? _rowContextFor(int targetIndex, int targetMessageId) {
+    if (targetIndex < 0 || targetIndex >= _messages.length) return null;
+    final row = _messages[targetIndex];
+    if (row.id != targetMessageId) return null;
+    final context = _rowKeys[_sheetKeyFor(row)]?.currentContext;
+    return context != null && context.mounted ? context : null;
+  }
+
+  bool _sheetReplyVisible(int targetIndex, int targetMessageId) {
+    final context = _rowContextFor(targetIndex, targetMessageId);
+    if (context == null) return false;
+    final render = context.findRenderObject();
+    if (render is! RenderBox || !render.hasSize || !render.attached) {
+      return false;
+    }
+    final viewport = RenderAbstractViewport.maybeOf(render);
+    if (viewport == null || !_scrollController.hasClients) return false;
+    final reveal = viewport.getOffsetToReveal(render, 0.0);
+    final position = _scrollController.position;
+    final top = reveal.offset - position.pixels;
+    final bottom = top + render.size.height;
+    return bottom > 0 && top < position.viewportDimension;
   }
 
   void _openImage(ChatMessage message) {

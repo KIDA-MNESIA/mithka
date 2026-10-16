@@ -6804,40 +6804,62 @@ class ChatViewModel extends ChangeNotifier {
     // map for each history page (or scanning the transcript for a live reply)
     // made quoting increasingly expensive as more history was loaded.
     _ensureMessageIndexes();
-    final unresolved = <int, List<ChatMessage>>{};
+    final unresolvedByChat = <int, Map<int, List<ChatMessage>>>{};
     for (final m in repliesToResolve) {
       final rid = m.replyToMessageId!;
-      final quoted = _messagesById[rid];
+      final rChatId = m.replyToChatId ?? m.chatId ?? chatId;
+      final quoted = rChatId == chatId
+          ? (_messagesById[rid] ?? _allMessagesById[rid])
+          : null;
       if (quoted != null) {
-        _applyReply(m, quoted);
+        // The locally cached target is trusted only across the restriction
+        // boundary: a redacted message must not lend its text to this anchor,
+        // and no remote lookup can repair the hole it would leave.
+        if (!quoted.isContentRestricted) {
+          _applyReply(m, quoted);
+        }
         continue;
       }
+      final unresolved = unresolvedByChat.putIfAbsent(
+        rChatId,
+        () => <int, List<ChatMessage>>{},
+      );
       unresolved.putIfAbsent(rid, () => <ChatMessage>[]).add(m);
     }
-    if (unresolved.isEmpty) return;
+    if (unresolvedByChat.isEmpty) return;
     // One getMessage per distinct target meant 10-25 concurrent round trips for
     // a single reply-heavy history page, repeated for every page scrolled up.
     // getMessages answers them all at once, so the previews fill in together.
-    final targets = unresolved.keys.toList();
-    for (var start = 0; start < targets.length; start += 100) {
-      final end = start + 100 > targets.length ? targets.length : start + 100;
-      _resolveReplyTargets(targets.sublist(start, end), unresolved);
+    for (final entry in unresolvedByChat.entries) {
+      final targetChatId = entry.key;
+      final unresolved = entry.value;
+      final targets = unresolved.keys.toList();
+      for (var start = 0; start < targets.length; start += 100) {
+        final end = start + 100 > targets.length ? targets.length : start + 100;
+        _resolveReplyTargets(
+          targetChatId,
+          targets.sublist(start, end),
+          unresolved,
+        );
+      }
     }
   }
 
   /// Fetches one batch of reply targets and patches every message waiting on it.
   void _resolveReplyTargets(
+    int targetChatId,
     List<int> messageIds,
     Map<int, List<ChatMessage>> unresolved,
   ) {
     _client
         .query({
           '@type': 'getMessages',
-          'chat_id': chatId,
+          'chat_id': targetChatId,
           'message_ids': messageIds,
         })
         .then((response) {
-          var changed = false;
+          if (_chatOpenWorkIsStale) return;
+          final updatedIds = <int>{};
           // Unavailable ids come back as nulls that carry no identity, so the
           // bucket is looked up by the id on each returned message, not by
           // position.
@@ -6848,16 +6870,42 @@ class ChatViewModel extends ChangeNotifier {
             if (quoted == null) continue;
             final waiting = unresolved[quoted.id];
             if (waiting == null) continue;
-            for (final message in waiting) {
-              if (message.replyToMessageId != quoted.id ||
-                  message.replyToPreview != null) {
-                continue;
+            for (final m in waiting) {
+              final refs = _messageRefs(m.id);
+              final targets = refs.isEmpty ? <ChatMessage>[m] : refs;
+              for (final message in targets) {
+                // A held lookup belongs to the COMPLETE target captured when it
+                // was issued. The message id alone is not identity: the refresh
+                // may have retargeted this very reply to another chat that uses
+                // the same numeric id, and applying the old chat's payload
+                // would hydrate the new target with another message's text.
+                final liveChatId =
+                    message.replyToChatId ?? message.chatId ?? chatId;
+                if (message.replyToMessageId != quoted.id ||
+                    liveChatId != targetChatId ||
+                    message.replyToPreview != null) {
+                  continue;
+                }
+                // Returned quotes must come from the requested chat: a
+                // mis-addressed response would otherwise smuggle a same-id
+                // message of a foreign chat into the reply anchor.
+                final quotedChatId = quoted.chatId ?? targetChatId;
+                if (quotedChatId != targetChatId) continue;
+                // A restriction-redacted reply must never be hydrated from
+                // cached quote plaintext, and a redacted response is a
+                // withdrawal, not an anchor to copy.
+                if (message.isContentRestricted || quoted.isContentRestricted) {
+                  continue;
+                }
+                _applyReply(message, quoted);
+                updatedIds.add(message.id);
               }
-              _applyReply(message, quoted);
-              changed = true;
             }
           }
-          if (changed) _scheduleCoalescedNotify();
+          if (updatedIds.isNotEmpty) {
+            _bumpMaterializedMessageRevisions(updatedIds);
+            _scheduleCoalescedNotify();
+          }
         })
         .catchError((_) {});
   }
@@ -6895,8 +6943,9 @@ class ChatViewModel extends ChangeNotifier {
   /// the reply in place. Reuses the sender cache populated for the transcript.
   Future<void> _resolveQuotedSender(ChatMessage m, int senderId) async {
     final existing = _senderCache[senderId];
-    if (existing != null) {
+    if (existing != null && existing.name.isNotEmpty) {
       m.replyToSender = existing.name;
+      _bumpMaterializedMessageRevisions([m.id]);
       _scheduleCoalescedNotify();
       return;
     }
@@ -6918,6 +6967,7 @@ class ChatViewModel extends ChangeNotifier {
     } catch (_) {}
     if (name != null && name.isNotEmpty) {
       m.replyToSender = name;
+      _bumpMaterializedMessageRevisions([m.id]);
       _scheduleCoalescedNotify();
     }
   }

@@ -747,6 +747,7 @@ class ChatMessage {
     this.summaryLanguageCode = '',
     this.canRecognizeSpeech = false,
     this.replyToMessageId,
+    this.replyToChatId,
     this.replyToQuote,
     this.textQuoteSource,
     this.textQuoteSourceEntities,
@@ -865,6 +866,7 @@ class ChatMessage {
 
   // 引用 / reply: the message this one replies to, resolved lazily for the quote.
   int? replyToMessageId;
+  int? replyToChatId;
   MessageTextQuote? replyToQuote;
   // Rendering can extract tables from the original formatted text. Quotes
   // must still address the unmodified source text, not that rendered subset.
@@ -1642,6 +1644,12 @@ abstract final class TDParse {
     final replyToMessageId = replyTo?.type == 'messageReplyToMessage'
         ? replyTo?.int64('message_id')
         : null;
+    final rawReplyToChatId = replyTo?.type == 'messageReplyToMessage'
+        ? replyTo?.int64('chat_id')
+        : null;
+    final replyToChatId = rawReplyToChatId == null || rawReplyToChatId == 0
+        ? null
+        : rawReplyToChatId;
 
     // Which forum topic this message belongs to. TDLib reports it as a
     // MessageTopic: messageTopicForum carries the forum topic id, while
@@ -1741,6 +1749,7 @@ abstract final class TDParse {
         summaryCard: summaryCard(message, content),
         summaryLanguageCode: message.str('summary_language_code') ?? '',
         replyToMessageId: isContentRestricted ? null : replyToMessageId,
+        replyToChatId: isContentRestricted ? null : replyToChatId,
         replyToQuote: isContentRestricted
             ? null
             : textQuote(replyTo?.obj('quote')),
