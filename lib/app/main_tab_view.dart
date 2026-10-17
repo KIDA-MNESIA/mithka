@@ -103,6 +103,8 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
   late final ChatListController _chatListController = ChatListController();
   late final ChatViewExitController _messageChatExitController =
       ChatViewExitController();
+  late final ChatRevealLatestController _messageRevealLatestController =
+      ChatRevealLatestController();
   ChatListSelection? _selectedMessageChat;
   final _chatPaneController = ChatPaneController();
   CommunityListSelection? _selectedMessageCommunity;
@@ -533,12 +535,8 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
         title: request.title,
         initialMessageId: request.messageId,
       );
-      _prepareMessageChatReplacement(nextSelection);
-      setState(() {
-        _selection = 0;
-        _selectedMessageCommunity = null;
-        _selectedMessageChat = nextSelection;
-      });
+      setState(() => _selection = 0);
+      _showMessageChat(nextSelection);
       return;
     }
 
@@ -1392,13 +1390,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
             selectedCommunityId: communitiesEnabled
                 ? _selectedMessageCommunity?.community.id
                 : null,
-            onChatSelected: (chat) {
-              _prepareMessageChatReplacement(chat);
-              setState(() {
-                _selectedMessageCommunity = null;
-                _selectedMessageChat = chat;
-              });
-            },
+            onChatSelected: _showMessageChat,
             onCommunitySelected: (community) {
               if (!communitiesEnabled) return;
               _messageChatExitController.prepareExit();
@@ -1423,12 +1415,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
             onUnarchive: archivedSelection.onUnarchive,
             onBack: () => setState(() => _selectedArchivedChats = null),
             onChatSelected: (chat) {
-              final nextSelection = ChatListSelection.fromChat(chat);
-              _prepareMessageChatReplacement(nextSelection);
-              setState(() {
-                _selectedMessageCommunity = null;
-                _selectedMessageChat = nextSelection;
-              });
+              _showMessageChat(ChatListSelection.fromChat(chat));
             },
           ),
       ],
@@ -1554,12 +1541,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
               ? () => setState(() => _selectedMessageCommunity = null)
               : null,
           onChatSelected: (chat) {
-            final nextSelection = ChatListSelection.fromChat(chat);
-            _prepareMessageChatReplacement(nextSelection);
-            setState(() {
-              _selectedMessageCommunity = null;
-              _selectedMessageChat = nextSelection;
-            });
+            _showMessageChat(ChatListSelection.fromChat(chat));
           },
         ),
       );
@@ -1590,6 +1572,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
         trailingPaneWidth: trailingPaneWidth,
         requestComposerFocusOnReady: selected.composerFocusRequestId != 0,
         exitController: _messageChatExitController,
+        revealLatestController: _messageRevealLatestController,
         onChatKindResolved: (kind) =>
             _handleSelectedChatKindResolved(selected.chatId, kind),
         onInfoPressed: onInfoPressed,
@@ -1629,6 +1612,31 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
       name,
       userId: userId,
     );
+  }
+
+  /// Shows [next] in the split pane, or — when it is the conversation already
+  /// on screen — asks that transcript for its newest message.
+  ///
+  /// Without this, tapping the open conversation in the list rebuilt an equal
+  /// selection: nothing moved, so the tap did nothing at all. The reader's
+  /// expectation is a jump to the latest message, which is also what the
+  /// return-to-latest arrow does.
+  void _showMessageChat(ChatListSelection next) {
+    final current = _selectedMessageChat;
+    // A jump target always means "go to that message", so only a plain
+    // request for the conversation already on screen is read as "show me the
+    // newest message".
+    if (current != null &&
+        next.initialMessageId == null &&
+        current.showsSameTranscript(next)) {
+      _messageRevealLatestController.revealLatest();
+      return;
+    }
+    _prepareMessageChatReplacement(next);
+    setState(() {
+      _selectedMessageCommunity = null;
+      _selectedMessageChat = next;
+    });
   }
 
   void _prepareMessageChatReplacement(ChatListSelection? nextSelection) {
