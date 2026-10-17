@@ -30,9 +30,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 
+import '../components/app_confirm_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
-import '../components/confirm_dialog.dart';
 import '../components/settings_selection_row.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
@@ -42,16 +42,119 @@ import '../theme/app_theme.dart';
 import 'proxy_config.dart';
 import 'proxy_status.dart';
 
+/// The concrete TDLib client a proxy page's rows belong to.
+///
+/// Proxy ids are account-scoped: id 42 in one account is a different row from
+/// id 42 in another. A page that outlives an account switch — the confirmation
+/// dialog is the long await — must keep every read and every removal on the
+/// account whose rows the user is looking at.
+abstract interface class ProxyViewOwner {
+  int get clientId;
+
+  /// Query bound to [clientId]. It never resolves the foreground account.
+  Future<Map<String, dynamic>> query(Map<String, dynamic> request);
+
+  /// False once the user switched accounts, this slot's client was replaced or
+  /// closed, or shutdown started.
+  bool get isCurrent;
+
+  /// Applies the locally saved proxy config to this owner's client, never to
+  /// whichever account happens to be in the foreground.
+  Future<void> applySavedProxy();
+
+  /// Applies [config] to this owner's client, never to the foreground account.
+  Future<void> applyProxyConfig(ProxyConfig config);
+}
+
+/// Supplies the owner a proxy page runs against.
+abstract interface class ProxyViewAccounts {
+  static const ProxyViewAccounts defaultAccounts = TdProxyViewAccounts();
+
+  /// The registry the pinned owners come from.
+  TdClient get registry;
+
+  /// Null when nothing can be pinned: nothing logged in, shutdown already
+  /// running, or a client replaced between the reads.
+  ProxyViewOwner? pinActiveOwner();
+
+  /// Foreground account changes, so a page pinned to the old account re-reads
+  /// instead of keeping another account's rows on screen.
+  Stream<int> get activeSlotChanges;
+}
+
+final class _TdProxyViewOwner implements ProxyViewOwner {
+  _TdProxyViewOwner(this._client, this._slot, this._clientId);
+
+  final TdClient _client;
+  final int _slot;
+  final int _clientId;
+
+  @override
+  int get clientId => _clientId;
+
+  @override
+  Future<Map<String, dynamic>> query(Map<String, dynamic> request) =>
+      _client.queryTo(request, _clientId);
+
+  @override
+  bool get isCurrent =>
+      !_client.isShuttingDown &&
+      _client.clientId(_slot) == _clientId &&
+      _client.activeClientId == _clientId;
+
+  @override
+  Future<void> applySavedProxy() => _client.applySavedProxyToClient(_clientId);
+
+  @override
+  Future<void> applyProxyConfig(ProxyConfig config) =>
+      _client.applyProxyConfigToClient(config, _clientId);
+}
+
+/// Production registry: pins the foreground account's concrete client the way
+/// the switcher reads each account's identity, without retaining anything.
+///
+/// Tests pass a private [TdClient.forTesting] registry so the same pinning and
+/// query path runs against synthetic bindings.
+final class TdProxyViewAccounts implements ProxyViewAccounts {
+  const TdProxyViewAccounts([this._client]);
+
+  final TdClient? _client;
+
+  @override
+  TdClient get registry => _client ?? TdClient.shared;
+
+  @override
+  ProxyViewOwner? pinActiveOwner() {
+    final client = registry;
+    if (client.isShuttingDown) return null;
+    final slot = client.activeSlot;
+    final clientId = client.activeClientId;
+    if (clientId == 0) return null;
+    // A session swap or a QR reset can replace the slot's client between those
+    // two reads; pinning that would page an account nobody looked at.
+    if (client.clientId(slot) != clientId) return null;
+    return _TdProxyViewOwner(client, slot, clientId);
+  }
+
+  @override
+  Stream<int> get activeSlotChanges => registry.subscribeActiveSlotChanges();
+}
+
 class ProxyView extends StatefulWidget {
-  const ProxyView({super.key});
+  const ProxyView({
+    super.key,
+    this.accounts = ProxyViewAccounts.defaultAccounts,
+  });
+
+  final ProxyViewAccounts accounts;
 
   @override
   State<ProxyView> createState() => _ProxyViewState();
 }
 
 class _ProxyViewState extends State<ProxyView> {
-  final TdClient _client = TdClient.shared;
   StreamSubscription<Map<String, dynamic>>? _clientWakeSub;
+  StreamSubscription<int>? _slotSub;
   List<Map<String, dynamic>> _proxies = [];
   bool _loading = true;
 
@@ -63,19 +166,31 @@ class _ProxyViewState extends State<ProxyView> {
   bool _clientReady = false;
   int _loadGeneration = 0;
 
+  /// The account whose rows are on screen. Every read and every mutation for
+  /// this page runs against it, never against whichever account is foreground
+  /// when the request finally leaves.
+  ProxyViewOwner? _owner;
+
+  /// Bumped whenever the page stops owning the rows it pinned, so answers and
+  /// confirmation batches started under a previous owner are discarded even if
+  /// the same account later returns to the foreground.
+  int _ownerGeneration = 0;
+
   /// The last probe verdict per proxy id, keyed by the TDLib proxy id. Only a
   /// probe or a live link state ever writes here; removing a proxy drops its
-  /// entry with it.
+  /// entry with it. Cleared when the page adopts another account, because ids
+  /// are only unique inside one account.
   final Map<int, ProxyCheckResult> _checks = {};
 
   /// One counter per proxy id, bumped every time a fresh probe starts, so an
   /// answer that belongs to a probe the user has since re-run is discarded.
   final Map<int, int> _checkGeneration = {};
 
-  /// The reduced verdict of the testProxy currently in flight per proxy id.
-  /// Two taps, or a tap racing 测试全部, share this one request instead of
-  /// issuing a second testProxy for the same proxy.
-  final Map<int, Future<ProxyCheckResult>> _pendingChecks = {};
+  /// The reduced verdict of the testProxy currently in flight per (client,
+  /// proxy id). Two taps, or a tap racing 测试全部, share this one request
+  /// instead of issuing a second testProxy for the same proxy; the client id
+  /// keeps another account's id 42 from joining this account's probe.
+  final Map<(int, int), Future<ProxyCheckResult>> _pendingChecks = {};
 
   /// What the probe itself is told to wait, and how long the page waits past
   /// that before it gives up on a client that stopped answering.
@@ -84,6 +199,11 @@ class _ProxyViewState extends State<ProxyView> {
 
   int _nextCheckGeneration(int id) =>
       _checkGeneration[id] = (_checkGeneration[id] ?? 0) + 1;
+
+  /// Whether [owner] still owns this page and the answer captured under
+  /// [ownerGeneration] still describes what the user is looking at.
+  bool _isOwnerCurrent(ProxyViewOwner owner, int ownerGeneration) =>
+      mounted && ownerGeneration == _ownerGeneration && owner.isCurrent;
 
   @override
   void initState() {
@@ -94,12 +214,31 @@ class _ProxyViewState extends State<ProxyView> {
     ProxyStatusController.shared.ensureTracking();
     _load();
     _listenForClientWake();
+    _slotSub = widget.accounts.activeSlotChanges.listen(
+      (_) => _onForegroundChanged(),
+    );
   }
 
   @override
   void dispose() {
     unawaited(_clientWakeSub?.cancel());
+    unawaited(_slotSub?.cancel());
     super.dispose();
+  }
+
+  /// The foreground account changed. Drop the old owner's verdicts and any
+  /// confirmation batch that was captured against it before re-reading the
+  /// account now on screen.
+  void _onForegroundChanged() {
+    if (!mounted) return;
+    setState(() {
+      _owner = null;
+      _ownerGeneration++;
+      _checks.clear();
+      _checkGeneration.clear();
+      _pendingChecks.clear();
+    });
+    unawaited(_load());
   }
 
   /// Re-reads on the first pushed authorization/connection state while the
@@ -107,7 +246,7 @@ class _ProxyViewState extends State<ProxyView> {
   /// these updates fan out, so the re-read lands past TDLib's queue and gets
   /// answered once the database is open. Event-driven: nothing polls.
   void _listenForClientWake() {
-    _clientWakeSub = _client
+    _clientWakeSub = widget.accounts.registry
         .updatesOfAny(const [
           'updateAuthorizationState',
           'updateConnectionState',
@@ -117,33 +256,46 @@ class _ProxyViewState extends State<ProxyView> {
 
   Future<void> _load() async {
     final generation = ++_loadGeneration;
-    final clientId = _client.activeClientId;
-    final slot = _client.activeSlot;
+    final owner = widget.accounts.pinActiveOwner();
+    if (owner == null) {
+      // No client to pin yet (the login screen before parameters). Keep the
+      // waiting state; the wake listener re-reads when the client reports in.
+      if (mounted && _clientReady) setState(() => _loading = false);
+      return;
+    }
     // Every mutation on this page lands here, and the sidebar shortcut reads
     // the same list: tell it the ground moved instead of leaving it to notice
     // on the next reconnect.
     ProxyStatusController.shared.proxiesChanged();
     try {
-      final res = await _client.query({'@type': 'getProxies'});
-      if (!mounted ||
-          generation != _loadGeneration ||
-          clientId != _client.activeClientId ||
-          slot != _client.activeSlot) {
+      final res = await owner.query({'@type': 'getProxies'});
+      // A read answered for an account the page no longer owns — or one a
+      // newer read has superseded — must not paint over the foreground list.
+      if (!mounted || generation != _loadGeneration || !owner.isCurrent) {
         return;
       }
       final list = res.objects('proxies') ?? const <Map<String, dynamic>>[];
-      if (mounted) {
-        final liveIds = {for (final proxy in list) proxy.integer('id') ?? 0};
-        setState(() {
-          _proxies = list;
-          _clientReady = true;
-          _loading = false;
-          // A proxy that is gone must not leave a verdict behind for an id
-          // TDLib may hand to a different proxy later.
-          _checks.removeWhere((id, _) => !liveIds.contains(id));
-          _checkGeneration.removeWhere((id, _) => !liveIds.contains(id));
-        });
-      }
+      final liveIds = {for (final proxy in list) proxy.integer('id') ?? 0};
+      setState(() {
+        if (_owner?.clientId != owner.clientId) {
+          // Proxy ids are account-scoped, so a verdict from the previous
+          // account must never label this account's identically numbered row.
+          _owner = owner;
+          _ownerGeneration++;
+          _checks.clear();
+          _checkGeneration.clear();
+          _pendingChecks.clear();
+        } else {
+          _owner = owner;
+        }
+        _proxies = list;
+        _clientReady = true;
+        _loading = false;
+        // A proxy that is gone must not leave a verdict behind for an id
+        // TDLib may hand to a different proxy later.
+        _checks.removeWhere((id, _) => !liveIds.contains(id));
+        _checkGeneration.removeWhere((id, _) => !liveIds.contains(id));
+      });
       // The client answers: nothing can still be pending behind the wake
       // listener, so it stops loading the page on every pushed state.
       await _clientWakeSub?.cancel();
@@ -171,69 +323,105 @@ class _ProxyViewState extends State<ProxyView> {
       .length;
 
   Future<void> _enable(Map<String, dynamic> proxy) async {
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     final id = proxy.integer('id') ?? 0;
     try {
-      await _client.query({'@type': 'enableProxy', 'proxy_id': id});
-      await ProxyConfig.save(ProxyConfig.fromTdProxy(proxy));
-      unawaited(_client.applySavedProxyToActive());
+      await owner.query({'@type': 'enableProxy', 'proxy_id': id});
+      if (_isOwnerCurrent(owner, ownerGeneration)) {
+        await ProxyConfig.save(ProxyConfig.fromTdProxy(proxy));
+        await owner.applySavedProxy();
+      }
     } catch (_) {}
     unawaited(_load());
   }
 
   Future<void> _disable() async {
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     try {
-      await _client.query({'@type': 'disableProxy'});
+      await owner.query({'@type': 'disableProxy'});
     } catch (_) {}
-    await ProxyConfig.disable();
-    unawaited(_client.applySavedProxyToActive());
+    if (_isOwnerCurrent(owner, ownerGeneration)) {
+      try {
+        await ProxyConfig.disable();
+      } catch (_) {}
+      try {
+        await owner.applySavedProxy();
+      } catch (_) {}
+    }
     unawaited(_load());
   }
 
   Future<void> _remove(int id) async {
-    final ok = await confirmDialog(
-      context,
-      title: AppStrings.t(AppStringKeys.proxyDeleteProxy),
-      confirmText: AppStrings.t(AppStringKeys.chatDelete),
-      destructive: true,
-    );
-    if (!ok) return;
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     final removed = _proxies.firstWhere(
       (proxy) => proxy.integer('id') == id,
       orElse: () => const <String, dynamic>{},
     );
     final wasEnabled = removed.boolean('is_enabled') ?? false;
+    final ok = await showAppConfirmDialog(
+      context,
+      title: AppStringKeys.proxyDeleteProxy,
+      confirmText: AppStringKeys.chatDelete,
+      destructive: true,
+    );
+    // The dialog is the long await: an account switch while it was open means
+    // the row the user confirmed belongs to an account this page no longer
+    // owns, so the removal is dropped rather than applied to its replacement.
+    if (!ok || !_isOwnerCurrent(owner, ownerGeneration)) return;
     setState(() => _checks.remove(id));
+    var removedNow = false;
     try {
-      await _client.query({'@type': 'removeProxy', 'proxy_id': id});
-      if (wasEnabled) {
-        await ProxyConfig.disable();
-        unawaited(_client.applySavedProxyToActive());
-      }
+      await owner.query({'@type': 'removeProxy', 'proxy_id': id});
+      removedNow = true;
     } catch (_) {}
+    if (removedNow && wasEnabled && _isOwnerCurrent(owner, ownerGeneration)) {
+      try {
+        await ProxyConfig.disable();
+      } catch (_) {}
+      if (_isOwnerCurrent(owner, ownerGeneration)) {
+        try {
+          await owner.applySavedProxy();
+        } catch (_) {}
+      }
+    }
     unawaited(_load());
   }
 
   /// Removes every proxy whose last probe failed. The button only exists while
   /// at least one row reads as unavailable, so this never runs empty.
   Future<void> _removeUnavailable() async {
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     final doomed = [
       for (final proxy in _proxies)
         if (_probeFailed(proxy)) proxy,
     ];
     if (doomed.isEmpty) return;
-    final ok = await confirmDialog(
-      context,
-      title: AppStrings.t(AppStringKeys.proxyDeleteUnavailable),
-      message: AppStrings.t(AppStringKeys.proxyDeleteUnavailableMessage),
-      confirmText: AppStrings.t(AppStringKeys.chatDelete),
-      destructive: true,
-    );
-    if (!ok) return;
+    // Capture the exact batch the user is confirming. Proxy ids are only
+    // meaningful inside [owner], so the batch stays pinned to that account
+    // through the dialog and through every removal in the loop.
+    final doomedIds = {for (final proxy in doomed) proxy.integer('id') ?? 0};
     final enabledIds = {
       for (final proxy in doomed)
         if (proxy.boolean('is_enabled') ?? false) proxy.integer('id') ?? 0,
     };
-    final doomedIds = {for (final proxy in doomed) proxy.integer('id') ?? 0};
+    final ok = await showAppConfirmDialog(
+      context,
+      title: AppStringKeys.proxyDeleteUnavailable,
+      message: AppStringKeys.proxyDeleteUnavailableMessage,
+      confirmText: AppStringKeys.chatDelete,
+      destructive: true,
+    );
+    // A switch while the dialog was open drops the whole batch: ids from the
+    // old account name unrelated rows in the new one.
+    if (!ok || !_isOwnerCurrent(owner, ownerGeneration)) return;
     setState(() {
       for (final id in doomedIds) {
         _checks.remove(id);
@@ -241,16 +429,27 @@ class _ProxyViewState extends State<ProxyView> {
     });
     var removedEnabled = false;
     for (final id in doomedIds) {
+      // Another account taking the foreground abandons whatever is left of
+      // this batch instead of aiming it at the new account's rows.
+      if (!_isOwnerCurrent(owner, ownerGeneration)) break;
       try {
-        await _client.query({'@type': 'removeProxy', 'proxy_id': id});
+        await owner.query({'@type': 'removeProxy', 'proxy_id': id});
         if (enabledIds.contains(id)) removedEnabled = true;
       } catch (_) {
         // One failed removal must not abandon the rest of the batch.
       }
     }
-    if (removedEnabled) {
-      await ProxyConfig.disable();
-      unawaited(_client.applySavedProxyToActive());
+    // The saved config and its re-apply belong to the account whose enabled
+    // row was actually removed, never to the account now in the foreground.
+    if (removedEnabled && _isOwnerCurrent(owner, ownerGeneration)) {
+      try {
+        await ProxyConfig.disable();
+      } catch (_) {}
+      if (_isOwnerCurrent(owner, ownerGeneration)) {
+        try {
+          await owner.applySavedProxy();
+        } catch (_) {}
+      }
     }
     unawaited(_load());
   }
@@ -260,27 +459,32 @@ class _ProxyViewState extends State<ProxyView> {
   /// with the datacenter behind the proxy finished, or the request's own
   /// timeout expired — so the elapsed round trip is the latency reported.
   Future<void> _testProxy(Map<String, dynamic> proxy) async {
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     final id = proxy.integer('id') ?? 0;
     // A row that is already being probed keeps the attempt it started with:
     // one testProxy per proxy id, however often the row is tapped.
     final inFlight = _checks[id]?.status == ProxyCheckStatus.testing;
     if (!inFlight) {
       final generation = _nextCheckGeneration(id);
-      final clientId = _client.activeClientId;
       setState(
         () => _checks[id] = const ProxyCheckResult(ProxyCheckStatus.testing),
       );
-      final outcome = await _probe(proxy, clientId);
-      if (!_isCurrentCheck(id, generation, clientId)) return;
+      final outcome = await _probe(proxy, owner);
+      if (!_isCurrentCheck(id, generation, owner, ownerGeneration)) return;
       setState(() => _checks[id] = outcome);
       return;
     }
     // A test-all pressed while a row's own tap is still waiting joins it
     // rather than issuing a second testProxy for the same proxy.
-    final pending = _pendingChecks[id];
+    final pending = _pendingChecks[(owner.clientId, id)];
     if (pending == null) return;
     final outcome = await pending;
-    if (!mounted || _checks[id]?.status != ProxyCheckStatus.testing) return;
+    if (!_isCurrentCheck(id, null, owner, ownerGeneration) ||
+        _checks[id]?.status != ProxyCheckStatus.testing) {
+      return;
+    }
     setState(() => _checks[id] = outcome);
   }
 
@@ -289,17 +493,20 @@ class _ProxyViewState extends State<ProxyView> {
   /// probe's own timeout; TDLib answers `ok` once the handshake with the
   /// datacenter behind the proxy finished, or a 400 whose message names the
   /// failure ('Timeout expired', 'Connection refused', ...).
-  Future<ProxyCheckResult> _probe(Map<String, dynamic> proxy, int clientId) {
+  Future<ProxyCheckResult> _probe(
+    Map<String, dynamic> proxy,
+    ProxyViewOwner owner,
+  ) {
     final id = proxy.integer('id') ?? 0;
     final proxyDetails = ProxyConfig.tdProxyDetails(proxy);
     final stopwatch = Stopwatch()..start();
-    final reduced = _client
-        .queryTo({
+    final reduced = owner
+        .query({
           '@type': 'testProxy',
           'proxy': proxyDetails,
           'dc_id': kProxyTestDcId,
           'timeout': _probeTimeout.inSeconds.toDouble(),
-        }, clientId)
+        })
         // The answer normally arrives on its own: the request is asynchronous
         // and this only bounds a client that stops reading altogether.
         .timeout(_probeTimeout + _probeAnswerGrace)
@@ -313,8 +520,9 @@ class _ProxyViewState extends State<ProxyView> {
             error: _probeErrorMessage(error),
           ),
         );
-    _pendingChecks[id] = reduced;
-    return reduced.whenComplete(() => _pendingChecks.remove(id));
+    final key = (owner.clientId, id);
+    _pendingChecks[key] = reduced;
+    return reduced.whenComplete(() => _pendingChecks.remove(key));
   }
 
   /// The message TDLib gave for a failed probe, so the chip says why. A 400 is
@@ -339,14 +547,17 @@ class _ProxyViewState extends State<ProxyView> {
   }
 
   /// Whether an answer still describes the row it was asked for: the same id,
-  /// the same probe attempt, and the same still-active client. A reconnect
-  /// that replaced the client mid-probe must not paint its answer.
-  bool _isCurrentCheck(int id, int generation, int clientId) =>
-      mounted &&
-      generation == _checkGeneration[id] &&
-      _proxies.any((proxy) => proxy.integer('id') == id) &&
-      !_client.isShuttingDown &&
-      clientId == _client.activeClientId;
+  /// the same probe attempt (when one is given), and the same still-owned
+  /// client. A reconnect or account switch mid-probe must not paint its answer.
+  bool _isCurrentCheck(
+    int id,
+    int? generation,
+    ProxyViewOwner owner,
+    int ownerGeneration,
+  ) =>
+      _isOwnerCurrent(owner, ownerGeneration) &&
+      (generation == null || generation == _checkGeneration[id]) &&
+      _proxies.any((proxy) => proxy.integer('id') == id);
 
   ProxyCheckResult _stateFor(Map<String, dynamic> proxy) {
     final id = proxy.integer('id') ?? 0;
@@ -491,6 +702,7 @@ class _ProxyViewState extends State<ProxyView> {
           _ProxyCheckChip(result: check),
           const SizedBox(width: AppSpacing.lg),
           AppInteractiveSurface(
+            key: ValueKey('proxy-remove-$id'),
             semanticLabel: AppStringKeys.chatInfoRemove.l10n(context),
             onTap: () => _remove(id),
             borderRadius: BorderRadius.circular(AppRadius.sm),
@@ -536,6 +748,9 @@ class _ProxyViewState extends State<ProxyView> {
   }
 
   Future<void> _addFromLink() async {
+    final owner = _owner;
+    if (owner == null || !owner.isCurrent) return;
+    final ownerGeneration = _ownerGeneration;
     final ctrl = TextEditingController();
     final result = await showCupertinoDialog<String>(
       context: context,
@@ -574,6 +789,7 @@ class _ProxyViewState extends State<ProxyView> {
     );
     ctrl.dispose();
     if (result == null || result.isEmpty) return;
+    if (!_isOwnerCurrent(owner, ownerGeneration)) return;
 
     final config = ProxyConfig.fromTelegramUrl(result);
     if (config == null) {
@@ -584,7 +800,7 @@ class _ProxyViewState extends State<ProxyView> {
     }
 
     try {
-      await TdClient.shared.applyProxyConfig(config);
+      await owner.applyProxyConfig(config);
       await ProxyConfig.save(config);
       unawaited(_load());
     } catch (_) {

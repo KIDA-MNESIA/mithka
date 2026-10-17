@@ -369,8 +369,9 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey('proxy-delete-unavailable')));
       await settle(tester);
-      // Destructive, so it confirms first.
-      expect(find.byType(CupertinoAlertDialog), findsOneWidget);
+      // Destructive, so it confirms first — through the app-owned dialog.
+      expect(find.byKey(const ValueKey('app-confirm-dialog')), findsOneWidget);
+      expect(find.byType(CupertinoAlertDialog), findsNothing);
       expect(
         find.text(AppStrings.t(AppStringKeys.proxyDeleteUnavailableMessage)),
         findsOneWidget,

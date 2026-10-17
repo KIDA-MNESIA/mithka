@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -37,6 +38,13 @@ class ProxyConfig {
   static const _securePasswordKey = 'mithka.proxy.password.v2';
   static const _secureSecretKey = 'mithka.proxy.secret.v2';
   static const _secureStorage = FlutterSecureStorage();
+
+  /// Test seams: widget tests run without the platform secure-storage channel,
+  /// while still exercising the real saved-config path.
+  @visibleForTesting
+  static ProxySecureRead? debugSecureRead;
+  @visibleForTesting
+  static ProxySecureWrite? debugSecureWrite;
 
   bool get isUsable => enabled && server.trim().isNotEmpty && port > 0;
 
@@ -184,8 +192,8 @@ class ProxyConfig {
     ProxySecureWrite? secureWrite,
   }) async {
     final prefs = preferences ?? await SharedPreferences.getInstance();
-    final read = secureRead ?? _defaultSecureRead;
-    final write = secureWrite ?? _defaultSecureWrite;
+    final read = secureRead ?? debugSecureRead ?? _defaultSecureRead;
+    final write = secureWrite ?? debugSecureWrite ?? _defaultSecureWrite;
     final password = await _loadSensitiveValue(
       preferences: prefs,
       legacyKey: _passwordKey,
@@ -219,8 +227,8 @@ class ProxyConfig {
     ProxySecureWrite? secureWrite,
   }) async {
     final prefs = preferences ?? await SharedPreferences.getInstance();
-    final read = secureRead ?? _defaultSecureRead;
-    final write = secureWrite ?? _defaultSecureWrite;
+    final read = secureRead ?? debugSecureRead ?? _defaultSecureRead;
+    final write = secureWrite ?? debugSecureWrite ?? _defaultSecureWrite;
     final previousPassword = await read(_securePasswordKey);
     final previousSecret = await read(_secureSecretKey);
     try {
