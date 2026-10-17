@@ -2313,7 +2313,11 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.buttonRow => SelectionContainer.disabled(
         child: _richButtonRowBlock(block, outgoing),
       ),
-      RichMessageBlockKind.list => _richListBlock(block, outgoing),
+      RichMessageBlockKind.list => _richListBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
       RichMessageBlockKind.blockQuote || RichMessageBlockKind.pullQuote =>
         _richQuoteContainer(block, outgoing, blockKey: blockPath),
       RichMessageBlockKind.animation ||
@@ -2324,7 +2328,11 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.collage => _richCollageBlock(block, outgoing),
       RichMessageBlockKind.slideshow => _richSlideshowBlock(block, outgoing),
       RichMessageBlockKind.table => _richTableBlock(block, outgoing),
-      RichMessageBlockKind.details => _richDetailsBlock(block, outgoing),
+      RichMessageBlockKind.details => _richDetailsBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
       RichMessageBlockKind.map => _richMapBlock(block, outgoing),
     };
   }
@@ -2420,7 +2428,11 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  Widget _richListBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richListBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final c = _colors;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2461,6 +2473,7 @@ class _MessageBubbleState extends State<MessageBubble>
                     children: _richBlockWidgets(
                       block.listItems[index].blocks,
                       outgoing,
+                      blockPath: '$blockPath.item$index',
                     ),
                   ),
                 ),
@@ -2544,20 +2557,21 @@ class _MessageBubbleState extends State<MessageBubble>
     // lines": the cap would slice a photo into a sliver. Only a body made of
     // text blocks folds, which is also the only case where the entity quote's
     // behaviour applies.
-    const textKinds = {
-      RichMessageBlockKind.paragraph,
-      RichMessageBlockKind.heading,
-      RichMessageBlockKind.preformatted,
-      RichMessageBlockKind.footer,
-      RichMessageBlockKind.thinking,
-      RichMessageBlockKind.math,
-      RichMessageBlockKind.divider,
-      RichMessageBlockKind.anchor,
-      RichMessageBlockKind.list,
+    bool isTextOnly(RichMessageBlock child) => switch (child.kind) {
+      RichMessageBlockKind.paragraph ||
+      RichMessageBlockKind.heading ||
+      RichMessageBlockKind.preformatted ||
+      RichMessageBlockKind.footer ||
+      RichMessageBlockKind.thinking ||
+      RichMessageBlockKind.math ||
+      RichMessageBlockKind.divider ||
+      RichMessageBlockKind.anchor => true,
+      RichMessageBlockKind.list => child.listItems.every(
+        (item) => item.blocks.every(isTextOnly),
+      ),
+      _ => false,
     };
-    final foldable =
-        !isPullQuote &&
-        block.children.every((child) => textKinds.contains(child.kind));
+    final foldable = !isPullQuote && block.children.every(isTextOnly);
     final overflows = foldable && _foldableRichQuotes.contains(key);
     final expanded = !foldable || _expandedQuotes.contains(key);
     final lineHeight = foldable ? _richQuoteLineHeight() : 0.0;
@@ -2631,7 +2645,11 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  Widget _richDetailsBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richDetailsBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final base = outgoing ? _outgoingTextColor : _incomingTextColor;
     final link = _messageLinkColor(outgoing);
     return _RichDetailsBlock(
@@ -2652,7 +2670,11 @@ class _MessageBubbleState extends State<MessageBubble>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
-        children: _richBlockWidgets(block.children, outgoing),
+        children: _richBlockWidgets(
+          block.children,
+          outgoing,
+          blockPath: '$blockPath.details',
+        ),
       ),
     );
   }

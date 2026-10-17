@@ -100,6 +100,144 @@ double _lineHeight(WidgetTester tester, String text) {
 }
 
 void main() {
+  testWidgets('review: quotes in distinct open details keep separate state', (
+    tester,
+  ) async {
+    await _pumpBubble(
+      tester,
+      _richMessage(922, [
+        RichMessageBlock.container(
+          kind: RichMessageBlockKind.details,
+          text: 'First details',
+          isOpen: true,
+          children: [_richQuote(RichMessageBlockKind.blockQuote, _longQuote)],
+        ),
+        RichMessageBlock.container(
+          kind: RichMessageBlockKind.details,
+          text: 'Second details',
+          isOpen: true,
+          children: [
+            _richQuote(RichMessageBlockKind.blockQuote, 'Second: $_longQuote'),
+          ],
+        ),
+      ]),
+    );
+    expect(find.text(_expandLabel), findsNWidgets(2));
+    await tester.tap(find.text(_expandLabel).first);
+    await tester.pumpAndSettle();
+    expect(find.text(_collapseLabel), findsOneWidget);
+    expect(find.text(_expandLabel), findsOneWidget);
+  });
+
+  testWidgets('review: a quote with text-only nested lists remains foldable', (
+    tester,
+  ) async {
+    await _pumpBubble(
+      tester,
+      _richMessage(923, const [
+        RichMessageBlock.container(
+          kind: RichMessageBlockKind.blockQuote,
+          children: [
+            RichMessageBlock.container(
+              kind: RichMessageBlockKind.list,
+              listItems: [
+                RichMessageListItem(
+                  blocks: [
+                    RichMessageBlock.container(
+                      kind: RichMessageBlockKind.list,
+                      listItems: [
+                        RichMessageListItem(
+                          blocks: [
+                            RichMessageBlock.text(
+                              kind: RichMessageBlockKind.paragraph,
+                              text: _longQuote,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+      ]),
+    );
+    expect(find.text(_expandLabel), findsOneWidget);
+    await tester.tap(find.text(_expandLabel));
+    await tester.pumpAndSettle();
+    expect(find.text(_collapseLabel), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('review: quotes in separate list items expand independently', (
+    tester,
+  ) async {
+    await _pumpBubble(
+      tester,
+      _richMessage(920, [
+        RichMessageBlock.container(
+          kind: RichMessageBlockKind.list,
+          listItems: [
+            RichMessageListItem(
+              blocks: [_richQuote(RichMessageBlockKind.blockQuote, _longQuote)],
+            ),
+            RichMessageListItem(
+              blocks: [
+                _richQuote(
+                  RichMessageBlockKind.blockQuote,
+                  'Second: $_longQuote',
+                ),
+              ],
+            ),
+          ],
+        ),
+      ]),
+    );
+    expect(find.text(_expandLabel), findsNWidgets(2));
+    await tester.tap(find.text(_expandLabel).first);
+    await tester.pumpAndSettle();
+    expect(find.text(_collapseLabel), findsOneWidget);
+    expect(find.text(_expandLabel), findsOneWidget);
+  });
+
+  testWidgets('review: media inside a quote list is not folded', (
+    tester,
+  ) async {
+    await _pumpBubble(
+      tester,
+      _richMessage(921, const [
+        RichMessageBlock.container(
+          kind: RichMessageBlockKind.blockQuote,
+          children: [
+            RichMessageBlock.container(
+              kind: RichMessageBlockKind.list,
+              listItems: [
+                RichMessageListItem(
+                  blocks: [
+                    RichMessageBlock.text(
+                      kind: RichMessageBlockKind.paragraph,
+                      text: _longQuote,
+                    ),
+                    RichMessageBlock.media(
+                      kind: RichMessageBlockKind.photo,
+                      imageWidth: 400,
+                      imageHeight: 300,
+                      caption: 'Nested photo',
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+      ]),
+    );
+    expect(find.text(_expandLabel), findsNothing);
+    expect(find.text(_collapseLabel), findsNothing);
+  });
+
   testWidgets(
     'a short rich block quote renders unfolded without an affordance',
     (tester) async {
