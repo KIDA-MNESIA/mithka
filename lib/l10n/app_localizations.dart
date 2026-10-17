@@ -2282,6 +2282,39 @@ abstract final class AppStringKeys {
   static const notificationChannels = 'notificationChannels';
   static const notificationCurrentAccount = 'notificationCurrentAccount';
   static const notificationException = 'notificationException';
+  static const notificationExceptionChatValue1 =
+      'notificationExceptionChatValue1';
+  static const notificationExceptionCustom = 'notificationExceptionCustom';
+  static const notificationExceptionCustomSound =
+      'notificationExceptionCustomSound';
+  static const notificationExceptionEmpty = 'notificationExceptionEmpty';
+  static const notificationExceptionLoadFailed =
+      'notificationExceptionLoadFailed';
+  static const notificationExceptionMentionsOff =
+      'notificationExceptionMentionsOff';
+  static const notificationExceptionMuted = 'notificationExceptionMuted';
+  static const notificationExceptionPinnedOff =
+      'notificationExceptionPinnedOff';
+  static const notificationExceptionPreviewOff =
+      'notificationExceptionPreviewOff';
+  static const notificationExceptionPreviewOn =
+      'notificationExceptionPreviewOn';
+  static const notificationExceptionReset = 'notificationExceptionReset';
+  static const notificationExceptionResetFailed =
+      'notificationExceptionResetFailed';
+  static const notificationExceptionRetry = 'notificationExceptionRetry';
+  static const notificationExceptionSoundOff = 'notificationExceptionSoundOff';
+  static const notificationExceptionStoriesMuted =
+      'notificationExceptionStoriesMuted';
+  static const notificationExceptionStoriesOn =
+      'notificationExceptionStoriesOn';
+  static const notificationExceptionStoryCustomSound =
+      'notificationExceptionStoryCustomSound';
+  static const notificationExceptionStoryPosterHidden =
+      'notificationExceptionStoryPosterHidden';
+  static const notificationExceptionStorySoundOff =
+      'notificationExceptionStorySoundOff';
+  static const notificationExceptionUnmuted = 'notificationExceptionUnmuted';
   static const notificationExceptions = 'notificationExceptions';
   static const notificationGroupMessages = 'notificationGroupMessages';
   static const notificationInAppBanners = 'notificationInAppBanners';
