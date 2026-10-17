@@ -742,6 +742,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                   selection: selection,
                   onSelect: _select,
                   items: tabs,
+                  reserveBottomInset: true,
                   onClearUnread: _chatListController.markAllRead,
                   unread: _unread.countFor(theme.unreadBadgeMode),
                 ),
@@ -1265,6 +1266,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                         selection: selection,
                                         onSelect: _select,
                                         items: tabs,
+                                        reserveBottomInset: false,
                                         onClearUnread:
                                             _chatListController.markAllRead,
                                         unread: _unread.countFor(
@@ -2167,6 +2169,7 @@ class _MainBottomBar extends StatelessWidget {
     required this.onClearUnread,
     required this.items,
     required this.unread,
+    required this.reserveBottomInset,
     this.chatListController,
   });
   final int selection;
@@ -2175,6 +2178,14 @@ class _MainBottomBar extends StatelessWidget {
   final List<_MainTabItem> items;
   final int unread;
   final ChatListController? chatListController;
+
+  /// Whether the bar owns the home-indicator band at the window's bottom edge.
+  ///
+  /// The compact shell docks the bar against the window edge, so the band has
+  /// to stay part of the bar and every tab has to fill it. Docked in the split
+  /// shell's column the bar keeps no band at all: the row spends the full
+  /// height and the space goes back to the content above.
+  final bool reserveBottomInset;
 
   /// Label size the bar is laid out around. The icon block above it keeps its
   /// size at every text scale, so only this line's growth is added to the bar.
@@ -2276,8 +2287,19 @@ class _MainBottomBar extends StatelessWidget {
       (MediaQuery.textScalerOf(context).scale(_labelSize) - _labelSize) *
           _labelLineHeight,
     );
-    final controls = SizedBox(
-      height: 62 + labelGrowth,
+    // Only the compact shell reserves the home-indicator band; the split shell
+    // leaves it to the content instead, so the row keeps the bar's whole box.
+    final bottomInset = reserveBottomInset
+        ? MediaQuery.paddingOf(context).bottom
+        : 0.0;
+
+    // The reserved band belongs to every tab, not to the container: the tab's
+    // press surface, ripple, and hover tint then reach the window edge and no
+    // strip under the buttons is left painted-but-unowned. The band is applied
+    // as padding inside each tab so the icon and label keep their centre. The
+    // glass hosts pass 0 — their capsules carry the inset themselves.
+    Widget controlsWithBottomInset(double inset) => SizedBox(
+      height: 62 + labelGrowth + inset,
       child: Row(
         children: [
           for (var i = 0; i < items.length; i++)
@@ -2294,85 +2316,88 @@ class _MainBottomBar extends StatelessWidget {
                 semanticLabel: items[i].label.l10n(context),
                 selected: selection == i,
                 onTap: () => onSelect(i),
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.xxs,
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: 36,
-                          height: 28,
-                          child: Stack(
-                            clipBehavior: Clip.none,
-                            alignment: Alignment.center,
-                            children: [
-                              TweenAnimationBuilder<double>(
-                                duration: AppMotion.duration(
-                                  context,
-                                  AppMotion.responsive,
-                                ),
-                                curve: AppMotion.standard,
-                                tween: Tween<double>(
-                                  end: selection == i ? 1 : 0,
-                                ),
-                                builder: (context, value, child) =>
-                                    Transform.translate(
-                                      offset: Offset(0, -value),
-                                      child: Transform.scale(
-                                        scale: 1 + value * 0.08,
-                                        child: AppIcon(
-                                          items[i].icon,
-                                          size: 24,
-                                          color: Color.lerp(
-                                            c.textTertiary,
-                                            AppTheme.brand,
-                                            value,
+                child: Padding(
+                  padding: EdgeInsets.only(bottom: inset),
+                  child: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.xxs,
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 36,
+                            height: 28,
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              alignment: Alignment.center,
+                              children: [
+                                TweenAnimationBuilder<double>(
+                                  duration: AppMotion.duration(
+                                    context,
+                                    AppMotion.responsive,
+                                  ),
+                                  curve: AppMotion.standard,
+                                  tween: Tween<double>(
+                                    end: selection == i ? 1 : 0,
+                                  ),
+                                  builder: (context, value, child) =>
+                                      Transform.translate(
+                                        offset: Offset(0, -value),
+                                        child: Transform.scale(
+                                          scale: 1 + value * 0.08,
+                                          child: AppIcon(
+                                            items[i].icon,
+                                            size: 24,
+                                            color: Color.lerp(
+                                              c.textTertiary,
+                                              AppTheme.brand,
+                                              value,
+                                            ),
                                           ),
                                         ),
                                       ),
-                                    ),
-                              ),
-                              if (i == 0 && unread > 0)
-                                Positioned(
-                                  right: -14,
-                                  top: -2,
-                                  child: UnreadBadge(
-                                    count: unread,
-                                    onClear: onClearUnread,
-                                  ),
                                 ),
-                            ],
+                                if (i == 0 && unread > 0)
+                                  Positioned(
+                                    right: -14,
+                                    top: -2,
+                                    child: UnreadBadge(
+                                      count: unread,
+                                      onClear: onClearUnread,
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        AnimatedDefaultTextStyle(
-                          duration: AppMotion.duration(
-                            context,
-                            AppMotion.responsive,
+                          const SizedBox(height: 2),
+                          AnimatedDefaultTextStyle(
+                            duration: AppMotion.duration(
+                              context,
+                              AppMotion.responsive,
+                            ),
+                            curve: AppMotion.standard,
+                            style: TextStyle(
+                              fontSize: _labelSize,
+                              fontWeight: selection == i
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: selection == i
+                                  ? AppTheme.brand
+                                  : c.textTertiary,
+                            ),
+                            // A wrapped label would outgrow the bar; the tab
+                            // is identified by its icon either way.
+                            child: Text(
+                              items[i].label.l10n(context),
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                          curve: AppMotion.standard,
-                          style: TextStyle(
-                            fontSize: _labelSize,
-                            fontWeight: selection == i
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                            color: selection == i
-                                ? AppTheme.brand
-                                : c.textTertiary,
-                          ),
-                          // A wrapped label would outgrow the bar; the tab
-                          // is identified by its icon either way.
-                          child: Text(
-                            items[i].label.l10n(context),
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -2381,6 +2406,7 @@ class _MainBottomBar extends StatelessWidget {
         ],
       ),
     );
+    final controls = controlsWithBottomInset(0.0);
     if (glass) {
       // iOS hosts the real Liquid Glass: a native surface draws only the glass
       // (public UIGlassEffect on iOS 26+, system material blur before), while
@@ -2430,7 +2456,7 @@ class _MainBottomBar extends StatelessWidget {
         color: c.navBar,
         border: Border(top: BorderSide(color: c.divider, width: 0.5)),
       ),
-      child: SafeArea(top: false, child: controls),
+      child: controlsWithBottomInset(bottomInset),
     );
   }
 }
