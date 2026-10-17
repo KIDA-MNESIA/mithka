@@ -87,6 +87,22 @@ List<ChatMessage> mergeChatMessages(
       message.senderPhoto ??= existing.senderPhoto;
       message.senderRole ??= existing.senderRole;
       message.senderTitle ??= existing.senderTitle;
+      if (message.replyToMessageId == existing.replyToMessageId &&
+          message.replyToChatId == existing.replyToChatId) {
+        message.replyToSender ??= existing.replyToSender;
+        if (!message.isContentRestricted) {
+          // A restriction-redacted refresh withdraws the quoted content: the
+          // cached quote text/entities must go with the image, not survive.
+          message.replyToPreview ??= existing.replyToPreview;
+          message.replyToDate ??= existing.replyToDate;
+          if (message.replyToEntities.isEmpty) {
+            message.replyToEntities = existing.replyToEntities;
+          }
+          message.replyToImage ??= existing.replyToImage;
+          message.replyToImageWidth ??= existing.replyToImageWidth;
+          message.replyToImageHeight ??= existing.replyToImageHeight;
+        }
+      }
       if (!message.commentThreadMetadataKnown &&
           existing.commentThreadMetadataKnown) {
         message.hasCommentThread = existing.hasCommentThread;
