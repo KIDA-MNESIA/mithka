@@ -1044,6 +1044,14 @@
     <string name="chatPeopleDoingAction">{value1}명이 활동 중…</string>
     <string name="chatPeopleTyping">{value1}명이 입력 중…</string>
     <string name="chatPickerChooseChat">채팅 선택</string>
+    <string name="chatReactionReportAction">반응 신고</string>
+    <string name="chatReactionReportFailed">반응을 신고하지 못했습니다: {value1}</string>
+    <string name="chatReactionReportMessage">{value1}님의 반응을 불쾌하거나 악의적인 콘텐츠로 신고하시겠습니까?</string>
+    <string name="chatReactionReportSent">반응을 신고했습니다</string>
+    <string name="chatReactionReportTitle">반응을 신고할까요?</string>
+    <string name="chatReactionUsersCount">반응 {value1}개 보기</string>
+    <string name="chatReactionUsersLoadFailed">반응을 불러오지 못했습니다</string>
+    <string name="chatReactionUsersRetry">다시 시도</string>
     <string name="chatReportConfirm">신고</string>
     <string name="chatReportFailed">신고를 보낼 수 없음: {value1}</string>
     <string name="chatReportMessage">이 메시지를 불쾌하거나 악성인 콘텐츠로 신고할까요?</string>

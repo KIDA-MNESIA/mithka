@@ -1044,6 +1044,14 @@
     <string name="chatPeopleDoingAction">{value1}人が操作中…</string>
     <string name="chatPeopleTyping">{value1}人が入力中…</string>
     <string name="chatPickerChooseChat">チャットを選択</string>
+    <string name="chatReactionReportAction">リアクションを報告</string>
+    <string name="chatReactionReportFailed">リアクションを報告できませんでした: {value1}</string>
+    <string name="chatReactionReportMessage">{value1} のリアクションを不適切または虐待的なコンテンツとして報告しますか？</string>
+    <string name="chatReactionReportSent">リアクションを報告しました</string>
+    <string name="chatReactionReportTitle">リアクションを報告しますか？</string>
+    <string name="chatReactionUsersCount">{value1} 件のリアクションを表示</string>
+    <string name="chatReactionUsersLoadFailed">リアクションを読み込めませんでした</string>
+    <string name="chatReactionUsersRetry">再試行</string>
     <string name="chatReportConfirm">報告</string>
     <string name="chatReportFailed">報告を送信できませんでした: {value1}</string>
     <string name="chatReportMessage">このメッセージを不適切または迷惑な内容として報告しますか？</string>

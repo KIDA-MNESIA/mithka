@@ -1021,6 +1021,14 @@ abstract final class AppStringKeys {
   static const chatPeopleDoingAction = 'chatPeopleDoingAction';
   static const chatPeopleTyping = 'chatPeopleTyping';
   static const chatPickerChooseChat = 'chatPickerChooseChat';
+  static const chatReactionReportAction = 'chatReactionReportAction';
+  static const chatReactionReportFailed = 'chatReactionReportFailed';
+  static const chatReactionReportMessage = 'chatReactionReportMessage';
+  static const chatReactionReportSent = 'chatReactionReportSent';
+  static const chatReactionReportTitle = 'chatReactionReportTitle';
+  static const chatReactionUsersCount = 'chatReactionUsersCount';
+  static const chatReactionUsersLoadFailed = 'chatReactionUsersLoadFailed';
+  static const chatReactionUsersRetry = 'chatReactionUsersRetry';
   static const chatReportConfirm = 'chatReportConfirm';
   static const chatReportFailed = 'chatReportFailed';
   static const chatReportMessage = 'chatReportMessage';

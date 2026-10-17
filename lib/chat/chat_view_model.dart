@@ -105,6 +105,9 @@ class _SenderInfo {
   final MemberRole role;
   final String? title;
   final bool isPremium;
+
+  /// TDLib reported `userTypeDeleted`: the account no longer exists, so it has
+  /// no profile to open and nothing to report.
   final bool isDeleted;
   final int accentColorId;
   final int emojiStatusId;
@@ -237,12 +240,16 @@ class MessageReactionUser {
     required this.title,
     this.photo,
     this.date = 0,
+    this.isDeleted = false,
   });
 
   final int senderId;
   final String title;
   final TdFileRef? photo;
   final int date;
+
+  /// The account behind the reaction no longer exists.
+  final bool isDeleted;
 }
 
 class BotCommandOption {
@@ -3313,6 +3320,19 @@ class ChatViewModel extends ChangeNotifier {
 
   Future<void> reportMessage(ChatMessage message) async {
     await _reportTelegramContent(message);
+  }
+
+  /// Reports one sender's reaction on a message. The caller must have checked
+  /// the message's `canReportReactions` permission first.
+  Future<void> reportReaction(ChatMessage message, int senderId) async {
+    await _client.query({
+      '@type': 'reportMessageReactions',
+      'chat_id': chatId,
+      'message_id': message.id,
+      'sender_id': senderId > 0
+          ? {'@type': 'messageSenderUser', 'user_id': senderId}
+          : {'@type': 'messageSenderChat', 'chat_id': senderId},
+    });
   }
 
   Future<void> blockSender(ChatMessage message) async {
@@ -6705,6 +6725,7 @@ class ChatViewModel extends ChangeNotifier {
           title: info.name,
           photo: info.photo,
           date: item.integer('date') ?? 0,
+          isDeleted: info.isDeleted,
         ),
       );
     }

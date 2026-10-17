@@ -1046,6 +1046,14 @@
     <string name="chatPeopleDoingAction">{value1} personnes actives…</string>
     <string name="chatPeopleTyping">{value1} personnes écrivent…</string>
     <string name="chatPickerChooseChat">Choisir une discussion</string>
+    <string name="chatReactionReportAction">Signaler la réaction</string>
+    <string name="chatReactionReportFailed">Impossible de signaler la réaction : {value1}</string>
+    <string name="chatReactionReportMessage">Signaler la réaction de {value1} comme contenu répréhensible ou abusif ?</string>
+    <string name="chatReactionReportSent">Réaction signalée</string>
+    <string name="chatReactionReportTitle">Signaler la réaction ?</string>
+    <string name="chatReactionUsersCount">Afficher les {value1} réactions</string>
+    <string name="chatReactionUsersLoadFailed">Impossible de charger les réactions</string>
+    <string name="chatReactionUsersRetry">Réessayer</string>
     <string name="chatReportConfirm">Signaler</string>
     <string name="chatReportFailed">Impossible d’envoyer le signalement : {value1}</string>
     <string name="chatReportMessage">Signaler ce message comme contenu choquant ou abusif ?</string>
