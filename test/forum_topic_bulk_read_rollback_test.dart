@@ -50,6 +50,41 @@ void main() {
   int unread(ChatViewModel model, int topicId) =>
       model.forumTopics.firstWhere((topic) => topic.id == topicId).unreadCount;
 
+  for (final success in [true, false]) {
+    test(
+      'disposing a bulk read cancels late ${success ? "success" : "failure"} and the remaining topics',
+      () async {
+        server
+          ..addTopic(id: 1, lastMessageId: 90, unread: 2)
+          ..addTopic(id: 2, lastMessageId: 85, unread: 3);
+        final viewModel = model();
+        await viewModel.loadForumTopics();
+        final pending = server.holdTopic(1);
+        final batch = viewModel.markForumTopicsRead([1, 2]);
+        await pumpEventQueue();
+        viewModel.dispose();
+        // Account/cache replacement must not be mutated by the old pane.
+        ForumTopicIndex.shared.clear();
+        ForumTopicIndex.shared.storeAll(0, _chatId, const [
+          ForumTopicIndexEntry(
+            id: 1,
+            name: 'Replacement topic',
+            unreadCount: 7,
+            lastMessageId: 90,
+          ),
+        ]);
+        if (success) {
+          pending.complete({'@type': 'ok'});
+        } else {
+          pending.completeError(StateError('old read failed'));
+        }
+        await batch;
+        expect(server.viewMessages, hasLength(1));
+        expect(ForumTopicIndex.shared.entryFor(0, _chatId, 1)?.unreadCount, 7);
+      },
+    );
+  }
+
   test('a pending batch failure must not restore a counter an authoritative '
       'read already cleared', () async {
     server.addTopic(id: 1, lastMessageId: 90, unread: 2);

@@ -4854,6 +4854,7 @@ class ChatViewModel extends ChangeNotifier {
     Iterable<int> topicIds, {
     bool failureFeedback = true,
   }) async {
+    if (_isDisposed) return;
     final wanted = topicIds.toSet();
     final targets = [
       for (final topic in forumTopics)
@@ -4895,6 +4896,7 @@ class ChatViewModel extends ChangeNotifier {
             messageIds: [topic.lastMessageId],
           ),
         );
+        if (_isDisposed) return;
         // TDLib advanced this topic's inbox watermark; remember it so a stale
         // getForumTopics page cannot regress the successful read.
         ForumTopicIndex.shared.recordRead(
@@ -4905,6 +4907,7 @@ class ChatViewModel extends ChangeNotifier {
           lastMessageId: topic.lastMessageId,
         );
       } catch (error) {
+        if (_isDisposed) return;
         failures++;
         firstError ??= error;
         final snapshot = previous[topic.id];

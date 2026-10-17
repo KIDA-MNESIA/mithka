@@ -61,6 +61,7 @@ void main() {
   var stalePages = false;
   // Message ids whose scoped read fails.
   final failingReadMessageIds = <int>{};
+  Completer<void>? heldBulkRead;
 
   setUpAll(() {
     updates = StreamController<Map<String, dynamic>>.broadcast();
@@ -87,6 +88,9 @@ void main() {
                   'messageSourceForumTopicHistory') {
             // Topic 77 ends at message 90, topic 78 at message 85.
             for (final id in request['message_ids'] as List) {
+              if (id == 90 && heldBulkRead != null) {
+                await heldBulkRead!.future;
+              }
               if (failingReadMessageIds.contains(id)) {
                 throw StateError('viewMessages failed for $id');
               }
@@ -115,6 +119,7 @@ void main() {
     readTopicIds = <int>{};
     stalePages = false;
     failingReadMessageIds.clear();
+    heldBulkRead = null;
     rights
       ..canCreateTopics = false
       ..adminStatus = false
@@ -632,6 +637,48 @@ void main() {
         });
       },
     );
+
+    testWidgets('disposing the topic page cancels a pending bulk read', (
+      tester,
+    ) async {
+      await withDesktopSurface(tester, () async {
+        final pending = heldBulkRead = Completer<void>();
+        await tester.tap(
+          find.byKey(const ValueKey('topic-list-mark-all-read')),
+        );
+        await _settle(tester);
+        final readCount = requests
+            .where((request) => request['@type'] == 'viewMessages')
+            .length;
+        expect(
+          requests
+              .where((request) => request['@type'] == 'viewMessages')
+              .last['message_ids'],
+          [90],
+        );
+        await tester.pumpWidget(const SizedBox.shrink());
+        ForumTopicIndex.shared.clear();
+        ForumTopicIndex.shared.storeAll(0, _chatId, const [
+          ForumTopicIndexEntry(
+            id: _topicId,
+            name: 'Replacement',
+            unreadCount: 9,
+            lastMessageId: 90,
+          ),
+        ]);
+        pending.complete();
+        await _settle(tester);
+        expect(
+          requests.where((request) => request['@type'] == 'viewMessages'),
+          hasLength(readCount),
+        );
+        expect(
+          ForumTopicIndex.shared.entryFor(0, _chatId, _topicId)?.unreadCount,
+          9,
+        );
+        expect(tester.takeException(), isNull);
+      });
+    });
 
     testWidgets('topic creator may delete without admin rights', (
       tester,

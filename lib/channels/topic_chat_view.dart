@@ -1284,8 +1284,10 @@ class _TopicChatViewState extends State<TopicChatView> {
     _syncTopicListHost();
     final failed = <int>{};
     for (final entry in plan) {
+      if (!mounted) return;
       try {
         await _query(entry.request);
+        if (!mounted) return;
         // The read advanced this topic's inbox watermark; record it so the
         // next getForumTopics page cannot resurrect the cleared counter.
         ForumTopicIndex.shared.recordRead(
