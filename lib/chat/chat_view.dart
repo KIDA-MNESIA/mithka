@@ -898,6 +898,26 @@ class ChatViewExitController {
   void prepareExit() => _prepareExit?.call();
 }
 
+/// Lets an adaptive parent ask the transcript it already shows to reveal the
+/// newest message.
+///
+/// Tapping the conversation that is already open in the split pane has nothing
+/// to navigate to, so it has to mean "take me to the latest message" instead of
+/// rebuilding the same pane and leaving the reader wherever they had scrolled.
+class ChatRevealLatestController {
+  VoidCallback? _revealLatest;
+
+  /// Registers the currently visible chat and returns a matching detacher.
+  VoidCallback register(VoidCallback revealLatest) {
+    _revealLatest = revealLatest;
+    return () {
+      if (identical(_revealLatest, revealLatest)) _revealLatest = null;
+    };
+  }
+
+  void revealLatest() => _revealLatest?.call();
+}
+
 /// Keeps the chat header full-width while reserving a trailing context pane
 /// only below it. This avoids the empty header gutter produced by placing the
 /// context pane beside the entire chat view.
@@ -979,6 +999,7 @@ class ChatView extends StatefulWidget {
     this.onOpenUserProfile,
     this.onBack,
     this.exitController,
+    this.revealLatestController,
   });
   final int chatId;
   final String title;
@@ -1008,6 +1029,10 @@ class ChatView extends StatefulWidget {
   final void Function(int userId, String name)? onOpenUserProfile;
   final VoidCallback? onBack;
   final ChatViewExitController? exitController;
+
+  /// Lets an owning shell ask this transcript — the one already on screen — to
+  /// show its newest message.
+  final ChatRevealLatestController? revealLatestController;
 
   @override
   State<ChatView> createState() => _ChatViewState();
@@ -1366,6 +1391,7 @@ class _ChatViewState extends State<ChatView> {
   final Set<int> _autoTranslatedMessageIds = <int>{};
   bool _sendFailureDialogVisible = false;
   VoidCallback? _detachExitController;
+  VoidCallback? _detachRevealLatestController;
   VoidCallback? _detachPaneBackHandler;
   final ChatSessionCacheWriteGate _sessionCacheWriteGate =
       ChatSessionCacheWriteGate();
@@ -1411,6 +1437,9 @@ class _ChatViewState extends State<ChatView> {
   void initState() {
     super.initState();
     _detachExitController = widget.exitController?.register(_prepareExitState);
+    _detachRevealLatestController = widget.revealLatestController?.register(
+      _onRevealLatestRequested,
+    );
     _wallpaperController.addListener(_onWallpaperChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -1593,9 +1622,21 @@ class _ChatViewState extends State<ChatView> {
       // reading position, this one included.
       _forgetJumpOrigin();
     }
-    if (identical(oldWidget.exitController, widget.exitController)) return;
-    _detachExitController?.call();
-    _detachExitController = widget.exitController?.register(_prepareExitState);
+    if (!identical(oldWidget.exitController, widget.exitController)) {
+      _detachExitController?.call();
+      _detachExitController = widget.exitController?.register(
+        _prepareExitState,
+      );
+    }
+    if (!identical(
+      oldWidget.revealLatestController,
+      widget.revealLatestController,
+    )) {
+      _detachRevealLatestController?.call();
+      _detachRevealLatestController = widget.revealLatestController?.register(
+        _onRevealLatestRequested,
+      );
+    }
   }
 
   /// Whether this chat's topics are known — resolved live or seeded from the
@@ -2589,6 +2630,25 @@ class _ChatViewState extends State<ChatView> {
       // reached: a stale origin must never outlive the tap that asked for it.
       _jumpOrigin = null;
       unawaited(_returnToJumpOrigin(origin));
+      return;
+    }
+    _requestReturnToLatest(userInitiated: true);
+  }
+
+  /// The shell asked for the newest message — because the reader tapped the
+  /// conversation that is already open, or re-opened it from a link. This is
+  /// the same intent as tapping the return-to-latest arrow, so it goes through
+  /// the same coordinator: an anchored history window loads the latest page
+  /// first, and a plain scroll-up just animates back to the edge.
+  void _onRevealLatestRequested() {
+    if (!mounted) return;
+    if (!_scroll.hasClients) {
+      // The pane is still laying out (a fresh selection being built), so there
+      // is no viewport to move yet. Re-ask once the frame is done instead of
+      // leaving a pending intent that would fire on some later scroll.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _requestReturnToLatest(userInitiated: true);
+      });
       return;
     }
     _requestReturnToLatest(userInitiated: true);
@@ -4433,6 +4493,7 @@ class _ChatViewState extends State<ChatView> {
     _prepareExitState();
     _detachPaneBackHandler?.call();
     _detachExitController?.call();
+    _detachRevealLatestController?.call();
     NotificationController.shared.unregisterVisibleChat(this);
     ActiveConversation.shared.unregister(this);
     _wallpaperController.removeListener(_onWallpaperChanged);
