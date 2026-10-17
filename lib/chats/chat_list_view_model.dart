@@ -247,7 +247,11 @@ class ChatListViewModel extends ChangeNotifier {
     if (_disposed || _listening) return;
     _listening = true;
     _subscribe();
-    for (final update in _client.latestCommunityUpdates) {
+    final slot = accountSlot;
+    final cachedCommunities = slot == null
+        ? _client.latestCommunityUpdates
+        : _client.latestCommunityUpdatesForClient(_client.clientId(slot) ?? 0);
+    for (final update in cachedCommunities) {
       final community = update.obj('community');
       if (community != null) _applyCommunity(community);
     }
@@ -353,7 +357,12 @@ class ChatListViewModel extends ChangeNotifier {
       : {'@type': 'chatListFolder', 'chat_folder_id': _selectedFilter.folderId};
 
   void _loadFilters() {
-    final cached = _client.latestChatFoldersUpdate;
+    // The cached bootstrap update belongs to the foreground account. A pinned
+    // list must read its own account's chat folders, never the foreground's.
+    final slot = accountSlot;
+    final cached = slot == null
+        ? _client.latestChatFoldersUpdate
+        : _client.latestChatFoldersUpdateForClient(_client.clientId(slot) ?? 0);
     if (cached != null) _applyChatFolders(cached);
   }
 
@@ -889,6 +898,9 @@ class ChatListViewModel extends ChangeNotifier {
   // MARK: - Update stream
 
   void _subscribe() {
+    // A pinned list follows its own slot; `allAccounts` is the only way to
+    // receive that slot's updates while another account is foreground. The
+    // unpinned list keeps the active-account stream it always had.
     _sub = _client
         .updatesOfAny(const [
           'updateNewChat',
@@ -913,12 +925,30 @@ class ChatListViewModel extends ChangeNotifier {
           'updateSupergroupFullInfo',
           'updateUserFullInfo',
           'updateUser',
-        ])
+        ], allAccounts: accountSlot != null)
         .listen(_apply);
   }
 
+  /// True when [update] was produced by the client this list is pinned to.
+  ///
+  /// Chat and user ids are account-scoped: ingesting the foreground account's
+  /// `updateNewChat` into a slot-7 picker adds a selectable row whose id a
+  /// later draft write resolves against slot 7, and an `updateChatTitle` can
+  /// rename an unrelated row that happens to share the numeric id. Routed
+  /// updates carry the originating `@client_id`; a local update carries none
+  /// and is accepted only while the pinned slot is the active one.
+  bool _belongsToOwner(Map<String, dynamic> update) {
+    final slot = accountSlot;
+    if (slot == null) return true;
+    final owner = _client.clientId(slot);
+    if (owner == null) return false;
+    final source = update.integer('@client_id');
+    if (source == null) return _client.activeClientId == owner;
+    return source == owner;
+  }
+
   void _apply(Map<String, dynamic> update) {
-    if (_disposed) return;
+    if (_disposed || !_belongsToOwner(update)) return;
     switch (update.type) {
       case 'updateNewChat':
         final chat = update.obj('chat');
