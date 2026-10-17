@@ -1672,7 +1672,9 @@ class _ChatViewState extends State<ChatView> {
     iconColor: topic.iconColor,
     unreadCount: topic.unreadCount,
     isMuted: topic.isMuted,
-    isPinned: topic.isPinned || (prior?.isPinned ?? false),
+    // A fresh model page can explicitly unpin a topic; the previously
+    // published marker must not turn that false back into true.
+    isPinned: topic.isPinned,
     isGeneral: topic.isGeneral || (prior?.isGeneral ?? false),
     isClosed: topic.isClosed || (prior?.isClosed ?? false),
     lastPreview: topic.lastPreview.isNotEmpty

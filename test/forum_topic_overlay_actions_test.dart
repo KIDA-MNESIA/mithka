@@ -42,6 +42,7 @@ void main() {
   final topicMessageCounts = <int, int>{};
   // Per-topic flag: does the fake history contain another user's message?
   final topicHasOtherSender = <int, bool>{};
+  final pinnedTopics = <int>{};
   setUpAll(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
@@ -54,6 +55,14 @@ void main() {
         accountSlot: 0,
         query: (request) async {
           requests.add(request);
+          if (request['@type'] == 'toggleForumTopicIsPinned') {
+            final id = request['forum_topic_id'] as int;
+            if (request['is_pinned'] == true) {
+              pinnedTopics.add(id);
+            } else {
+              pinnedTopics.remove(id);
+            }
+          }
           return _response(
             request,
             adminRights,
@@ -61,6 +70,7 @@ void main() {
             adminCanDeleteMessages,
             topicMessageCounts,
             topicHasOtherSender,
+            pinnedTopics,
           );
         },
         send: (_) async {},
@@ -77,6 +87,7 @@ void main() {
     adminCanDeleteMessages = false;
     topicMessageCounts.clear();
     topicHasOtherSender.clear();
+    pinnedTopics.clear();
   });
   tearDownAll(() async {
     await TdClient.shared.closeProxy();
@@ -321,6 +332,43 @@ void main() {
     },
   );
 
+  testWidgets('overlay follows pin, unpin, and repin from refreshed rows', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    try {
+      adminRights = true;
+      await _setSurfaceSize(tester, const Size(1180, 820));
+      await _pumpMainShell(tester);
+      tester.widget<ChatListView>(find.byType(ChatListView)).onChatSelected!(
+        ChatListSelection.fromChat(_chat()),
+      );
+      await _settle(tester);
+      final marker = find.byKey(const ValueKey('topic-row-pinned-78'));
+      expect(marker, findsNothing);
+
+      for (final pinned in [true, false, true]) {
+        await tester.longPress(
+          find.byKey(const ValueKey('topic-navigation-item-78')),
+        );
+        await _settle(tester);
+        await tester.tap(find.byKey(const ValueKey('topic-menu-pin')));
+        await _settle(tester);
+        final request = requests.lastWhere(
+          (request) => request['@type'] == 'toggleForumTopicIsPinned',
+        );
+        expect(request['chat_id'], -42);
+        expect(request['forum_topic_id'], 78);
+        expect(request['is_pinned'], pinned);
+        expect(marker, pinned ? findsOneWidget : findsNothing);
+      }
+      expect(tester.takeException(), isNull);
+      await _disposeShell(tester);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets('admin: pin and create fire their TDLib requests', (
     tester,
   ) async {
@@ -434,6 +482,7 @@ Map<String, dynamic> _response(
   bool adminCanDeleteMessages,
   Map<int, int> topicMessageCounts,
   Map<int, bool> topicHasOtherSender,
+  Set<int> pinnedTopics,
 ) => switch (request['@type']) {
   'getChat' => {
     '@type': 'chat',
@@ -490,6 +539,7 @@ Map<String, dynamic> _response(
                 : null,
           },
           'last_message': _message(70 - index),
+          'is_pinned': pinnedTopics.contains(77 + index),
           'unread_count': index == 2 ? 4 : 0, // topic 79 is unread
         },
     ],
