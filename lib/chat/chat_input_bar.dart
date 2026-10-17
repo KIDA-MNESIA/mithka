@@ -7269,13 +7269,13 @@ class _ChatInputBarState extends State<ChatInputBar>
   /// Delivers the composer's text as an ordinary formatted message when the
   /// account has no rich send path. Block structure has no representation in
   /// `inputMessageText`, so it is dropped with one toast; when nothing at all
-  /// can be sent (media-only document, rejected send) the draft is reopened
-  /// instead of disappearing.
+  /// can be sent (a document containing media, or a rejected send) the draft
+  /// is reopened instead of silently sending only its caption and losing media.
   Future<void> _sendRichTextFormattedOnly(
     RichTextComposerResult result, {
     required bool droppedRichBlocks,
   }) async {
-    if (result.text.trim().isEmpty) {
+    if (result.text.trim().isEmpty || result.attachments.isNotEmpty) {
       showToast(
         context,
         AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),

@@ -4,6 +4,8 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/chat/chat_input_bar.dart';
 import 'package:mithka/chat/chat_view_model.dart';
+import 'package:mithka/chat/outgoing_attachment.dart';
+import 'package:mithka/chat/rich_message_source.dart';
 import 'package:mithka/chat/rich_text_composer_view.dart';
 import 'package:mithka/components/app_icons.dart';
 import 'package:mithka/l10n/app_localizations.dart';
@@ -141,6 +143,49 @@ void main() {
     expect(find.byType(RichTextComposerView), findsNothing);
     final input = tester.widget<TextField>(_barField(tester).first);
     expect(input.controller?.text, isEmpty);
+    await _drainToast(tester);
+  });
+
+  testWidgets('declining a relay preserves a mixed text and attachment draft', (
+    tester,
+  ) async {
+    final vm = _RecordingChatViewModel();
+    addTearDown(vm.dispose);
+    await _pumpComposer(tester, vm);
+    await _openRichTextEditor(tester);
+    const attachment = OutgoingAttachment(
+      path: '/tmp/unsent-document.pdf',
+      kind: OutgoingAttachmentKind.document,
+    );
+    // Submit through the real route's result boundary without opening an OS
+    // file picker. This is the same text/attachment shape the editor emits.
+    Navigator.of(tester.element(find.byType(RichTextComposerView))).pop(
+      const RichTextComposerResult(
+        text: 'Document caption',
+        entities: [],
+        attachments: [attachment],
+        segments: [
+          RichMessageSendSegment.html('<p>Document caption</p>'),
+          RichMessageSendSegment.attachments([attachment]),
+        ],
+        hasRichBlocks: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Configure a relay bot?'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(
+      vm.sent,
+      isEmpty,
+      reason: 'no partial text-only send may lose media',
+    );
+    final editor = tester.widget<RichTextComposerView>(
+      find.byType(RichTextComposerView),
+    );
+    expect(editor.initialText, 'Document caption');
+    expect(editor.initialAttachments, [attachment]);
+    expect(find.text('unsent-document.pdf'), findsOneWidget);
     await _drainToast(tester);
   });
 
