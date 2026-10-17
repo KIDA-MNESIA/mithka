@@ -229,6 +229,32 @@ class ForumTopicReadTarget {
   final int unreadCount;
 }
 
+/// One topic's scoped read request, paired with the topic it belongs to so a
+/// bulk caller can roll back exactly the topics whose request failed.
+class ForumTopicReadRequest {
+  const ForumTopicReadRequest({required this.target, required this.request});
+
+  final ForumTopicReadTarget target;
+  final Map<String, dynamic> request;
+}
+
+/// The per-topic reads for [topics], each paired with its target. A topic with
+/// no message to advance the watermark to has no request.
+List<ForumTopicReadRequest> forumTopicMarkAllReadPlan({
+  required int chatId,
+  required Iterable<ForumTopicReadTarget> topics,
+}) => [
+  for (final topic in topics)
+    if (topic.lastMessageId > 0)
+      ForumTopicReadRequest(
+        target: topic,
+        request: forumTopicViewMessagesRequest(
+          chatId: chatId,
+          messageIds: [topic.lastMessageId],
+        ),
+      ),
+];
+
 /// The per-topic read requests that clear [topics]: one `viewMessages` per
 /// topic, scoped through [forumTopicViewMessagesRequest] so TDLib advances
 /// that topic's own inbox watermark (a chat-wide read cannot address a
@@ -239,12 +265,8 @@ List<Map<String, dynamic>> forumTopicMarkAllReadRequests({
   required int chatId,
   required Iterable<ForumTopicReadTarget> topics,
 }) => [
-  for (final topic in topics)
-    if (topic.lastMessageId > 0)
-      forumTopicViewMessagesRequest(
-        chatId: chatId,
-        messageIds: [topic.lastMessageId],
-      ),
+  for (final entry in forumTopicMarkAllReadPlan(chatId: chatId, topics: topics))
+    entry.request,
 ];
 
 Map<String, dynamic> createForumTopicRequest({

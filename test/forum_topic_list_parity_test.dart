@@ -56,6 +56,11 @@ void main() {
   // clears that topic's unread counter on the next getForumTopics, exactly
   // like TDLib advancing the topic's inbox watermark.
   late Set<int> readTopicIds;
+  // A stale page keeps reporting the pre-read counters, the way a response
+  // fetched before a successful read lands.
+  var stalePages = false;
+  // Message ids whose scoped read fails.
+  final failingReadMessageIds = <int>{};
 
   setUpAll(() {
     updates = StreamController<Map<String, dynamic>>.broadcast();
@@ -82,11 +87,20 @@ void main() {
                   'messageSourceForumTopicHistory') {
             // Topic 77 ends at message 90, topic 78 at message 85.
             for (final id in request['message_ids'] as List) {
+              if (failingReadMessageIds.contains(id)) {
+                throw StateError('viewMessages failed for $id');
+              }
               if (id == 90) readTopicIds.add(_topicId);
               if (id == 85) readTopicIds.add(_otherTopicId);
             }
           }
-          return _response(request, rights, pinnedTopicIds, readTopicIds);
+          return _response(
+            request,
+            rights,
+            pinnedTopicIds,
+            readTopicIds,
+            stalePages,
+          );
         },
         send: (_) async {},
         updates: updates.stream,
@@ -99,6 +113,8 @@ void main() {
     ForumTopicIndex.shared.clear();
     pinnedTopicIds = <int>{_topicId};
     readTopicIds = <int>{};
+    stalePages = false;
+    failingReadMessageIds.clear();
     rights
       ..canCreateTopics = false
       ..adminStatus = false
@@ -562,6 +578,61 @@ void main() {
       });
     });
 
+    testWidgets(
+      'a partial bulk read restores only the failed topic across a stale page',
+      (tester) async {
+        await withDesktopSurface(tester, () async {
+          expect(find.byKey(_unreadKey(_topicId)), findsOneWidget);
+          expect(find.byKey(_unreadKey(_otherTopicId)), findsOneWidget);
+
+          // From here every getForumTopics answer is the pre-batch snapshot,
+          // exactly a page fetched before the successful read lands. Topic
+          // 78's scoped read fails; topic 77's succeeds.
+          stalePages = true;
+          failingReadMessageIds.add(85);
+
+          await tester.tap(
+            find.byKey(const ValueKey('topic-list-mark-all-read')),
+          );
+          await tester.pump();
+          await _settle(tester);
+
+          expect(
+            find.byKey(_unreadKey(_topicId)),
+            findsNothing,
+            reason: 'a successful read must survive the stale page',
+          );
+          expect(
+            find.byKey(_unreadKey(_otherTopicId)),
+            findsOneWidget,
+            reason: 'only the failed topic regains its own counter',
+          );
+          final reads = [
+            for (final request in requests)
+              if (request['@type'] == 'viewMessages') request,
+          ];
+          expect(
+            [for (final request in reads) request['message_ids']],
+            [
+              [80],
+              [90],
+              [85],
+            ],
+            reason: 'exactly one scoped read per topic',
+          );
+          expect(
+            find.text('Failed to mark all topics as read'),
+            findsOneWidget,
+          );
+          // The toast hides on its own timer; let it expire so the binding's
+          // "no pending timers" invariant holds at teardown.
+          await tester.pump(const Duration(milliseconds: 1500));
+          await _settle(tester);
+          expect(tester.takeException(), isNull);
+        });
+      },
+    );
+
     testWidgets('topic creator may delete without admin rights', (
       tester,
     ) async {
@@ -662,8 +733,9 @@ Map<String, dynamic> _message(
 
 Map<String, dynamic> _forumTopics(
   Set<int> pinnedTopicIds,
-  Set<int> readTopicIds,
-) => {
+  Set<int> readTopicIds, {
+  bool stalePages = false,
+}) => {
   '@type': 'forumTopics',
   'topics': [
     {
@@ -697,7 +769,7 @@ Map<String, dynamic> _forumTopics(
       },
       'last_message': _message(90, text: 'Hello topic', senderUserId: 2),
       'is_pinned': pinnedTopicIds.contains(_topicId),
-      'unread_count': readTopicIds.contains(_topicId) ? 0 : 3,
+      'unread_count': stalePages || !readTopicIds.contains(_topicId) ? 3 : 0,
       'notification_settings': {
         '@type': 'chatNotificationSettings',
         'mute_for': 0,
@@ -715,7 +787,9 @@ Map<String, dynamic> _forumTopics(
       },
       'last_message': _message(85, text: 'Other chatter', senderUserId: 2),
       'is_pinned': pinnedTopicIds.contains(_otherTopicId),
-      'unread_count': readTopicIds.contains(_otherTopicId) ? 0 : 2,
+      'unread_count': stalePages || !readTopicIds.contains(_otherTopicId)
+          ? 2
+          : 0,
       'notification_settings': {
         '@type': 'chatNotificationSettings',
         'mute_for': 0,
@@ -729,8 +803,13 @@ Map<String, dynamic> _response(
   _Rights rights,
   Set<int> pinnedTopicIds,
   Set<int> readTopicIds,
+  bool stalePages,
 ) => switch (request['@type']) {
-  'getForumTopics' => _forumTopics(pinnedTopicIds, readTopicIds),
+  'getForumTopics' => _forumTopics(
+    pinnedTopicIds,
+    readTopicIds,
+    stalePages: stalePages,
+  ),
   // Empty history: the topic-list previews under test come from
   // getForumTopics.last_message, not the post feed. Pumping TopicChatView
   // standalone with a real rendered post row trips a pre-existing
