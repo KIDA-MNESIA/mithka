@@ -2655,6 +2655,7 @@ abstract final class AppStringKeys {
   static const richTextRelayProgressForward = 'richTextRelayProgressForward';
   static const richTextRelayProgressUpload = 'richTextRelayProgressUpload';
   static const richTextRelayProgressWait = 'richTextRelayProgressWait';
+  static const richTextSentFormattedOnly = 'richTextSentFormattedOnly';
   static const richTextTableAddColumnLeft = 'richTextTableAddColumnLeft';
   static const richTextTableAddColumnRight = 'richTextTableAddColumnRight';
   static const richTextTableAddRowAbove = 'richTextTableAddRowAbove';

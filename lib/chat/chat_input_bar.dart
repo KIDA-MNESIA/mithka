@@ -2402,7 +2402,21 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (lengthTier == TelegramMessageLengthTier.rich) {
       final sendAsRichText = await _confirmLongMessageAsRichText();
       if (!mounted || !sendAsRichText) return;
-      if (await _richTextSendMode() == null || !mounted) return;
+      if (await _richTextSendMode() == null) {
+        if (!mounted) return;
+        // This length cannot travel as a plain message, so a declined or
+        // failed relay setup keeps the draft and says why instead of dropping
+        // the text silently.
+        final configured = await _configureRichMessageRelay();
+        if (!mounted) return;
+        if (!configured) {
+          showToast(
+            context,
+            AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+          );
+          return;
+        }
+      }
       if (vm.requiresPaidMessage) {
         final ok = await _confirmPaidMessageSend();
         if (!mounted || !ok) return;
@@ -3036,7 +3050,9 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<void> _openRichTextComposer() async {
-    if (await _richTextSendMode() == null) return;
+    // Every account can compose rich text; whether it can be delivered as a
+    // rich message is resolved at send time, so the editor itself is never
+    // gated behind the relay bot.
     if (!mounted) return;
     if (_usesNativeDesktopComposer(context)) {
       try {
@@ -6854,9 +6870,28 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<void> _sendRichTextResult(RichTextComposerResult result) async {
-    final mode = await _richTextSendMode();
-    if (mode == null) return;
+    var mode = await _richTextSendMode();
     if (!mounted) return;
+    if (mode == null && result.hasRichBlocks) {
+      // The document needs a capability this account does not have. Offer the
+      // relay once; declining or a failed setup falls through to a plain
+      // formatted message.
+      var configured = false;
+      try {
+        configured = await _configureRichMessageRelay();
+      } catch (error) {
+        debugPrint('Rich text relay setup failed: $error');
+      }
+      if (!mounted) return;
+      if (configured) mode = _RichTextSendMode.botRelay;
+    }
+    if (mode == null) {
+      await _sendRichTextFormattedOnly(
+        result,
+        droppedRichBlocks: result.hasRichBlocks,
+      );
+      return;
+    }
     try {
       var sentAny = false;
       if (mode == _RichTextSendMode.direct) {
@@ -6912,6 +6947,41 @@ class _ChatInputBarState extends State<ChatInputBar>
         showToast(context, message);
         await _reopenFailedRichTextComposer(result);
       }
+    }
+  }
+
+  /// Delivers the composer's text as an ordinary formatted message when the
+  /// account has no rich send path. Block structure has no representation in
+  /// `inputMessageText`, so it is dropped with one toast; when nothing at all
+  /// can be sent (media-only document, rejected send) the draft is reopened
+  /// instead of disappearing.
+  Future<void> _sendRichTextFormattedOnly(
+    RichTextComposerResult result, {
+    required bool droppedRichBlocks,
+  }) async {
+    if (result.text.trim().isEmpty) {
+      showToast(
+        context,
+        AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    final sent = await widget.vm.sendFormatted(result.text, result.entities);
+    if (!mounted) return;
+    if (!sent) {
+      showToast(
+        context,
+        AppStringKeys.composerRichTextSendFailed.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    widget.onMessageSent();
+    _controller.clear();
+    _focus.requestFocus();
+    if (droppedRichBlocks) {
+      showToast(context, AppStringKeys.richTextSentFormattedOnly.l10n(context));
     }
   }
 
@@ -7046,6 +7116,10 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (entry?.mounted ?? false) entry!.remove();
   }
 
+  /// Resolves how this account can deliver a rich message, without asking the
+  /// user for anything. A null result means the account has no rich send path;
+  /// callers may then offer [RichMessageRelayConfig] setup once and fall back
+  /// to a plain formatted message.
   Future<_RichTextSendMode?> _richTextSendMode() async {
     try {
       if (await TdClient.shared.activeAccountUsesBotApi()) {
@@ -7057,17 +7131,10 @@ class _ChatInputBarState extends State<ChatInputBar>
       if (await RichMessageRelayConfig.isConfigured()) {
         return _RichTextSendMode.botRelay;
       }
-      if (mounted && await _configureRichMessageRelay()) {
-        return _RichTextSendMode.botRelay;
-      }
-    } catch (error) {
-      if (mounted) {
-        final message = switch (error) {
-          TdError(:final message) when message.trim().isNotEmpty => message,
-          _ => error.toString(),
-        };
-        showToast(context, message);
-      }
+    } catch (_) {
+      // Capability probing is advisory here: a failure leaves the caller on the
+      // plain formatted-message path rather than replacing the message with a
+      // probe error.
     }
     return null;
   }

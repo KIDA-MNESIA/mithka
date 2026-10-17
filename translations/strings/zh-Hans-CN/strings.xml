@@ -2771,6 +2771,7 @@
     <string name="richTextRelayProgressForward">转发消息</string>
     <string name="richTextRelayProgressUpload">上传媒体 {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">等待接收消息</string>
+    <string name="richTextSentFormattedOnly">已作为格式化消息发送，富文本块已被丢弃。</string>
     <string name="richTextTableAddColumnLeft">在左侧添加列</string>
     <string name="richTextTableAddColumnRight">在右侧添加列</string>
     <string name="richTextTableAddRowAbove">在上方添加行</string>

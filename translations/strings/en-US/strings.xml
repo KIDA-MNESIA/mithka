@@ -2781,6 +2781,7 @@
     <string name="richTextRelayProgressForward">Forward message</string>
     <string name="richTextRelayProgressUpload">Upload media {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">Wait for message</string>
+    <string name="richTextSentFormattedOnly">Sent as a formatted message. Rich blocks were dropped.</string>
     <string name="richTextTableAddColumnLeft">Add column left</string>
     <string name="richTextTableAddColumnRight">Add column right</string>
     <string name="richTextTableAddRowAbove">Add row above</string>
