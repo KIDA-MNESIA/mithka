@@ -273,6 +273,75 @@ void main() {
     }
   });
 
+  testWidgets('a covered dock releases the window-level collapsed player', (
+    tester,
+  ) async {
+    final navigator = GlobalKey<NavigatorState>();
+    player.current = _track();
+    player.collapse();
+    await tester.pumpWidget(
+      MaterialApp(
+        navigatorKey: navigator,
+        builder: (context, child) =>
+            Stack(children: [child!, const GlobalMusicPlayerOverlay()]),
+        home: const Scaffold(
+          body: Align(
+            alignment: Alignment.bottomLeft,
+            child: SizedBox(width: 320, child: MusicMiniPlayerDock()),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(player.hasDockedMiniPlayerHost, isTrue);
+    expect(find.byKey(musicCollapsedOverlayKey), findsNothing);
+
+    unawaited(
+      navigator.currentState!.push<void>(
+        MaterialPageRoute(
+          builder: (_) => const Scaffold(body: Text('Covered')),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    await tester.pump();
+    expect(find.text('Covered'), findsOneWidget);
+    expect(
+      find.byType(MusicMiniPlayerDock, skipOffstage: false),
+      findsOneWidget,
+    );
+    expect(player.hasDockedMiniPlayerHost, isFalse);
+    expect(find.byKey(musicCollapsedOverlayKey), findsOneWidget);
+
+    navigator.currentState!.pop();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    await tester.pump();
+    expect(player.hasDockedMiniPlayerHost, isTrue);
+    expect(find.byKey(musicCollapsedOverlayKey), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('a delayed swipe dismissal cannot close a newly selected track', (
+    tester,
+  ) async {
+    await _pumpShellWithTrack(tester, const Size(1366, 1024));
+    await tester.drag(
+      find.byKey(musicMiniPlayerCardKey),
+      const Offset(-220, 0),
+    );
+    final next = _track(title: 'New track', id: 102, fileId: 304);
+    player.current = next;
+    player.expand();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(player.current, same(next));
+    expect(player.isVisible, isTrue);
+    expect(find.text('New track'), findsOneWidget);
+    await _disposeShell(tester);
+  });
+
   testWidgets('the window-level collapsed player stands down for a dock', (
     tester,
   ) async {
@@ -351,8 +420,10 @@ Future<void> _pumpShellWithTrack(
 ChatMessage _track({
   String title = 'Song title',
   String performer = 'Artist',
+  int id = 101,
+  int fileId = 303,
 }) => ChatMessage(
-  id: 101,
+  id: id,
   isOutgoing: false,
   text: '',
   date: 1,
@@ -362,7 +433,7 @@ ChatMessage _track({
     title: title,
     performer: performer,
     duration: 200,
-    file: TdFileRef(id: 303),
+    file: TdFileRef(id: fileId),
   ),
 );
 

@@ -1204,10 +1204,23 @@ class MusicMiniPlayerDock extends StatefulWidget {
 }
 
 class _MusicMiniPlayerDockState extends State<MusicMiniPlayerDock> {
+  bool _registered = false;
+
   @override
-  void initState() {
-    super.initState();
-    MusicPlayerController.shared.attachDockedMiniPlayerHost(this);
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Navigator retains covered routes. Only a visible, ticking dock may
+    // suppress the window-level player on the route above it.
+    final visible =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    if (visible == _registered) return;
+    _registered = visible;
+    if (visible) {
+      MusicPlayerController.shared.attachDockedMiniPlayerHost(this);
+    } else {
+      MusicPlayerController.shared.detachDockedMiniPlayerHost(this);
+    }
   }
 
   @override
@@ -1258,6 +1271,7 @@ class _MusicMiniPlayerCardState extends State<MusicMiniPlayerCard> {
   bool _dragging = false;
   bool _settling = false;
   int _settleRevision = 0;
+  ChatMessage? _gestureTrack;
 
   MusicPlayerController get controller => MusicPlayerController.shared;
 
@@ -1276,11 +1290,19 @@ class _MusicMiniPlayerCardState extends State<MusicMiniPlayerCard> {
   }
 
   void _onControllerChanged() {
+    if (!identical(_gestureTrack, controller.current)) {
+      _settleRevision++;
+      _gestureTrack = controller.current;
+      _settling = false;
+      _dragging = false;
+      _dragX = 0;
+    }
     if (mounted) setState(() {});
   }
 
   void _onHorizontalDragStart(DragStartDetails details) {
     if (_settling) return;
+    _gestureTrack = controller.current;
     _settleRevision++;
     setState(() {
       _dragging = true;
