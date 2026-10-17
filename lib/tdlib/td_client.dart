@@ -2143,8 +2143,32 @@ class TdClient {
     await _applySavedProxyToClient(clientId);
   }
 
+  /// Applies the locally saved proxy config to [clientId], even when that
+  /// account is no longer the foreground one.
+  ///
+  /// A surface that mutates one account's proxy list must not route its
+  /// cleanup through whichever account the user switched to meanwhile.
+  Future<void> applySavedProxyToClient(int clientId) async {
+    if (clientId == 0) return;
+    _proxyAppliedClients.add(clientId);
+    await _applySavedProxyToClient(clientId);
+  }
+
   Future<void> applyProxyConfig(ProxyConfig config) async {
     final clientId = _activeClientId;
+    if (clientId == 0) {
+      throw StateError('TDLib client is not active yet');
+    }
+    _proxyAppliedClients.add(clientId);
+    await _applyProxyConfigToClient(config, clientId);
+  }
+
+  /// Applies [config] to [clientId], even when that account is no longer the
+  /// foreground one.
+  Future<void> applyProxyConfigToClient(
+    ProxyConfig config,
+    int clientId,
+  ) async {
     if (clientId == 0) {
       throw StateError('TDLib client is not active yet');
     }
