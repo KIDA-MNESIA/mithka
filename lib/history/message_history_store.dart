@@ -364,6 +364,7 @@ class MessageHistoryStore extends ChangeNotifier {
   /// a queued update resolving long after the invalidation is still
   /// classified correctly.
   int _persistedScopeEpoch = 0;
+  int _clearedAllAt = 0;
 
   /// Resolved user id of the active client, kept in sync with
   /// [TosAccountUserIdResolver] results; null while unresolved.
@@ -394,6 +395,10 @@ class MessageHistoryStore extends ChangeNotifier {
 
   /// Directory holding the mirror file. Resolved lazily; tests inject one.
   Directory? fileDir;
+
+  /// Holds the file-commit boundary in persistence cancellation tests.
+  @visibleForTesting
+  Future<void> Function()? beforePersistRenameForTesting;
 
   TosAccountUserIdResolver get _resolver =>
       accountUserIdResolver ?? TosAccountUserIdResolver.production;
@@ -773,8 +778,8 @@ class MessageHistoryStore extends ChangeNotifier {
     final existing = _byKey[key];
     if (existing != null) {
       final refreshed = existing.copyWith(
-        text: _messageText(message) ?? existing.text,
-        kindKey: _messageKindKey(message) ?? existing.kindKey,
+        text: _messageText(message.obj('content')) ?? existing.text,
+        kindKey: _messageKindKey(message.obj('content')) ?? '',
         senderId: _senderId(message) ?? existing.senderId,
         state: MessageHistoryState.active,
         deletedAt: 0,
@@ -899,6 +904,10 @@ class MessageHistoryStore extends ChangeNotifier {
       () => <int>{},
     );
     if (!excluded.add(chatId)) return;
+    _clearedChatAt['$accountUserId:$chatId'] = ++_scopeEpoch;
+    _pendingEditDates.removeWhere(
+      (key, _) => key.startsWith('$accountUserId:$chatId:'),
+    );
     _byKey.removeWhere(
       (key, entry) =>
           entry.accountUserId == accountUserId && entry.chatId == chatId,
@@ -933,10 +942,12 @@ class MessageHistoryStore extends ChangeNotifier {
         if (entry.accountUserId == accountUserId && entry.chatId == chatId)
           entry.key,
     ];
-    if (keys.isEmpty) return 0;
     for (final key in keys) {
       _byKey.remove(key);
     }
+    _pendingEditDates.removeWhere(
+      (key, _) => key.startsWith('$accountUserId:$chatId:'),
+    );
     _clearedChatAt['$accountUserId:$chatId'] = ++_scopeEpoch;
     notifyListeners();
     _schedulePersist();
@@ -949,12 +960,11 @@ class MessageHistoryStore extends ChangeNotifier {
   /// queued updates and an in-flight load cannot resurrect any of it.
   int clearAll() {
     if (!allowTelegramTosViolations) return 0;
-    if (_byKey.isEmpty) return 0;
     final removed = _byKey.length;
     _byKey.clear();
     _pendingEditDates.clear();
     _generation++;
-    _scopeEpoch++;
+    _clearedAllAt = ++_scopeEpoch;
     notifyListeners();
     _schedulePersist();
     return removed;
@@ -1030,6 +1040,7 @@ class MessageHistoryStore extends ChangeNotifier {
       // is stale on disk and is dropped even when the invalidation happened
       // before this load started.
       if (_disposed || _generation != generation) return;
+      if (_clearedAllAt > _persistedScopeEpoch) return;
       if (decoded is! Map) return;
       final raw = decoded['entries'];
       if (raw is! List) return;
@@ -1060,6 +1071,7 @@ class MessageHistoryStore extends ChangeNotifier {
   }
 
   Future<void> _persistNow() async {
+    if (!allowTelegramTosViolations || _disposed) return;
     if (_persisting) {
       _dirtyWhilePersisting = true;
       return;
@@ -1068,17 +1080,23 @@ class MessageHistoryStore extends ChangeNotifier {
     try {
       final dir = fileDir ?? await getApplicationSupportDirectory();
       final tmp = File('${dir.path}/$_fileName$_tmpSuffix');
+      final batchScopeEpoch = _scopeEpoch;
       final batch = {
         'version': 2,
         'entries': [
-          for (final entry in _byKey.values.take(persistBatch)) entry.toJson(),
+          for (final entry in _byKey.values.skip(
+            (_byKey.length - persistBatch).clamp(0, maxEntries),
+          ))
+            entry.toJson(),
         ],
       };
       await tmp.writeAsString(jsonEncode(batch), flush: true);
+      final beforeRename = beforePersistRenameForTesting;
+      if (beforeRename != null) await beforeRename();
       await tmp.rename('${dir.path}/$_fileName');
       // The file now reflects this exact invalidation state: loads may
       // trust every row in it again.
-      _persistedScopeEpoch = _scopeEpoch;
+      _persistedScopeEpoch = batchScopeEpoch;
     } catch (_) {
       return;
     } finally {

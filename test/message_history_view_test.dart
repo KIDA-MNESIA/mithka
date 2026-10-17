@@ -18,6 +18,7 @@ import 'package:mithka/config/build_flags.dart';
 import 'package:mithka/history/message_history_store.dart';
 import 'package:mithka/history/message_history_view.dart';
 import 'package:mithka/l10n/app_localizations.dart';
+import 'package:mithka/tdlib/td_client.dart';
 import 'package:mithka/theme/app_theme.dart';
 import 'package:mithka/theme/theme_controller.dart';
 import 'package:provider/provider.dart';
@@ -127,6 +128,47 @@ void main() {
       find.text(AppStringKeys.historyEmpty.l10n(_contextOf(tester))),
       findsOneWidget,
     );
+  });
+
+  testWidgets('a held chat title cannot cross an account switch', (
+    tester,
+  ) async {
+    final oldTitle = Completer<Map<String, dynamic>>();
+    var account = 42;
+    addTearDown(() => account = 0);
+    TdClient.shared.configureProxy(
+      TdClientProxyTransport(
+        accountSlot: 0,
+        query: (request) async {
+          if (request['@type'] != 'getChat') return {'@type': 'ok'};
+          if (account == 0) return {'@type': 'ok'};
+          if (account == 42) return oldTitle.future;
+          return {'@type': 'chat', 'id': 11, 'title': 'Second account title'};
+        },
+        send: (_) async {},
+        updates: const Stream<Map<String, dynamic>>.empty(),
+      ),
+    );
+    addTearDown(TdClient.shared.closeProxy);
+    store.debugSeed([
+      _entry(11, 100, text: 'first account message'),
+      _entry(11, 100, accountUserId: 43, text: 'second account message'),
+    ]);
+    await _pumpViewer(tester, store);
+    account = 43;
+    store.debugSetActiveAccount(43);
+    await tester.pump();
+    oldTitle.complete({
+      '@type': 'chat',
+      'id': 11,
+      'title': 'First account title',
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('first account message'), findsNothing);
+    expect(find.text('First account title'), findsNothing);
+    expect(find.text('second account message'), findsOneWidget);
+    expect(find.text('Second account title'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets('rows list kept messages with their chat label', (tester) async {

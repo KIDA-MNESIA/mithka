@@ -55,6 +55,7 @@ void main() {
         store.initialize(await SharedPreferences.getInstance());
         await store.ensureLoaded();
         store.startObserving();
+        await store.persistNowForTesting();
         store.debugSeed([
           const MessageHistoryEntry(
             accountUserId: 42,

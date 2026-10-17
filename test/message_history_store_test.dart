@@ -167,6 +167,93 @@ void main() {
     return jsonDecode(file.readAsStringSync()) as Map<String, dynamic>;
   }
 
+  test(
+    'a refetched message refreshes content without losing its history',
+    () async {
+      await start();
+      store.recordIncomingMessage(_message(11, 100, text: 'before'));
+      emitAs(_clientA, 'updateMessageEdited', {
+        'chat_id': '11',
+        'message_id': 100,
+        'edit_date': 123,
+      });
+      emitAs(_clientA, 'updateMessageContent', {
+        'chat_id': '11',
+        'message_id': 100,
+        'new_content': {
+          '@type': 'messageText',
+          'text': {'@type': 'formattedText', 'text': 'edited'},
+        },
+      });
+      await pump();
+      store.recordIncomingMessage({
+        ..._message(11, 100),
+        'content': {
+          '@type': 'messagePhoto',
+          'caption': {'@type': 'formattedText', 'text': 'refetched caption'},
+        },
+      });
+      final entry = store.entry(11, 100)!;
+      expect(entry.text, 'refetched caption');
+      expect(entry.kindKey, 'historyKindPhoto');
+      expect(entry.events.single.oldText, 'before');
+      expect(entry.events.single.newText, 'edited');
+    },
+  );
+
+  test(
+    'clearAll invalidates queued updates even while the mirror is empty',
+    () async {
+      final gate = Completer<int?>();
+      store.accountUserIdResolver = _GatedResolver({_clientA: gate});
+      await start();
+      emitAs(_clientA, 'updateNewMessage', {'message': _message(11, 100)});
+      await pump();
+      expect(store.clearAll(), 0);
+      gate.complete(_accountA);
+      await pump();
+      expect(store.entryCount, 0);
+    },
+  );
+
+  test(
+    'clearChat stamps an empty chat without cancelling another chat',
+    () async {
+      final gate = Completer<int?>();
+      store.accountUserIdResolver = _GatedResolver({_clientA: gate});
+      await start();
+      store.debugSetActiveAccount(_accountA);
+      emitAs(_clientA, 'updateNewMessage', {'message': _message(11, 100)});
+      emitAs(_clientA, 'updateNewMessage', {'message': _message(22, 200)});
+      await pump();
+      expect(store.clearChat(11), 0);
+      gate.complete(_accountA);
+      await pump();
+      expect(store.entry(11, 100), isNull);
+      expect(store.entry(22, 200), isNotNull);
+    },
+  );
+
+  test(
+    'exclude then include does not revive updates queued before exclusion',
+    () async {
+      final gate = Completer<int?>();
+      store.accountUserIdResolver = _GatedResolver({_clientA: gate});
+      await start();
+      store.debugSetActiveAccount(_accountA);
+      emitAs(_clientA, 'updateNewMessage', {'message': _message(11, 100)});
+      await pump();
+      store.excludeChat(11);
+      store.includeChat(11);
+      gate.complete(_accountA);
+      await pump();
+      expect(store.entryCount, 0);
+      emitAs(_clientA, 'updateNewMessage', {'message': _message(11, 101)});
+      await pump();
+      expect(store.entry(11, 101), isNotNull);
+    },
+  );
+
   test('incoming messages mirror with sender, kind and text', () async {
     await start();
     emitAs(_clientA, 'updateNewMessage', {'message': _message(11, 100)});
@@ -184,6 +271,64 @@ void main() {
     expect(entries.single.state, MessageHistoryState.active);
     expect(persistedJson()['entries'], hasLength(1));
   });
+
+  test('the bounded persisted batch keeps the most recent messages', () async {
+    await start();
+    for (var id = 1; id <= MessageHistoryStore.persistBatch + 1; id++) {
+      store.recordIncomingMessage(_message(11, id));
+    }
+    await store.persistNowForTesting();
+    final rows = persistedJson()['entries'] as List;
+    expect(rows, hasLength(MessageHistoryStore.persistBatch));
+    expect((rows.first as Map)['id'], 2);
+    expect((rows.last as Map)['id'], MessageHistoryStore.persistBatch + 1);
+  });
+
+  for (final scope in ['chat', 'all', 'account']) {
+    test(
+      'a $scope clear during persistence cannot resurrect stale disk rows',
+      () async {
+        store.debugSetActiveAccount(_accountA);
+        store.recordIncomingMessage(_message(11, 100));
+        final reachedCommit = Completer<void>();
+        final releaseCommit = Completer<void>();
+        store.beforePersistRenameForTesting = () async {
+          reachedCommit.complete();
+          await releaseCommit.future;
+        };
+        final writing = store.persistNowForTesting();
+        await reachedCommit.future;
+        switch (scope) {
+          case 'chat':
+            store.clearChat(11);
+          case 'all':
+            store.clearAll();
+          case 'account':
+            store.removeAccount(_accountA);
+        }
+        releaseCommit.complete();
+        await writing;
+        store.beforePersistRenameForTesting = null;
+        await store.ensureLoaded();
+        expect(store.entryCount, 0);
+      },
+    );
+  }
+
+  test(
+    'clearing an empty mirror before its first load invalidates old disk rows',
+    () async {
+      store.debugSetActiveAccount(_accountA);
+      store.recordIncomingMessage(_message(11, 100));
+      await store.persistNowForTesting();
+      store.dispose();
+      store = MessageHistoryStore.forTesting()..fileDir = dir;
+      store.initialize(await SharedPreferences.getInstance());
+      expect(store.clearAll(), 0);
+      await store.ensureLoaded();
+      expect(store.entryCount, 0);
+    },
+  );
 
   test('updateDeleteMessages keeps the copy and marks it deleted', () async {
     await start();

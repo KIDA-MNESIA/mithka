@@ -10,13 +10,14 @@
 
 import 'dart:async';
 
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 
 import '../components/app_confirm_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../l10n/app_localizations.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
@@ -47,12 +48,16 @@ class _MessageHistoryViewState extends State<MessageHistoryView> {
   late int? _chatId;
   Map<int, String> _chatTitles = const {};
   bool _resolvingTitles = false;
+  int? _titleAccountUserId;
+  int _titleResolutionGeneration = 0;
 
   @override
   void initState() {
     super.initState();
     _store = widget.store ?? MessageHistoryStore.shared;
     _chatId = widget.chatId;
+    if (!allowTelegramTosViolations) return;
+    _titleAccountUserId = _store.activeAccountUserId;
     _store.addListener(_onStore);
     unawaited(_store.ensureLoaded());
     _maybeResolveChatTitles();
@@ -65,6 +70,13 @@ class _MessageHistoryViewState extends State<MessageHistoryView> {
   }
 
   void _onStore() {
+    if (_titleAccountUserId != _store.activeAccountUserId) {
+      _titleAccountUserId = _store.activeAccountUserId;
+      _titleResolutionGeneration++;
+      _resolvingTitles = false;
+      _chatTitles = const {};
+      _chatId = null;
+    }
     if (mounted) setState(() {});
     _maybeResolveChatTitles();
   }
@@ -77,24 +89,27 @@ class _MessageHistoryViewState extends State<MessageHistoryView> {
     final wanted = {for (final entry in _store.entries) entry.chatId};
     if (_chatTitles.keys.toSet().containsAll(wanted)) return;
     _resolvingTitles = true;
-    unawaited(_resolveChatTitles(wanted));
+    unawaited(_resolveChatTitles(wanted, ++_titleResolutionGeneration));
   }
 
-  Future<void> _resolveChatTitles(Set<int> chatIds) async {
+  Future<void> _resolveChatTitles(Set<int> chatIds, int generation) async {
+    final clientId = TdClient.shared.activeClientId;
     final resolved = <int, String>{};
     for (final chatId in chatIds) {
+      if (!mounted || generation != _titleResolutionGeneration) return;
       try {
-        final chat = await TdClient.shared.query({
+        final chat = await TdClient.shared.queryTo({
           '@type': 'getChat',
           'chat_id': chatId,
-        });
+        }, clientId);
         final title = chat.str('title');
         if (title != null && title.isNotEmpty) resolved[chatId] = title;
       } catch (_) {
         // Fall through to the localized "Chat {id}" label.
       }
     }
-    if (mounted && resolved.isNotEmpty) {
+    if (!mounted || generation != _titleResolutionGeneration) return;
+    if (resolved.isNotEmpty) {
       setState(() => _chatTitles = {..._chatTitles, ...resolved});
     }
     _resolvingTitles = false;
@@ -140,6 +155,7 @@ class _MessageHistoryViewState extends State<MessageHistoryView> {
 
   @override
   Widget build(BuildContext context) {
+    if (!allowTelegramTosViolations) return const SizedBox.shrink();
     final all = _store.entries;
     final visible = _chatId == null
         ? all.reversed.toList()
@@ -360,6 +376,7 @@ class MessageHistoryExcludedChatsView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!allowTelegramTosViolations) return const SizedBox.shrink();
     return SettingsPageScaffold(
       title: AppStringKeys.historyExcludedTitle.l10n(context),
       onBack: () => Navigator.of(context).pop(),
