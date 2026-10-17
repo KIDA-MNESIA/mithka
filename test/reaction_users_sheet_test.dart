@@ -29,14 +29,13 @@ Map<String, dynamic> _reaction(int count, {bool chosen = false}) => {
   'is_chosen': chosen,
 };
 
-Map<String, dynamic> _message({bool canReportReactions = true}) => {
+Map<String, dynamic> _message() => {
   '@type': 'message',
   'id': _messageId,
   'chat_id': _chatId,
   'date': 1785862260 + _messageId,
   'is_outgoing': false,
   'sender_id': {'@type': 'messageSenderUser', 'user_id': 2},
-  if (canReportReactions) 'can_report_reactions': true,
   'interaction_info': {
     'reactions': {
       'reactions': [_reaction(3)],
@@ -86,7 +85,9 @@ void main() {
   L10nFixtures.load().install();
 
   late List<Map<String, dynamic>> requests;
-  late bool canReportReactions;
+  late bool canReportProperty;
+  late bool propertiesFail;
+  late Completer<bool>? propertiesGate;
   late bool reactionsFail;
   late bool reportFails;
   late bool reactionsLoadedOnce;
@@ -104,7 +105,7 @@ void main() {
               return {
                 '@type': 'messages',
                 'total_count': 1,
-                'messages': [_message(canReportReactions: canReportReactions)],
+                'messages': [_message()],
               };
             case 'getMe':
               return _user(_meId, 'Me');
@@ -119,6 +120,16 @@ void main() {
               return {'@type': 'supergroup', 'id': -_chatId - 1000000000000};
             case 'getSupergroupFullInfo':
               return {'@type': 'supergroupFullInfo', 'member_count': 3};
+            case 'getMessageProperties':
+              final gate = propertiesGate;
+              if (gate != null) await gate.future;
+              if (propertiesFail) {
+                throw StateError('properties unavailable');
+              }
+              return {
+                '@type': 'messageProperties',
+                'can_report_reactions': canReportProperty,
+              };
             case 'getMessageAddedReactions':
               if (reactionsFail) {
                 throw StateError('reactions unavailable');
@@ -175,7 +186,9 @@ void main() {
 
   setUp(() async {
     requests = [];
-    canReportReactions = true;
+    canReportProperty = true;
+    propertiesFail = false;
+    propertiesGate = null;
     reactionsFail = false;
     reportFails = false;
     reactionsLoadedOnce = false;
@@ -368,7 +381,7 @@ void main() {
   testWidgets('without the message permission no report action is offered', (
     tester,
   ) async {
-    canReportReactions = false;
+    canReportProperty = false;
     await pumpChat(tester);
     await openReactions(tester);
 
@@ -423,5 +436,58 @@ void main() {
     expect(inSheet(find.text('Could not load reactions')), findsNothing);
 
     await settle(tester);
+  });
+  testWidgets('the report action is hydrated from messageProperties', (
+    tester,
+  ) async {
+    await pumpChat(tester);
+    await openReactions(tester);
+
+    expect(find.byKey(const ValueKey('reactionUserReport-2')), findsOneWidget);
+    final properties = requests
+        .where((request) => request['@type'] == 'getMessageProperties')
+        .toList();
+    expect(properties, hasLength(1));
+    expect(properties.single, {
+      '@type': 'getMessageProperties',
+      'chat_id': _chatId,
+      'message_id': _messageId,
+    });
+
+    await settle(tester);
+  });
+
+  testWidgets('a failed property lookup hides reporting and keeps the sheet', (
+    tester,
+  ) async {
+    propertiesFail = true;
+    await pumpChat(tester);
+    await openReactions(tester);
+
+    expect(find.byKey(const ValueKey('reactionUserReport-2')), findsNothing);
+    expect(find.byType(ReactionUsersSheetFrame), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await settle(tester);
+  });
+
+  testWidgets('a property answer after dismissal never offers reporting', (
+    tester,
+  ) async {
+    final gate = propertiesGate = Completer<bool>();
+    await pumpChat(tester);
+    await openReactions(tester);
+    // Still in flight: nothing may be offered before TDLib granted it.
+    expect(find.byKey(const ValueKey('reactionUserReport-2')), findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    gate.complete(true);
+    await tester.pump(const Duration(milliseconds: 500));
+
+    expect(tester.takeException(), isNull);
+    expect(
+      requests.where((request) => request['@type'] == 'reportMessageReactions'),
+      isEmpty,
+    );
   });
 }

@@ -37,6 +37,7 @@ import '../channels/topic_navigation.dart';
 import '../chats/search_token_views.dart';
 import '../communities/community_models.dart';
 import '../communities/community_view.dart';
+import '../components/app_confirm_dialog.dart';
 import '../components/app_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -5951,12 +5952,17 @@ class _ChatViewState extends State<ChatView> {
     MessageReaction reaction,
   ) async {
     if (!mounted || message.reactions.isEmpty) return;
+    // `can_report_reactions` is a messageProperties field, not a field of the
+    // message. Start the hydrated permission alongside the sheet so the report
+    // action appears only after TDLib granted it, and fails closed otherwise.
+    final reportPermission = _vm.canReportMessageReactions(message.id);
     await showReactionUsersModal<void>(
       context,
       builder: (dialogContext) => _ReactionUsersSheet(
         viewModel: _vm,
         message: message,
         initialReaction: reaction,
+        reportPermission: reportPermission,
         onOpenSender: _openReactionSender,
         onReportSender: (user) => _reportReactionSender(message, user),
       ),
@@ -5989,18 +5995,20 @@ class _ChatViewState extends State<ChatView> {
     ChatMessage message,
     MessageReactionUser user,
   ) async {
-    if (!message.canReportReactions || user.isDeleted) return;
+    if (user.isDeleted) return;
     if (user.senderId == _vm.meId) return;
-    final confirmed = await confirmDialog(
+    final confirmed = await showAppConfirmDialog(
       context,
-      title: AppStringKeys.chatReactionReportTitle,
+      title: AppStrings.t(AppStringKeys.chatReactionReportTitle),
       message: AppStrings.t(AppStringKeys.chatReactionReportMessage, {
         'value1': user.title,
       }),
-      confirmText: AppStringKeys.chatReportConfirm,
+      confirmText: AppStrings.t(AppStringKeys.chatReportConfirm),
       destructive: true,
     );
-    if (!mounted || !confirmed) return;
+    // The permission and the write belong to the pane's own account: a switch
+    // while the dialog was open must drop the report entirely.
+    if (!mounted || !confirmed || !_vm.isAccountCurrent) return;
     try {
       await _vm.reportReaction(message, user.senderId);
       if (!mounted) return;
@@ -11228,6 +11236,7 @@ class _ReactionUsersSheet extends StatefulWidget {
     required this.viewModel,
     required this.message,
     required this.initialReaction,
+    required this.reportPermission,
     required this.onOpenSender,
     required this.onReportSender,
   });
@@ -11235,6 +11244,10 @@ class _ReactionUsersSheet extends StatefulWidget {
   final ChatViewModel viewModel;
   final ChatMessage message;
   final MessageReaction initialReaction;
+
+  /// `messageProperties.can_report_reactions` for [message], resolved when the
+  /// sheet opens. Hidden until true and never resurrected by a late answer.
+  final Future<bool> reportPermission;
   final ValueChanged<MessageReactionUser> onOpenSender;
   final ValueChanged<MessageReactionUser> onReportSender;
 
@@ -11247,6 +11260,7 @@ enum _ReactionUserAction { report }
 class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   late MessageReaction _selected;
   final Map<String, Future<List<MessageReactionUser>>> _loads = {};
+  bool _allowReport = false;
 
   @override
   void initState() {
@@ -11256,6 +11270,13 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
       (reaction) => _reactionKey(reaction) == initialKey,
       orElse: () => widget.message.reactions.first,
     );
+    unawaited(_loadReportPermission());
+  }
+
+  Future<void> _loadReportPermission() async {
+    final allowed = await widget.reportPermission;
+    if (!mounted || !allowed) return;
+    setState(() => _allowReport = true);
   }
 
   Future<List<MessageReactionUser>> _load(MessageReaction reaction) {
@@ -11271,9 +11292,7 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
       : 'emoji:${reaction.emoji ?? ''}';
 
   bool _canReport(MessageReactionUser user) =>
-      widget.message.canReportReactions &&
-      !user.isDeleted &&
-      user.senderId != widget.viewModel.meId;
+      _allowReport && !user.isDeleted && user.senderId != widget.viewModel.meId;
 
   void _retrySelected() {
     _loads.remove(_reactionKey(_selected));

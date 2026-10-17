@@ -709,7 +709,6 @@ class ChatMessage {
     this.restrictedContentTextEntities = const [],
     this.containsUnreadMention = false,
     this.hasUnreadReactions = false,
-    this.canReportReactions = false,
     this.senderId,
     this.senderPhoto,
     this.image,
@@ -820,10 +819,6 @@ class ChatMessage {
   bool containsUnreadMention;
   bool hasUnreadReactions;
 
-  /// TDLib's message-level permission to report a reaction on this message.
-  /// Absent payloads default to false so the action never appears without the
-  /// server granting it.
-  bool canReportReactions;
   int? senderId;
   TdFileRef? senderPhoto;
   TdFileRef? image; // photo / sticker / video-thumb / gif
@@ -1715,7 +1710,6 @@ abstract final class TDParse {
             message.boolean('contains_unread_mention') ?? false,
         hasUnreadReactions:
             (message.objects('unread_reactions') ?? const []).isNotEmpty,
-        canReportReactions: message.boolean('can_report_reactions') ?? false,
         senderId: senderId,
         senderIsChat: sender?.type == 'messageSenderChat',
         senderTitle:
