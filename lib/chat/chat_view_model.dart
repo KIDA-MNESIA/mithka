@@ -439,6 +439,28 @@ class ForumTopicOption {
     lastPreview: lastPreview,
     lastSender: lastSender,
     lastMessageDate: lastMessageDate,
+    // The index can know a newer message than a stale page row: keep the
+    // newer id so a later mark-read targets live traffic, not the old page.
+    lastMessageId: entry.lastMessageId > lastMessageId
+        ? entry.lastMessageId
+        : lastMessageId,
+  );
+
+  /// The same row with a new unread counter, every other field untouched.
+  ForumTopicOption _withUnreadCount(int unread) => ForumTopicOption(
+    id: id,
+    name: name,
+    iconCustomEmojiId: iconCustomEmojiId,
+    iconColor: iconColor,
+    unreadCount: unread,
+    isMuted: isMuted,
+    isPinned: isPinned,
+    isGeneral: isGeneral,
+    isClosed: isClosed,
+    creatorId: creatorId,
+    lastPreview: lastPreview,
+    lastSender: lastSender,
+    lastMessageDate: lastMessageDate,
     lastMessageId: lastMessageId,
   );
 }
@@ -4595,6 +4617,7 @@ class ChatViewModel extends ChangeNotifier {
         iconColor: entry.iconColor,
         unreadCount: entry.unreadCount,
         isMuted: entry.isMuted,
+        lastMessageId: entry.lastMessageId,
       );
 
   int? _forumTopicId(Map<String, dynamic> topic, Map<String, dynamic> info) {
@@ -4809,6 +4832,138 @@ class ChatViewModel extends ChangeNotifier {
     } catch (_) {
       // A failed mark-read is silent: nothing destructive happened.
     }
+  }
+
+  /// Clears every one of [topicIds] at once: the rows drop their unread
+  /// counters before the first request leaves, each topic's read is sent
+  /// scoped to its own newest message, and a failed topic gets its own counter
+  /// back. Reads run even for topics that already report zero locally, so a
+  /// stale counter cannot survive on the server.
+  ///
+  /// Rollback is deliberately per topic and state-guarded: a topic whose
+  /// request failed regains its counter only while the index still holds the
+  /// exact read state captured before the optimistic clear. An authoritative
+  /// updateForumTopic (or new traffic) that moved the watermark while the
+  /// batch was in flight wins, so a successful read's zero is never
+  /// overwritten by an older counter.
+  ///
+  /// Throws only when no topic could be read at all. With [failureFeedback]
+  /// false a partial failure is silent (the counters still roll back); the
+  /// caller decides what to say.
+  Future<void> markForumTopicsRead(
+    Iterable<int> topicIds, {
+    bool failureFeedback = true,
+  }) async {
+    final wanted = topicIds.toSet();
+    final targets = [
+      for (final topic in forumTopics)
+        if (wanted.contains(topic.id) && topic.lastMessageId > 0) topic,
+    ];
+    if (targets.isEmpty) return;
+    // Snapshot the index state behind each counter, not just the number: the
+    // rollback guard needs to know whether the read position moved since.
+    final previous =
+        <
+          int,
+          ({int unreadCount, int? lastReadInboxMessageId, int? lastMessageId})
+        >{};
+    for (final topic in targets) {
+      if (topic.unreadCount <= 0) continue;
+      final entry = ForumTopicIndex.shared.entryFor(
+        _accountSlot,
+        chatId,
+        topic.id,
+      );
+      previous[topic.id] = (
+        unreadCount: topic.unreadCount,
+        lastReadInboxMessageId: entry?.lastReadInboxMessageId,
+        lastMessageId: entry?.lastMessageId,
+      );
+    }
+    if (previous.isNotEmpty) {
+      _applyTopicUnreadCounts({
+        for (final topicId in previous.keys) topicId: 0,
+      });
+    }
+    var failures = 0;
+    Object? firstError;
+    for (final topic in targets) {
+      try {
+        await _topicAccountQuery(
+          forumTopicViewMessagesRequest(
+            chatId: chatId,
+            messageIds: [topic.lastMessageId],
+          ),
+        );
+        // TDLib advanced this topic's inbox watermark; remember it so a stale
+        // getForumTopics page cannot regress the successful read.
+        ForumTopicIndex.shared.recordRead(
+          _accountSlot,
+          chatId,
+          topic.id,
+          readMessageId: topic.lastMessageId,
+          lastMessageId: topic.lastMessageId,
+        );
+      } catch (error) {
+        failures++;
+        firstError ??= error;
+        final snapshot = previous[topic.id];
+        if (snapshot == null) continue;
+        // Restore only this topic, and only while nothing authoritative moved
+        // its read position or newest message during the batch.
+        final restored = ForumTopicIndex.shared.restoreUnreadCountIfUnmoved(
+          _accountSlot,
+          chatId,
+          topic.id,
+          restoreCount: snapshot.unreadCount,
+          expectedUnreadCount: 0,
+          expectedLastReadInboxMessageId: snapshot.lastReadInboxMessageId,
+          expectedLastMessageId: snapshot.lastMessageId,
+        );
+        if (restored) {
+          _applyTopicUnreadCounts({topic.id: snapshot.unreadCount});
+        }
+      }
+    }
+    if (failures > 0) {
+      if (failures == targets.length) throw firstError!;
+      if (failureFeedback) {
+        // Some topics could not be read: say so once, after the rollback.
+        _bulkReadFailed = true;
+        notifyListeners();
+      }
+    }
+    await loadForumTopics();
+  }
+
+  /// True when the last bulk read lost some topics; the surface reads and
+  /// clears it to raise one toast.
+  bool _bulkReadFailed = false;
+  bool takeBulkReadFailure() {
+    final failed = _bulkReadFailed;
+    _bulkReadFailed = false;
+    return failed;
+  }
+
+  /// Rewrites the unread counter of the named rows in place (the index owns
+  /// every other displayed field), notifying only on a real change.
+  void _applyTopicUnreadCounts(Map<int, int> counts) {
+    if (counts.isEmpty) return;
+    var changed = false;
+    final next = <ForumTopicOption>[];
+    for (final topic in forumTopics) {
+      final count = counts[topic.id];
+      if (count == null || count == topic.unreadCount) {
+        next.add(topic);
+        continue;
+      }
+      changed = true;
+      next.add(topic._withUnreadCount(count));
+    }
+    ForumTopicIndex.shared.setUnreadCounts(_accountSlot, chatId, counts);
+    if (!changed) return;
+    forumTopics = next;
+    notifyListeners();
   }
 
   /// Folds live updates into the topic rows so previews, pins, closes and

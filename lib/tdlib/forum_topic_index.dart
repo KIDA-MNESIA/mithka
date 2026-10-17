@@ -334,6 +334,106 @@ class ForumTopicIndex extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Records that [readMessageId] was successfully marked read for a topic.
+  ///
+  /// A scoped `viewMessages` with `force_read` advances the topic's inbox
+  /// watermark to the viewed message, so the index must remember it: without
+  /// this, the next stale getForumTopics page would look newer than the
+  /// locally known read state and resurrect a counter the read cleared.
+  /// [lastMessageId] is the newest message the caller knew when it read, which
+  /// may be newer than the index's own bookkeeping.
+  void recordRead(
+    int slot,
+    int chatId,
+    int topicId, {
+    required int readMessageId,
+    int lastMessageId = 0,
+  }) {
+    if (readMessageId <= 0) return;
+    final topics = _topics[(slot, chatId)];
+    final previous = topics?[topicId];
+    if (topics == null || previous == null) return;
+    var next = previous;
+    if (lastMessageId > next.lastMessageId) {
+      next = next.copyWith(lastMessageId: lastMessageId);
+    }
+    if (readMessageId > next.lastReadInboxMessageId) {
+      next = next.copyWith(lastReadInboxMessageId: readMessageId);
+    }
+    // A read that reaches the newest known message clears the counter; a
+    // partial read leaves the remainder for the next page to confirm.
+    if (next.lastMessageId != 0 &&
+        next.lastReadInboxMessageId >= next.lastMessageId &&
+        next.unreadCount != 0) {
+      next = next.copyWith(unreadCount: 0);
+    }
+    // Persist the watermark even when nothing displayed moved: it is what
+    // keeps a later stale page from regressing the read position.
+    final displayChanged = next != previous;
+    topics[topicId] = next;
+    if (displayChanged) notifyListeners();
+  }
+
+  /// Restores [restoreCount] only while the topic still holds the exact read
+  /// state captured before an optimistic clear.
+  ///
+  /// A failed bulk read may roll back only its own topic. If an authoritative
+  /// updateForumTopic advanced the watermark (or new traffic moved the newest
+  /// message) while the request was in flight, that state wins and nothing is
+  /// restored. A null expectation means the index had no entry when the clear
+  /// happened; restoring is then only allowed while it still has none.
+  bool restoreUnreadCountIfUnmoved(
+    int slot,
+    int chatId,
+    int topicId, {
+    required int restoreCount,
+    int? expectedUnreadCount,
+    int? expectedLastReadInboxMessageId,
+    int? expectedLastMessageId,
+  }) {
+    final topics = _topics[(slot, chatId)];
+    final entry = topics?[topicId];
+    if (entry == null) {
+      return expectedLastReadInboxMessageId == null &&
+          expectedLastMessageId == null;
+    }
+    if (expectedLastReadInboxMessageId == null ||
+        expectedLastMessageId == null) {
+      // A page or update taught the index this topic mid-batch: its state
+      // moved, so the pre-batch counter is no longer trustworthy.
+      return false;
+    }
+    if (entry.lastReadInboxMessageId != expectedLastReadInboxMessageId ||
+        entry.lastMessageId != expectedLastMessageId ||
+        (expectedUnreadCount != null &&
+            entry.unreadCount != expectedUnreadCount)) {
+      return false;
+    }
+    if (entry.unreadCount == restoreCount) return true;
+    topics![topicId] = entry.copyWith(unreadCount: _nonNegative(restoreCount));
+    notifyListeners();
+    return true;
+  }
+
+  /// Rewrites the unread counter of the named topics in place. The index is
+  /// what every topic surface paints from, so a bulk read must not wait for a
+  /// page refresh to show its effect. Returns whether anything changed.
+  bool setUnreadCounts(int slot, int chatId, Map<int, int> counts) {
+    final topics = _topics[(slot, chatId)];
+    if (topics == null || counts.isEmpty) return false;
+    var changed = false;
+    for (final entry in counts.entries) {
+      final previous = topics[entry.key];
+      if (previous == null || previous.unreadCount == entry.value) continue;
+      topics[entry.key] = previous.copyWith(
+        unreadCount: _nonNegative(entry.value),
+      );
+      changed = true;
+    }
+    if (changed) notifyListeners();
+    return changed;
+  }
+
   void clearSlot(int slot) {
     final hadAny =
         _topicChats.containsKey(slot) ||
