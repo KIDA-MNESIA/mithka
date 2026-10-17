@@ -1264,6 +1264,9 @@ class _ChatViewState extends State<ChatView> {
   /// starts until the arrow consumes it, the user drags the transcript away
   /// from the jump target, or the session ends.
   _ChatJumpOrigin? _jumpOrigin;
+  // Unlike the target generation, this survives a successful target clear so
+  // post-layout corrections can still be cancelled by a newer user intent.
+  int _jumpOriginReturnGeneration = 0;
 
   /// Scroll offset when the drag that may abandon [_jumpOrigin] began. Null
   /// outside such a drag, so programmatic scrolls cannot measure against it.
@@ -2027,6 +2030,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _claimTranscriptViewport() {
+    ++_jumpOriginReturnGeneration;
     ++_transcriptGestureGeneration;
     if (_scrollTargetId != null) {
       setState(_invalidateScrollNavigation);
@@ -2544,6 +2548,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _forgetJumpOrigin() {
+    ++_jumpOriginReturnGeneration;
     _jumpOrigin = null;
     _jumpOriginDragBaseline = null;
   }
@@ -2623,11 +2628,15 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Future<void> _returnToJumpOrigin(_ChatJumpOrigin origin) async {
-    final restored = await _restoreJumpOrigin(origin);
+    final restoration = _restoreJumpOrigin(origin);
+    final generation = _jumpOriginReturnGeneration;
+    final restored = await restoration;
     // The origin's row can vanish between the tap and the layout (a paged
     // window replaced under it); keep the arrow's old contract as the fallback
     // rather than swallowing the tap.
-    if (!restored && mounted) _requestReturnToLatest(userInitiated: true);
+    if (!restored && mounted && generation == _jumpOriginReturnGeneration) {
+      _requestReturnToLatest(userInitiated: true);
+    }
   }
 
   Future<bool> _restoreJumpOrigin(_ChatJumpOrigin origin) async {
@@ -2649,15 +2658,19 @@ class _ChatViewState extends State<ChatView> {
     final alignment = viewportHeight == null || viewportHeight <= 0
         ? 0.0
         : (origin.viewportOffset / viewportHeight).clamp(0.0, 1.0);
-    final reached = await _scrollToMessageAndReport(
+    final navigation = _scrollToMessageAndReport(
       origin.messageId,
       alignment: alignment,
       forceAlignment: true,
     );
-    if (!reached || !mounted) return false;
+    final generation = _jumpOriginReturnGeneration;
+    final reached = await navigation;
+    if (!reached || !mounted || generation != _jumpOriginReturnGeneration) {
+      return false;
+    }
     _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
     await WidgetsBinding.instance.endOfFrame;
-    if (!mounted) return false;
+    if (!mounted || generation != _jumpOriginReturnGeneration) return false;
     _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
     _saveSessionScrollSnapshot();
     return true;
@@ -3371,6 +3384,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _setScrollTarget(int? messageId, {bool forceNavigation = false}) {
+    if (forceNavigation) ++_jumpOriginReturnGeneration;
     if (forceNavigation || _scrollTargetId != messageId) {
       ++_scrollTargetGeneration;
     }

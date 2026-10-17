@@ -118,7 +118,7 @@ void main() {
                 );
                 start = index < 0
                     ? history.length
-                    : index + (offset < 0 ? -offset - 1 : 0);
+                    : (index + offset).clamp(0, history.length);
               }
               if (start >= history.length) {
                 return {
@@ -454,6 +454,54 @@ void main() {
       reason: 'an abandoned origin must not teleport the reader back',
     );
   });
+
+  testWidgets('a new reply jump supersedes a pending origin return', (
+    tester,
+  ) async {
+    await pumpChat(tester);
+    await dragUpFromBottom(tester, 320);
+    await tester.tap(replyQuoteOf(_replyId));
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_parentId)));
+
+    await tester.tap(jumpArrow);
+    await tester.tap(replyQuoteOf(_parentId));
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_grandparentId)));
+    expect(visibleRows(tester), isNot(contains(_mid(_messageCount))));
+  });
+
+  testWidgets('a second arrow tap supersedes a pending origin return', (
+    tester,
+  ) async {
+    await pumpChat(tester);
+    await dragUpFromBottom(tester, 320);
+    await tester.tap(replyQuoteOf(_replyId));
+    await pumpFrames(tester);
+    await tester.tap(jumpArrow);
+    await tester.tap(jumpArrow);
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_messageCount)));
+  });
+
+  test(
+    'the history fixture includes newer messages for a negative offset',
+    () async {
+      final response = await TdClient.shared.query({
+        '@type': 'getChatHistory',
+        'chat_id': _chatId,
+        'from_message_id': _mid(5),
+        'offset': -2,
+        'limit': 3,
+        'only_local': false,
+      });
+      expect((response['messages'] as List).map((message) => message['id']), [
+        _mid(7),
+        _mid(6),
+        _mid(5),
+      ]);
+    },
+  );
 
   test('the history fixture keeps TDLib history semantics', () {
     final ids = _history().map((m) => m['id'] as int).toList();
