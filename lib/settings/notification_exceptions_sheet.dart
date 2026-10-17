@@ -150,7 +150,81 @@ int _soundId(Map<String, dynamic>? settings, String key) {
   return value > 0 ? value : 0;
 }
 
+/// The concrete TDLib client a notification-exception sheet is bound to.
+///
+/// Chat ids and the exception list itself are account-scoped, so a sheet that
+/// outlives a switch must keep using the account it was opened for instead of
+/// following the foreground.
+abstract interface class NotificationExceptionOwner {
+  int get clientId;
+
+  /// Query bound to [clientId]. It never resolves the active account.
+  Future<Map<String, dynamic>> query(Map<String, dynamic> request);
+
+  /// False once the user switched accounts, this slot's client was replaced or
+  /// closed, or shutdown started. Anything collected after that point belongs
+  /// to an account the sheet no longer represents.
+  bool get isCurrent;
+}
+
+/// Supplies the owner a notification-exception sheet runs against.
+abstract interface class NotificationExceptionAccounts {
+  static final NotificationExceptionAccounts defaultAccounts =
+      TdNotificationExceptionAccounts();
+
+  /// Null when nothing can be pinned: nothing logged in, shutdown already
+  /// running, or a client replaced between the registry reads.
+  NotificationExceptionOwner? pinActiveOwner();
+}
+
+final class TdNotificationExceptionOwner implements NotificationExceptionOwner {
+  TdNotificationExceptionOwner(this._client, this._slot, this.clientId);
+
+  final TdClient _client;
+  final int _slot;
+
+  @override
+  final int clientId;
+
+  @override
+  Future<Map<String, dynamic>> query(Map<String, dynamic> request) =>
+      _client.queryTo(request, clientId);
+
+  @override
+  bool get isCurrent =>
+      // Shutdown refuses queries before the slot and active-client mappings
+      // necessarily disappear, so the latch belongs to "still this account".
+      !_client.isShuttingDown &&
+      _client.clientId(_slot) == clientId &&
+      _client.activeClientId == clientId;
+}
+
+/// Production pinning against [TdClient.shared], or a test registry when one is
+/// supplied.
+final class TdNotificationExceptionAccounts
+    implements NotificationExceptionAccounts {
+  TdNotificationExceptionAccounts({TdClient? client})
+    : _client = client ?? TdClient.shared;
+
+  final TdClient _client;
+
+  @override
+  NotificationExceptionOwner? pinActiveOwner() {
+    if (_client.isShuttingDown) return null;
+    final slot = _client.activeSlot;
+    final clientId = _client.activeClientId;
+    if (clientId == 0) return null;
+    // A session swap can replace the slot's client between those two reads;
+    // pinning that would query an account the sheet was never opened for.
+    if (_client.clientId(slot) != clientId) return null;
+    return TdNotificationExceptionOwner(_client, slot, clientId);
+  }
+}
+
 /// Opens the exception list for [scope] in the app's sheet frame.
+///
+/// The foreground account is pinned here, before the route is pushed, and every
+/// request the sheet makes is bound to that owner.
 Future<void> showNotificationExceptionsSheet({
   required BuildContext context,
   required String scope,
@@ -158,7 +232,10 @@ Future<void> showNotificationExceptionsSheet({
   required Map<String, dynamic> scopeSettings,
   Future<void> Function(int chatId, String title)? onOpenChat,
   Future<void> Function()? onExceptionsChanged,
+  NotificationExceptionAccounts? accounts,
 }) {
+  final owner = (accounts ?? NotificationExceptionAccounts.defaultAccounts)
+      .pinActiveOwner();
   return showAppModalSheet<void>(
     context: context,
     backgroundColor: Colors.transparent,
@@ -169,6 +246,7 @@ Future<void> showNotificationExceptionsSheet({
       scopeSettings: scopeSettings,
       onOpenChat: onOpenChat,
       onExceptionsChanged: onExceptionsChanged,
+      owner: owner,
     ),
   );
 }
@@ -181,6 +259,7 @@ class NotificationExceptionsSheet extends StatefulWidget {
     required this.scopeSettings,
     this.onOpenChat,
     this.onExceptionsChanged,
+    this.owner,
   });
 
   /// A `notificationSettingsScope*` value, or [storiesNotificationScope].
@@ -197,6 +276,11 @@ class NotificationExceptionsSheet extends StatefulWidget {
   /// Runs after a reset so the page can re-read its scope count.
   final Future<void> Function()? onExceptionsChanged;
 
+  /// Pinned by [showNotificationExceptionsSheet] before the route is pushed.
+  /// Null when nothing could be pinned; the sheet then shows its failure state
+  /// and never falls through to the foreground client.
+  final NotificationExceptionOwner? owner;
+
   @override
   State<NotificationExceptionsSheet> createState() =>
       _NotificationExceptionsSheetState();
@@ -204,20 +288,59 @@ class NotificationExceptionsSheet extends StatefulWidget {
 
 class _NotificationExceptionsSheetState
     extends State<NotificationExceptionsSheet> {
-  final TdClient _client = TdClient.shared;
   final Set<int> _resetting = {};
+  NotificationExceptionOwner? _owner;
   List<_NotificationExceptionEntry> _entries = const [];
   int _loadGeneration = 0;
   bool _loading = true;
   bool _failed = false;
+  bool _closedForStaleOwner = false;
 
   @override
   void initState() {
     super.initState();
+    _owner = widget.owner;
+    if (_owner == null) {
+      // Nothing could be pinned: show the failure state rather than letting a
+      // request fall through to the foreground client.
+      _loading = false;
+      _failed = true;
+      return;
+    }
     unawaited(_load());
   }
 
+  /// Ends the sheet when the account it was opened for is gone.
+  ///
+  /// Every await in this state calls this before touching the result: a list,
+  /// detail or reset response from an account the user already left must not
+  /// populate or mutate the replacement account's UI.
+  bool _stopIfOwnerLost() {
+    if (!mounted) return true;
+    final owner = _owner;
+    if (owner != null && owner.isCurrent) return false;
+    _closeForStaleOwner();
+    return true;
+  }
+
+  void _closeForStaleOwner() {
+    if (_closedForStaleOwner) return;
+    _closedForStaleOwner = true;
+    final navigator = Navigator.maybeOf(context);
+    if (navigator != null && navigator.canPop()) {
+      navigator.pop();
+    }
+  }
+
+  bool _abandonIfStale(int generation) {
+    if (!mounted || generation != _loadGeneration) return true;
+    return _stopIfOwnerLost();
+  }
+
   void _retry() {
+    // Without an owner there is nothing safe to retry: re-pinning here could
+    // bind the sheet to an account it was not opened for.
+    if (_owner == null) return;
     setState(() {
       _loading = true;
       _failed = false;
@@ -226,21 +349,28 @@ class _NotificationExceptionsSheetState
   }
 
   Future<void> _load() async {
+    final owner = _owner;
+    if (owner == null || _stopIfOwnerLost()) return;
     final generation = ++_loadGeneration;
     try {
-      final chatIds = await _queryChatIds();
+      final chatIds = await _queryChatIds(owner);
+      if (_abandonIfStale(generation)) return;
       final entries = <_NotificationExceptionEntry>[];
       for (final chatId in chatIds) {
-        entries.add(await _resolve(chatId));
+        final entry = await _resolve(owner, chatId);
+        if (entry == null || !mounted || generation != _loadGeneration) {
+          return;
+        }
+        entries.add(entry);
       }
-      if (!mounted || generation != _loadGeneration) return;
+      if (_abandonIfStale(generation)) return;
       setState(() {
         _entries = entries;
         _loading = false;
         _failed = false;
       });
     } catch (_) {
-      if (!mounted || generation != _loadGeneration) return;
+      if (_abandonIfStale(generation)) return;
       setState(() {
         _loading = false;
         _failed = true;
@@ -248,14 +378,14 @@ class _NotificationExceptionsSheetState
     }
   }
 
-  Future<List<int>> _queryChatIds() async {
+  Future<List<int>> _queryChatIds(NotificationExceptionOwner owner) async {
     if (widget.scope == storiesNotificationScope) {
-      final result = await _client.query({
+      final result = await owner.query({
         '@type': 'getStoryNotificationSettingsExceptions',
       });
       return result.int64Array('chat_ids') ?? const [];
     }
-    final result = await _client.query({
+    final result = await owner.query({
       '@type': 'getChatNotificationSettingsExceptions',
       'scope': {'@type': widget.scope},
       'compare_sound': true,
@@ -263,16 +393,22 @@ class _NotificationExceptionsSheetState
     return result.int64Array('chat_ids') ?? const [];
   }
 
-  Future<_NotificationExceptionEntry> _resolve(int chatId) async {
+  /// Resolves one row, or null when the pinned owner was lost mid-flight.
+  Future<_NotificationExceptionEntry?> _resolve(
+    NotificationExceptionOwner owner,
+    int chatId,
+  ) async {
     String? title;
     TdFileRef? photo;
     Map<String, dynamic>? settings;
     try {
-      final chat = await _client.query({'@type': 'getChat', 'chat_id': chatId});
+      final chat = await owner.query({'@type': 'getChat', 'chat_id': chatId});
+      if (_stopIfOwnerLost()) return null;
       title = chat.str('title');
       photo = TDParse.smallPhoto(chat.obj('photo'));
       settings = chat.obj('notification_settings');
     } catch (_) {
+      if (_stopIfOwnerLost()) return null;
       // The chat stays listed so it can still be reset; only its title and
       // deviation fall back.
     }
@@ -296,6 +432,7 @@ class _NotificationExceptionsSheetState
   }
 
   void _openChat(_NotificationExceptionEntry entry) {
+    if (_stopIfOwnerLost()) return;
     Navigator.of(context).pop();
     final onOpenChat = widget.onOpenChat;
     if (onOpenChat != null) {
@@ -305,15 +442,17 @@ class _NotificationExceptionsSheetState
 
   Future<void> _reset(_NotificationExceptionEntry entry) async {
     if (_resetting.contains(entry.chatId)) return;
+    final owner = _owner;
+    if (owner == null || _stopIfOwnerLost()) return;
     setState(() => _resetting.add(entry.chatId));
     try {
-      await _client.query({
+      await owner.query({
         '@type': 'setChatNotificationSettings',
         'chat_id': entry.chatId,
         'notification_settings': resetChatNotificationSettingsPayload(),
       });
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || _stopIfOwnerLost()) return;
       setState(() => _resetting.remove(entry.chatId));
       showToast(
         context,
@@ -321,14 +460,17 @@ class _NotificationExceptionsSheetState
       );
       return;
     }
-    if (!mounted) return;
+    if (_stopIfOwnerLost()) return;
     setState(() {
       _resetting.remove(entry.chatId);
       _entries = _entries
           .where((existing) => existing.chatId != entry.chatId)
           .toList(growable: false);
     });
-    await widget.onExceptionsChanged?.call();
+    final onExceptionsChanged = widget.onExceptionsChanged;
+    if (onExceptionsChanged != null && !_stopIfOwnerLost()) {
+      await onExceptionsChanged();
+    }
   }
 
   @override
@@ -399,7 +541,7 @@ class _NotificationExceptionsSheetState
         child: Center(child: AppActivityIndicator(size: 24)),
       );
     }
-    if (_failed) return _Failure(onRetry: _retry);
+    if (_failed) return _Failure(onRetry: _owner == null ? null : _retry);
     if (_entries.isEmpty) {
       return Padding(
         key: const ValueKey('notification-exceptions-empty'),
@@ -432,9 +574,10 @@ class _NotificationExceptionsSheetState
 }
 
 class _Failure extends StatelessWidget {
-  const _Failure({required this.onRetry});
+  const _Failure({this.onRetry});
 
-  final VoidCallback onRetry;
+  /// Null when nothing could be pinned, so there is no safe retry.
+  final VoidCallback? onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -456,13 +599,14 @@ class _Failure extends StatelessWidget {
             style: AppTextStyle.footnote(context.colors.textTertiary),
           ),
         ),
-        SettingsRow(
-          key: const ValueKey('notification-exceptions-retry'),
-          title: AppStringKeys.notificationExceptionRetry.l10n(context),
-          leading: const SettingsLeadingIcon(icon: HeroAppIcons.rotateLeft),
-          showChevron: false,
-          onTap: onRetry,
-        ),
+        if (onRetry != null)
+          SettingsRow(
+            key: const ValueKey('notification-exceptions-retry'),
+            title: AppStringKeys.notificationExceptionRetry.l10n(context),
+            leading: const SettingsLeadingIcon(icon: HeroAppIcons.rotateLeft),
+            showChevron: false,
+            onTap: onRetry,
+          ),
       ],
     );
   }
