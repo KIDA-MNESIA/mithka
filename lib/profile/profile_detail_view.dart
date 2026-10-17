@@ -646,7 +646,8 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
   List<(String, String)> get _infoRows {
     final registration = _registrationText;
     return [
-      if (_bio.isNotEmpty) (AppStrings.t(AppStringKeys.profileDetailBio), _bio),
+      // The bio lives in the header (and only there), so it never needs a
+      // second, truncated-looking home among the detail rows.
       if (_birthday.isNotEmpty)
         (AppStrings.t(AppStringKeys.profileDetailBirthday), _birthday),
       if (registration.isNotEmpty)
@@ -1013,10 +1014,9 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
               children: [
                 Expanded(
                   child: TelegramRichText(
+                    key: const ValueKey('profileBio'),
                     text: _bio,
                     entities: _bioEntities,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(fontSize: 15, color: c.textPrimary),
                     onMentionTap: (userId, name) {
                       Navigator.of(context).push(
@@ -1028,8 +1028,21 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
                     },
                   ),
                 ),
-                const SizedBox(width: 8),
-                AppIcon(HeroAppIcons.pen, size: 17, color: c.textTertiary),
+                // Only your own bio is editable, so the pen must not promise
+                // an edit on someone else's profile.
+                if (_isMe) ...[
+                  const SizedBox(width: 8),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _openEditProfile,
+                    child: AppIcon(
+                      HeroAppIcons.pen,
+                      key: const ValueKey('profileBioEditIcon'),
+                      size: 17,
+                      color: c.textTertiary,
+                    ),
+                  ),
+                ],
               ],
             ),
           ],

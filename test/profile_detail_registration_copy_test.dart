@@ -207,7 +207,7 @@ void main() {
     // The card still renders for the bio; only the row it cannot support is
     // gone. Bounding the account from below would claim more than the fitted
     // table proves, so the page claims nothing instead.
-    expect(find.text('just a cat').last, findsOneWidget);
+    expect(find.text('just a cat', findRichText: true), findsOneWidget);
     expect(find.text('Registration'), findsNothing);
     expect(find.textContaining('After'), findsNothing);
   });
@@ -221,7 +221,7 @@ void main() {
     // The same ID on a human account does date, so what rules this one out is
     // the profile being a bot.
     expect(estimateRegistrationDate(userId), isNotNull);
-    expect(find.text('just a cat').last, findsOneWidget);
+    expect(find.text('just a cat', findRichText: true), findsOneWidget);
     expect(find.text('Registration'), findsNothing);
   });
 
@@ -284,7 +284,9 @@ void main() {
     await drainToast(tester);
   });
 
-  testWidgets('copies an info row, registration date included', (tester) async {
+  testWidgets('copies an info row, and the bio has no duplicate to copy', (
+    tester,
+  ) async {
     serveProfile(
       accountInfo: {'registration_year': 2021, 'registration_month': 3},
       bio: 'just a cat',
@@ -293,12 +295,11 @@ void main() {
 
     await tester.longPress(find.text('March 2021'));
     await tester.pumpAndSettle();
-    // The bio shows once in the header and once in the info card; the card is
-    // the copyable one and comes last.
-    await tester.longPress(find.text('just a cat').last);
-    await tester.pumpAndSettle();
 
-    expect(clipboard, ['March 2021', 'just a cat']);
+    expect(clipboard, ['March 2021']);
+    // The bio lives in the header alone, so it renders once and no info-card
+    // copy of it is left to long-press.
+    expect(find.text('just a cat', findRichText: true), findsOneWidget);
     await drainToast(tester);
   });
 
