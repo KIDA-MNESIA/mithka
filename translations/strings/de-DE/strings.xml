@@ -1071,6 +1071,9 @@
     <string name="chatSearchMessageResultLabel">[Nachricht]</string>
     <string name="chatSearchNewerMatch">Neuerer Treffer</string>
     <string name="chatSearchNoMessagesFound">Keine passenden Nachrichten gefunden</string>
+    <string name="chatSearchJumpToDate">Zu Datum springen</string>
+    <string name="chatSearchNoMessagesAtDate">Keine Nachrichten an diesem Datum</string>
+    <string name="chatSearchDateJumpFailed">Nachrichten für diesen Tag konnten nicht geladen werden</string>
     <string name="chatSearchOlderMatch">Älterer Treffer</string>
     <plurals name="chatSearchResultCount">
         <item quantity="one">{count} Ergebnis</item>

@@ -304,6 +304,7 @@ class HeroAppIcons {
   static const circleUser = AppIconData(HeroiconsOutline.userCircle);
   static const circleXmark = AppIconData(HeroiconsOutline.xCircle);
   static const clipboard = AppIconData(HeroiconsOutline.clipboard);
+  static const calendarDays = AppIconData(HeroiconsOutline.calendarDays);
   static const clock = AppIconData(HeroiconsOutline.clock);
   static const code = AppIconData(HeroiconsOutline.codeBracket);
   static const commandLine = AppIconData(HeroiconsOutline.commandLine);

@@ -1069,6 +1069,9 @@
     <string name="chatSearchMessageResultLabel">[消息]</string>
     <string name="chatSearchNewerMatch">较新的结果</string>
     <string name="chatSearchNoMessagesFound">没有找到相关消息</string>
+    <string name="chatSearchJumpToDate">跳转到日期</string>
+    <string name="chatSearchNoMessagesAtDate">该日期没有消息</string>
+    <string name="chatSearchDateJumpFailed">无法加载该日期的消息</string>
     <string name="chatSearchOlderMatch">较旧的结果</string>
     <plurals name="chatSearchResultCount">
         <item quantity="other">{count} 条结果</item>

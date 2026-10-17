@@ -9091,7 +9091,17 @@ class _ChatViewState extends State<ChatView> {
     showDivider: widget.showHeaderDivider,
     showSteppers: showSteppers,
     onClose: _closeSearch,
+    onJumpToMessage: _jumpToDateMessage,
   );
+
+  /// Lands the transcript on the message a calendar date resolved to.
+  ///
+  /// Unlike a search hit nothing is marked — the jump reads as navigation, not
+  /// as a match — and the search session stays open for the next step.
+  Future<void> _jumpToDateMessage(ChatMessage message) async {
+    _search.focusNode.unfocus();
+    await _scrollToMessage(message.id, alignment: 0.38, forceAlignment: true);
+  }
 
   Widget _searchResultsPane() => ChatSearchResultsPane(
     controller: _search,

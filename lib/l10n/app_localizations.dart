@@ -1061,6 +1061,9 @@ abstract final class AppStringKeys {
   static const chatSearchMessageResultLabel = 'chatSearchMessageResultLabel';
   static const chatSearchNewerMatch = 'chatSearchNewerMatch';
   static const chatSearchNoMessagesFound = 'chatSearchNoMessagesFound';
+  static const chatSearchNoMessagesAtDate = 'chatSearchNoMessagesAtDate';
+  static const chatSearchDateJumpFailed = 'chatSearchDateJumpFailed';
+  static const chatSearchJumpToDate = 'chatSearchJumpToDate';
   static const chatSearchOlderMatch = 'chatSearchOlderMatch';
   static const chatSearchResultCount = 'chatSearchResultCount';
   static const chatSearchSearching = 'chatSearchSearching';
