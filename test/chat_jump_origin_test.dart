@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/chat/chat_view.dart'
-    show ChatView, clearChatMemoryCaches;
+    show ChatView, ChatRevealLatestController, clearChatMemoryCaches;
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/translation_controller.dart';
 import 'package:mithka/tdlib/td_client.dart';
@@ -200,6 +200,8 @@ void main() {
     translation.dispose();
   });
 
+  final revealLatest = ChatRevealLatestController();
+
   Widget app() => MultiProvider(
     providers: [
       ChangeNotifierProvider<ThemeController>.value(value: theme),
@@ -213,7 +215,11 @@ void main() {
       locale: const Locale('en'),
       localizationsDelegates: const [AppLocalizations.delegate],
       supportedLocales: AppLocalizations.supportedLocales,
-      home: const ChatView(chatId: _chatId, title: 'Jump origin group'),
+      home: ChatView(
+        chatId: _chatId,
+        title: 'Jump origin group',
+        revealLatestController: revealLatest,
+      ),
     ),
   );
 
@@ -429,6 +435,34 @@ void main() {
       contains(_mid(_messageCount)),
       reason: 'the consumed origin must not survive a second tap',
     );
+    expect(jumpArrow, findsNothing);
+  });
+
+  testWidgets('reselecting the open chat discards a saved jump origin', (
+    tester,
+  ) async {
+    await pumpChat(tester);
+    await dragUpFromBottom(tester, 320);
+    await tester.tap(replyQuoteOf(_replyId));
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_parentId)));
+    revealLatest.revealLatest();
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_messageCount)));
+    expect(jumpArrow, findsNothing);
+  });
+
+  testWidgets('reselecting the open chat cancels a pending origin return', (
+    tester,
+  ) async {
+    await pumpChat(tester);
+    await dragUpFromBottom(tester, 320);
+    await tester.tap(replyQuoteOf(_replyId));
+    await pumpFrames(tester);
+    await tester.tap(jumpArrow);
+    revealLatest.revealLatest();
+    await pumpFrames(tester);
+    expect(visibleRows(tester), contains(_mid(_messageCount)));
     expect(jumpArrow, findsNothing);
   });
 
