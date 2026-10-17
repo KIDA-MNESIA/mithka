@@ -8,6 +8,7 @@ import 'package:mithka/history/message_history_view.dart';
 import 'package:mithka/settings/ghost_mode_controller.dart';
 import 'package:mithka/settings/ghost_mode_settings_view.dart';
 import 'package:mithka/tdlib/td_client.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -37,6 +38,38 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(sent, isEmpty);
   });
+
+  test(
+    'direct preference actions leave saved opt-in state untouched',
+    () async {
+      const saved = {
+        'ghost_mode.enabled': true,
+        'ghost_mode.blockReadReceipts': true,
+        'ghost_mode.blockStoryReads': true,
+        'ghost_mode.blockTyping': true,
+        'ghost_mode.hideOnline': true,
+        'ghost_mode.chat.42': 1,
+      };
+      SharedPreferences.setMockInitialValues(saved);
+      final prefs = await SharedPreferences.getInstance();
+      final controller = GhostModeController.shared;
+      var notifications = 0;
+      void listener() => notifications++;
+      controller.addListener(listener);
+      addTearDown(() => controller.removeListener(listener));
+      controller.initialize(prefs);
+      await controller.setGlobalEnabled(true);
+      await controller.setBlockReadReceipts(false);
+      await controller.setBlockStoryReads(false);
+      await controller.setBlockTyping(false);
+      await controller.setHideOnline(false);
+      await controller.setChatException(42, GhostChatException.forceAllow);
+      expect({for (final key in prefs.getKeys()) key: prefs.get(key)}, saved);
+      expect(controller.chatExceptions, isEmpty);
+      expect(controller.globalEnabled, isFalse);
+      expect(notifications, 0);
+    },
+  );
 
   testWidgets('direct feature pages are absent without the opt-in', (
     tester,

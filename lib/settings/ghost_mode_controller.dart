@@ -96,6 +96,7 @@ class GhostModeController extends ChangeNotifier {
   /// Loads the persisted state and subscribes to authorization-ready updates.
   /// Safe to call again (the desktop settings reload re-seeds shared stores).
   void initialize(SharedPreferences prefs) {
+    if (!isAvailable) return;
     _prefs = prefs;
     _globalEnabled = prefs.getBool(_globalEnabledKey) ?? false;
     _blockReadReceipts =
@@ -185,7 +186,7 @@ class GhostModeController extends ChangeNotifier {
   bool shouldShareOnline() => globalEnabled && _hideOnline;
 
   Future<void> setGlobalEnabled(bool value) async {
-    if (!isAvailable) value = false;
+    if (!isAvailable) return;
     if (_globalEnabled == value) return;
     _globalEnabled = value;
     await _prefs?.setBool(_globalEnabledKey, value);
@@ -194,6 +195,7 @@ class GhostModeController extends ChangeNotifier {
   }
 
   Future<void> setBlockReadReceipts(bool value) async {
+    if (!isAvailable) return;
     if (_blockReadReceipts == value) return;
     _blockReadReceipts = value;
     await _prefs?.setBool(_blockReadReceiptsKey, value);
@@ -201,6 +203,7 @@ class GhostModeController extends ChangeNotifier {
   }
 
   Future<void> setBlockStoryReads(bool value) async {
+    if (!isAvailable) return;
     if (_blockStoryReads == value) return;
     _blockStoryReads = value;
     await _prefs?.setBool(_blockStoryReadsKey, value);
@@ -208,6 +211,7 @@ class GhostModeController extends ChangeNotifier {
   }
 
   Future<void> setBlockTyping(bool value) async {
+    if (!isAvailable) return;
     if (_blockTyping == value) return;
     _blockTyping = value;
     await _prefs?.setBool(_blockTypingKey, value);
@@ -215,6 +219,7 @@ class GhostModeController extends ChangeNotifier {
   }
 
   Future<void> setHideOnline(bool value) async {
+    if (!isAvailable) return;
     if (_hideOnline == value) return;
     _hideOnline = value;
     await _prefs?.setBool(_hideOnlineKey, value);
@@ -223,6 +228,7 @@ class GhostModeController extends ChangeNotifier {
   }
 
   Future<void> setChatException(int chatId, GhostChatException state) async {
+    if (!isAvailable) return;
     if (state == GhostChatException.defaultState) {
       if (_chatExceptions.remove(chatId) == null) return;
       await _prefs?.remove('$_chatExceptionKeyPrefix$chatId');
