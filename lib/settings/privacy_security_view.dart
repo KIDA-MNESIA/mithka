@@ -17,12 +17,14 @@ import '../auth/telegram_passkey_service.dart';
 import '../components/app_icons.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../theme/app_theme.dart';
 import '../theme/theme_controller.dart';
 import 'account_security_views.dart';
 import 'auto_delete_view.dart';
+import 'ghost_mode_settings_view.dart';
 import 'passkeys_view.dart';
 import 'privacy_detail_views.dart';
 import 'privacy_rule_options.dart';
@@ -308,6 +310,15 @@ class _PrivacySecurityViewState extends State<PrivacySecurityView> {
               '',
               () => _open(const AutoDeleteView()),
             ),
+            // Compile-time gated: the row (and the whole ghost-mode surface
+            // behind it) does not exist in builds without the ToS define.
+            if (allowTelegramTosViolations)
+              _Row(
+                HeroAppIcons.eyeSlash,
+                AppStrings.t(AppStringKeys.ghostModeTitle),
+                '',
+                () => _open(const GhostModeSettingsView()),
+              ),
           ]),
           _group(AppStrings.t(AppStringKeys.privacyDangerZone), [
             _Row(

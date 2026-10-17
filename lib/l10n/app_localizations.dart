@@ -492,6 +492,26 @@ abstract final class AppStringKeys {
   static const gesturesSwitchFoldersModeDescription =
       'gesturesSwitchFoldersModeDescription';
   static const gesturesThreeFingerSwipe = 'gesturesThreeFingerSwipe';
+  static const ghostModeTitle = 'ghostModeTitle';
+  static const ghostModeDescription = 'ghostModeDescription';
+  static const ghostModeEnable = 'ghostModeEnable';
+  static const ghostModeReadReceipts = 'ghostModeReadReceipts';
+  static const ghostModeReadReceiptsDescription =
+      'ghostModeReadReceiptsDescription';
+  static const ghostModeStoryReads = 'ghostModeStoryReads';
+  static const ghostModeStoryReadsDescription =
+      'ghostModeStoryReadsDescription';
+  static const ghostModeTyping = 'ghostModeTyping';
+  static const ghostModeTypingDescription = 'ghostModeTypingDescription';
+  static const ghostModeOnline = 'ghostModeOnline';
+  static const ghostModeOnlineDescription = 'ghostModeOnlineDescription';
+  static const ghostModeChatExceptions = 'ghostModeChatExceptions';
+  static const ghostModeAddChatException = 'ghostModeAddChatException';
+  static const ghostModeNoChatExceptions = 'ghostModeNoChatExceptions';
+  static const ghostModeExceptionDefault = 'ghostModeExceptionDefault';
+  static const ghostModeExceptionForceBlock = 'ghostModeExceptionForceBlock';
+  static const ghostModeExceptionForceAllow = 'ghostModeExceptionForceAllow';
+  static const ghostModeExceptionRemove = 'ghostModeExceptionRemove';
   static const appearanceGroupAssistantPosition =
       'appearanceGroupAssistantPosition';
   static const appearanceHideBlockedUserMessages =

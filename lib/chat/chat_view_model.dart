@@ -16,8 +16,10 @@ import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/notifications/scope_notification_settings.dart';
 
 import '../channels/topic_list_actions.dart';
+import '../config/build_flags.dart';
 import '../notifications/notification_settings_payload.dart';
 import '../settings/blocked_user_service.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../tdlib/forum_topic_index.dart';
@@ -1506,6 +1508,10 @@ class ChatViewModel extends ChangeNotifier {
 
   /// Tell TDLib the user is typing (drives the peer's typing indicator).
   void sendTyping() {
+    if (allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockTyping(chatId).isBlock) {
+      return;
+    }
     _client.send({
       '@type': 'sendChatAction',
       'chat_id': chatId,
@@ -5387,12 +5393,17 @@ class ChatViewModel extends ChangeNotifier {
         )
         .toList(growable: false);
     if (viewed.isEmpty) return;
-    _client.send({
-      '@type': 'viewMessages',
-      'chat_id': chatId,
-      'message_ids': viewed.map((message) => message.id).toSet().toList(),
-      'force_read': true,
-    });
+    // Ghost mode skips only the server report; the local mention/reaction
+    // counters below still clear so the UI reads the chat as read.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      _client.send({
+        '@type': 'viewMessages',
+        'chat_id': chatId,
+        'message_ids': viewed.map((message) => message.id).toSet().toList(),
+        'force_read': true,
+      });
+    }
     _consumeViewedMentions(
       viewed
           .where((message) => message.containsUnreadMention)
@@ -5409,29 +5420,39 @@ class ChatViewModel extends ChangeNotifier {
   /// scrolled it into place. Awaiting TDLib prevents a quick second tap from
   /// resolving the same mention again.
   Future<void> markUnreadMentionRead(int messageId) async {
-    try {
-      await _client.query({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': [messageId],
-        'force_read': true,
-      });
-    } catch (_) {
-      return;
+    // Ghost mode skips only the server report; the blue-@ badge below still
+    // clears so the UI reads the mention as read.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      try {
+        await _client.query({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': [messageId],
+          'force_read': true,
+        });
+      } catch (_) {
+        return;
+      }
     }
     _consumeViewedMentions([messageId], force: true);
   }
 
   Future<void> markUnreadReactionRead(int messageId) async {
-    try {
-      await _client.query({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': [messageId],
-        'force_read': true,
-      });
-    } catch (_) {
-      return;
+    // Ghost mode skips only the server report; the local reaction counter
+    // below still clears so the UI reads the reaction as seen.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      try {
+        await _client.query({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': [messageId],
+          'force_read': true,
+        });
+      } catch (_) {
+        return;
+      }
     }
     _consumeViewedReactions([messageId], force: true);
   }
@@ -5759,12 +5780,19 @@ class ChatViewModel extends ChangeNotifier {
       ++_chatReadStateRevision;
       notifyListeners();
 
+      final ghostRead =
+          allowTelegramTosViolations &&
+          GhostModeController.shared.shouldBlockRead(chatId).isBlock;
       if (shouldClearMarker) {
-        _client.send({
-          '@type': 'toggleChatIsMarkedAsUnread',
-          'chat_id': chatId,
-          'is_marked_as_unread': false,
-        });
+        // Ghost mode keeps the local unread bookkeeping (emitLocalUpdate)
+        // and only skips the server report.
+        if (!ghostRead) {
+          _client.send({
+            '@type': 'toggleChatIsMarkedAsUnread',
+            'chat_id': chatId,
+            'is_marked_as_unread': false,
+          });
+        }
         _client.emitLocalUpdate({
           '@type': 'updateChatIsMarkedAsUnread',
           'chat_id': chatId,
@@ -5773,15 +5801,17 @@ class ChatViewModel extends ChangeNotifier {
       }
       if (shouldForceRead) {
         _lastForcedReadMessageId = messageId;
-        _client.send({
-          '@type': 'viewMessages',
-          'chat_id': chatId,
-          'message_ids': [messageId],
-          'source': isForumTopicTranscript
-              ? {'@type': 'messageSourceForumTopicHistory'}
-              : null,
-          'force_read': true,
-        });
+        if (!ghostRead) {
+          _client.send({
+            '@type': 'viewMessages',
+            'chat_id': chatId,
+            'message_ids': [messageId],
+            'source': isForumTopicTranscript
+                ? {'@type': 'messageSourceForumTopicHistory'}
+                : null,
+            'force_read': true,
+          });
+        }
         // A topic's read position is not the chat's; TDLib reports the
         // resulting chat-wide counts through its own updates.
         if (!isForumTopicTranscript) {
@@ -7127,12 +7157,17 @@ class ChatViewModel extends ChangeNotifier {
     for (var i = 0; i < ids.length; i += 100) {
       final end = i + 100 > ids.length ? ids.length : i + 100;
       final chunk = ids.sublist(i, end);
-      _client.send({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': chunk,
-        'force_read': true,
-      });
+      // Blocked-country messages must clear locally too; only the server
+      // report is skipped in ghost mode.
+      if (!(allowTelegramTosViolations &&
+          GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+        _client.send({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': chunk,
+          'force_read': true,
+        });
+      }
     }
   }
 
@@ -7644,6 +7679,14 @@ class ChatViewModel extends ChangeNotifier {
   @visibleForTesting
   void applyLiveUpdateForTesting(Map<String, dynamic> update) {
     _handle(update);
+  }
+
+  /// Marks the read-state gates satisfied so read-marking paths can be
+  /// exercised without replaying the whole history bootstrap.
+  @visibleForTesting
+  void markChatReadStateReadyForTesting() {
+    _chatReadStateLoaded = true;
+    _historyReachesLatest = true;
   }
 
   @visibleForTesting

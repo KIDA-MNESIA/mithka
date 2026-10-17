@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../config/build_flags.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -860,6 +862,11 @@ class ChannelDirectMessageTopicController extends ChangeNotifier {
 
   Future<void> _markRead() async {
     if (_messages.isEmpty) return;
+    // Ghost mode keeps the local history view but withholds the read report.
+    if (allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock) {
+      return;
+    }
     final latest = _messages.last.id;
     await _client.query({
       '@type': 'viewMessages',
