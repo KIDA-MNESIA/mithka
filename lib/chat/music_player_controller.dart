@@ -1235,7 +1235,7 @@ class _MusicMiniPlayerDockState extends State<MusicMiniPlayerDock> {
       animation: MusicPlayerController.shared,
       builder: (context, _) {
         final player = MusicPlayerController.shared;
-        if (!player.isVisible || player.hasEmbeddedPlayerHost) {
+        if (!_registered || !player.isVisible || player.hasEmbeddedPlayerHost) {
           return const SizedBox.shrink();
         }
         const card = Padding(

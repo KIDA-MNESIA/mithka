@@ -320,6 +320,23 @@ void main() {
     await tester.pump();
     expect(player.hasDockedMiniPlayerHost, isTrue);
     expect(find.byKey(musicCollapsedOverlayKey), findsNothing);
+    unawaited(
+      navigator.currentState!.push<void>(
+        PageRouteBuilder<void>(
+          opaque: false,
+          pageBuilder: (_, _, _) => const Center(child: Text('Transient page')),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    await tester.pump();
+    expect(player.hasDockedMiniPlayerHost, isFalse);
+    expect(find.byKey(musicMiniPlayerCardKey), findsNothing);
+    expect(find.byKey(musicCollapsedOverlayKey), findsOneWidget);
+    navigator.currentState!.pop();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
