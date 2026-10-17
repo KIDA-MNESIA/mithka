@@ -47,6 +47,7 @@ class GhostModeSettingsView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (!GhostModeController.isAvailable) return const SizedBox.shrink();
     final controller = GhostModeController.shared;
     return ListenableBuilder(
       listenable: controller,

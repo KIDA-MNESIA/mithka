@@ -392,6 +392,7 @@ class GhostModeController extends ChangeNotifier {
   /// Pushes an explicit `online` value to one client. Public for tests.
   @visibleForTesting
   void applyOnlineStatusToClient(bool online, int clientId, TdClient client) {
+    if (!isAvailable) return;
     client.sendTo({
       '@type': 'setOption',
       'name': 'online',
