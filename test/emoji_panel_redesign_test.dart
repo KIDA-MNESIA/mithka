@@ -28,7 +28,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 Future<void> _pumpPane(
   WidgetTester tester, {
   List<String> inserted = const [],
+  double width = 360,
+  double height = 320,
 }) async {
+  // Give the pane a real composer width instead of the 800dp default test
+  // surface, so the strip/scroll assertions exercise a phone panel.
+  await tester.binding.setSurfaceSize(Size(width, height + 120));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
   await tester.pumpWidget(
     MaterialApp(
       locale: const Locale('en'),
@@ -41,17 +47,36 @@ Future<void> _pumpPane(
       supportedLocales: AppLocalizations.supportedLocales,
       theme: ThemeData(extensions: [AppColors.light]),
       home: Scaffold(
-        body: SizedBox(
-          height: 320,
-          child: StandardEmojiPane(
-            insertText: inserted.add,
-            insertCustomEmoji: (_, _) {},
+        body: Center(
+          child: SizedBox(
+            width: width,
+            height: height,
+            child: StandardEmojiPane(
+              insertText: inserted.add,
+              insertCustomEmoji: (_, _) {},
+            ),
           ),
         ),
       ),
     ),
   );
   await tester.pumpAndSettle();
+}
+
+/// Width of the widest row of emoji cells currently laid out. Every full row
+/// has one cell per column, so this is the effective column count on screen.
+int _widestCellRow(WidgetTester tester) {
+  final perRow = <int, int>{};
+  for (final element in find.byType(EmojiPanelCell).evaluate()) {
+    final box = element.renderObject! as RenderBox;
+    final top = box.localToGlobal(Offset.zero).dy.round();
+    perRow[top] = (perRow[top] ?? 0) + 1;
+  }
+  var widest = 0;
+  for (final count in perRow.values) {
+    if (count > widest) widest = count;
+  }
+  return widest;
 }
 
 /// The strip section whose button is marked selected, or -1 if none is.
@@ -300,20 +325,76 @@ void main() {
   });
 
   group('emojiPanelColumnCount', () {
-    test(
-      'phones stay at eight columns, wide surfaces add columns not stretch',
-      () {
-        expect(emojiPanelColumnCount(360), 8); // 360 / 44 = 8.18 → 8
-        expect(emojiPanelColumnCount(390), 8);
-        expect(emojiPanelColumnCount(300), 6); // clamps to the minimum
-        expect(emojiPanelColumnCount(0), emojiPanelMinColumns);
-        expect(emojiPanelColumnCount(-5), emojiPanelMinColumns);
-        expect(
-          emojiPanelColumnCount(1200),
-          emojiPanelMaxColumns,
-        ); // clamps to the maximum
-      },
-    );
+    test('phones stay at eight columns', () {
+      expect(emojiPanelColumnCount(360), 8); // 360 / 44 = 8.18 → 8
+      expect(emojiPanelColumnCount(390), 8);
+    });
+
+    test('narrow panels keep the six-column floor', () {
+      expect(emojiPanelColumnCount(300), emojiPanelMinColumns);
+      expect(emojiPanelColumnCount(0), emojiPanelMinColumns);
+      expect(emojiPanelColumnCount(-5), emojiPanelMinColumns);
+      expect(emojiPanelColumnCount(double.infinity), emojiPanelMinColumns);
+    });
+
+    test('wide surfaces add columns and keep cells near the target extent', () {
+      // No ceiling: 1024 / 44 = 23.27, so an iPad landscape panel grows to 23
+      // columns rather than stopping at 12 and stretching each cell to 84dp.
+      final columns = emojiPanelColumnCount(1024);
+      expect(columns, greaterThan(12));
+      expect(columns, 23);
+      expect(1024 / columns, closeTo(emojiPanelCellExtent, 1));
+    });
+  });
+
+  group('StandardEmojiPane grid extent', () {
+    testWidgets('cells stay 44dp tall and tablets add columns', (tester) async {
+      EmojiRecentsStore.shared.record('😀');
+
+      await _pumpPane(tester);
+      final phoneCell = tester.getSize(
+        find.byKey(const ValueKey('emojiRecent-😀')),
+      );
+      expect(phoneCell.height, emojiPanelCellExtent);
+      // The recents row holds one cell; the catalog rows below it are full.
+      final phonePerRow = _widestCellRow(tester);
+      expect(phonePerRow, 8);
+      expect(phonePerRow, emojiPanelColumnCount(360));
+
+      // iPad landscape composer: same height, many more columns.
+      await _pumpPane(tester, width: 1024, height: 376);
+      final tabletCell = tester.getSize(
+        find.byKey(const ValueKey('emojiRecent-😀')),
+      );
+      expect(tabletCell.height, emojiPanelCellExtent);
+      expect(tabletCell.width, lessThanOrEqualTo(emojiPanelCellExtent));
+      final tabletPerRow = _widestCellRow(tester);
+      expect(tabletPerRow, emojiPanelColumnCount(1024));
+      expect(tabletPerRow, greaterThan(phonePerRow));
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('a tablet-width strip tap lands on the exact section header', (
+      tester,
+    ) async {
+      // 1024dp / 44dp = 23 columns; the strip's analytic offsets must count
+      // 44dp rows, not the 43.65dp cell width, or a tap drifts a few dp per row.
+      await _pumpPane(tester, width: 1024, height: 376);
+      const section = 3;
+      await tester.tap(
+        find.byKey(const ValueKey('emojiCategoryStrip-$section')),
+      );
+      await tester.pumpAndSettle();
+
+      final headerTop = tester
+          .getTopLeft(find.byKey(const ValueKey('emojiSectionHeader-$section')))
+          .dy;
+      final viewportTop = tester
+          .getTopLeft(find.byKey(const ValueKey('emojiStandardGrid')))
+          .dy;
+      expect((headerTop - viewportTop).abs(), lessThan(1));
+      expect(tester.takeException(), isNull);
+    });
   });
 
   group('StandardEmojiPane', () {
