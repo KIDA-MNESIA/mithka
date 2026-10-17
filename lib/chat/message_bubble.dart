@@ -1050,6 +1050,7 @@ class _MessageBubbleState extends State<MessageBubble>
                         ? message.senderPhoto
                         : widget.peerPhoto,
                     size: 38,
+                    isDeleted: widget.isGroup && message.senderIsDeleted,
                   ),
                   withLongPress: true,
                 ),
