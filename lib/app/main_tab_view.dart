@@ -798,6 +798,10 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
   }
 
   Widget _musicAwareContent(Widget child, {bool reserveForShellPlayer = true}) {
+    // The split shell docks the player in its list column instead of a
+    // window-wide strip, so the pane keeps its own bottom inset and needs no
+    // media query juggling.
+    if (!reserveForShellPlayer) return child;
     return AnimatedBuilder(
       animation: MusicPlayerController.shared,
       child: child,
@@ -1244,6 +1248,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                       Row(
                         children: [
                           SizedBox(
+                            key: const ValueKey('tablet-list-pane'),
                             width: compact ? 0 : sidebarWidth,
                             child: Offstage(
                               offstage: compact,
@@ -1260,19 +1265,29 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                       builder: (tab) =>
                                           _tabletSidebarRoot(tab.index),
                                     ),
-                                    footer: AnimatedBuilder(
-                                      animation: _unread,
-                                      builder: (context, _) => _MainBottomBar(
-                                        chatListController: _chatListController,
-                                        selection: selection,
-                                        onSelect: _select,
-                                        items: tabs,
-                                        onClearUnread:
-                                            _chatListController.markAllRead,
-                                        unread: _unread.countFor(
-                                          theme.unreadBadgeMode,
+                                    footer: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (!compact)
+                                          const MusicMiniPlayerDock(),
+                                        AnimatedBuilder(
+                                          animation: _unread,
+                                          builder: (context, _) =>
+                                              _MainBottomBar(
+                                                chatListController:
+                                                    _chatListController,
+                                                selection: selection,
+                                                onSelect: _select,
+                                                items: tabs,
+                                                onClearUnread:
+                                                    _chatListController
+                                                        .markAllRead,
+                                                unread: _unread.countFor(
+                                                  theme.unreadBadgeMode,
+                                                ),
+                                              ),
                                         ),
-                                      ),
+                                      ],
                                     ),
                                   ),
                                   overlayVisible: !compact,
@@ -1300,6 +1315,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                       desktopInfoPaneWidth,
                                 ),
                               ),
+                              reserveForShellPlayer: compact,
                             ),
                           ),
                         ],
@@ -1318,7 +1334,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                   ),
                 ),
               ),
-              _fixedMusicPlayer(safeBottom: true),
+              if (compact) _fixedMusicPlayer(safeBottom: true),
             ],
           ),
         );
