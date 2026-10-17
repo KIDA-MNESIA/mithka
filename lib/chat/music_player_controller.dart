@@ -85,6 +85,22 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
   /// Telegram and the system players do.
   static const previousRestartThreshold = Duration(seconds: 3);
   static const _modePrefsKey = 'mithka.musicPlaybackMode.v1';
+
+  /// How many times one load request tries a track before its failure is
+  /// reported. A first failure is usually recoverable: TDLib deletes cached
+  /// files on its own, so the path the player remembered can name a file that
+  /// no longer exists, and a native start can lose its session. The retry
+  /// forgets the remembered path (the file is downloaded again) and loads on a
+  /// fresh native instance; only a track that fails twice is reported.
+  static const maxPlaybackLoadAttempts = 2;
+
+  /// Failures reported to the user so far. Backs the "could not play this
+  /// track" toast, which needs a shell overlay a test does not have.
+  @visibleForTesting
+  int playbackFailureReports = 0;
+
+  int? _failedFileId;
+  int _failedLoadAttempts = 0;
   bool hidden = true;
   bool collapsed = false;
 
@@ -356,6 +372,7 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
     );
     current = _playlistCopyOf(message);
     queue = nextQueue.isEmpty ? [current!] : nextQueue;
+    _beginLoad(file.id);
     // A track picked by hand starts a new shuffle pass from that track.
     if (!keepShuffleOrder) _shuffleOrder = const [];
     if (reveal) {
@@ -430,6 +447,7 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
   void toggleCurrent() {
     final file = current?.music?.file;
     if (file == null || isLoading) return;
+    _beginLoad(file.id);
     hidden = false;
     notifyListeners();
     unawaited(_player.toggleAudio(file));
@@ -440,6 +458,7 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
   void resume() {
     final file = current?.music?.file;
     if (file == null || isPlaying || isLoading) return;
+    _beginLoad(file.id);
     // A track that finished (or whose native start failed) stays retained
     // but stopped, not paused: the native resume is a no-op there, so start
     // the current file again instead of ignoring the Play command.
@@ -581,22 +600,62 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
     _playAdjacent(1, manual: false);
   }
 
-  /// A track that failed to start (download stall, native start timeout,
-  /// unsupported container). Stay on the track so the user can retry, but
-  /// stop auto-advance: skipping past the failure silently would look like
-  /// playback never started.
+  /// Starts a fresh attempt budget for [fileId].
+  ///
+  /// A deliberate load — a tap, a skip, a system play command — may try the
+  /// track [maxPlaybackLoadAttempts] times. The automatic retry a failure
+  /// triggers deliberately does not call this, so a track that fails again is
+  /// reported instead of retried forever.
+  void _beginLoad(int fileId) {
+    _failedFileId = fileId;
+    _failedLoadAttempts = 0;
+  }
+
+  /// A track that failed to start.
+  ///
+  /// The first failure of a load request is recovered silently: the path the
+  /// player remembered can name a file TDLib has deleted from its cache (the
+  /// cache optimizer and "clear cache" both remove files behind the app's
+  /// back), and a timed-out native start or open has already retired its
+  /// instance. Dropping the remembered path makes the retry download the file
+  /// again, so a track whose file was evicted plays instead of being reported
+  /// unplayable.
+  ///
+  /// A track that fails again is reported and stays current, so a later tap
+  /// can retry it. Auto-advance stays off: silently skipping would look like
+  /// playback never started here.
   void _onPlaybackFailed(int fileId, Object error) {
     debugPrint('MusicPlayerController: track $fileId failed to start: $error');
-    final overlay = appNavigatorKey.currentState?.overlay;
-    if (overlay == null) {
-      // No shell yet (tests, early startup): the state change still notifies.
+    if (current?.music?.file?.id != fileId) {
+      // A track the user already moved away from; nothing to recover.
       notifyListeners();
       return;
     }
-    showToastOverlay(
-      overlay,
-      AppStrings.t(AppStringKeys.musicPlayerStartFailed),
-    );
+    if (_failedFileId != fileId) {
+      _failedFileId = fileId;
+      _failedLoadAttempts = 0;
+    }
+    _failedLoadAttempts++;
+    if (_failedLoadAttempts < maxPlaybackLoadAttempts) {
+      // The player only dropped what failed; the path it used may also be
+      // stale, so forget it and let the retry resolve (and download) again.
+      TdFileCenter.shared.forget(fileId);
+      notifyListeners();
+      scheduleMicrotask(() {
+        final retry = current?.music?.file;
+        if (retry == null || retry.id != fileId) return;
+        unawaited(_startAndPrefetch(retry));
+      });
+      return;
+    }
+    playbackFailureReports++;
+    final overlay = appNavigatorKey.currentState?.overlay;
+    if (overlay != null) {
+      showToastOverlay(
+        overlay,
+        AppStrings.t(AppStringKeys.musicPlayerStartFailed),
+      );
+    }
     notifyListeners();
   }
 

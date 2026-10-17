@@ -8,6 +8,7 @@
 //
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
@@ -404,6 +405,32 @@ class VoicePlayer extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Resolves a local path the native player can open.
+  ///
+  /// TDLib deletes cached files on its own (storage optimizer, "clear cache"),
+  /// and a path remembered before that names a file that no longer exists. The
+  /// native player then rejects the start, and every later attempt replays the
+  /// same dead path — the reported "cannot play this track" that no retry
+  /// could clear. Validating the remembered path and forgetting it makes the
+  /// resolver download the file again instead, which is what
+  /// [TdFileCenter.forget] exists for.
+  Future<String?> _resolvePath(TdFileRef file) async {
+    final remembered = TdFileCenter.shared.cachedPath(file);
+    if (remembered != null) {
+      if (await _isReadableFile(remembered)) return remembered;
+      TdFileCenter.shared.forget(file.id);
+    }
+    return TdFileCenter.shared.pathFor(file, priority: 32);
+  }
+
+  Future<bool> _isReadableFile(String path) async {
+    try {
+      return await File(path).exists();
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _toggle(TdFileRef? file, {required Codec codec}) async {
     if (file == null) return;
 
@@ -473,9 +500,7 @@ class VoicePlayer extends ChangeNotifier {
     String? path;
     Object? pathError;
     try {
-      path =
-          TdFileCenter.shared.cachedPath(file) ??
-          await TdFileCenter.shared.pathFor(file, priority: 32);
+      path = await _resolvePath(file);
     } catch (error) {
       pathError = error;
     }
@@ -573,6 +598,7 @@ class VoicePlayer extends ChangeNotifier {
     _starting = true;
     _startAttempts++;
     FlutterSoundPlayer? startOn;
+    Object? failure;
     try {
       final ready = await audioReady?.timeout(nativeCallTimeout);
       if (ready == null) {
@@ -595,8 +621,7 @@ class VoicePlayer extends ChangeNotifier {
           isPlaying = false;
           isLoading = false;
           _syncPolling();
-          notifyListeners();
-          onFailed?.call(fileId!, TimeoutException('openPlayer'));
+          failure = TimeoutException('openPlayer');
         }
         return;
       }
@@ -653,10 +678,17 @@ class VoicePlayer extends ChangeNotifier {
       isPlaying = false;
       isLoading = false;
       _syncPolling();
-      notifyListeners();
-      if (fileId != null) onFailed?.call(fileId, error);
+      failure = error;
     } finally {
       _starting = false;
+      // Report only once no start is in flight. A listener that reacts to the
+      // failure by loading the track again (the music player does) would
+      // otherwise be dropped by the in-flight tap guard above and never
+      // retried.
+      if (failure != null && fileId != null) {
+        notifyListeners();
+        onFailed?.call(fileId, failure);
+      }
     }
   }
 

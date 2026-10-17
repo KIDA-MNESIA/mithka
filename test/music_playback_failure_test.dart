@@ -20,35 +20,58 @@ void main() {
     ),
   );
 
-  test('a start failure keeps the track current instead of auto-advancing', () {
-    final voice = _FailingStartVoicePlayer();
-    final player = MusicPlayerController.forTest(player: voice);
+  /// Lets the recovery attempt a failure schedules run before asserting.
+  Future<void> settle() async {
+    for (var i = 0; i < 4; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
 
-    final first = track(1);
-    final second = track(2);
-    player.play(first, visibleQueue: [first, second], toggleIfActive: false);
+  test(
+    'a track that fails every attempt stays current instead of advancing',
+    () async {
+      final voice = _FailingStartVoicePlayer();
+      final player = MusicPlayerController.forTest(player: voice);
 
-    // The failed track stays current: skipping to the next one silently
-    // would look like playback never started.
-    expect(player.current?.music?.file?.id, 1);
-    expect(player.isPlaying, isFalse);
-    expect(player.isLoading, isFalse);
-    expect(voice.starts, 1);
-  });
+      final first = track(1);
+      final second = track(2);
+      player.play(first, visibleQueue: [first, second], toggleIfActive: false);
+      await settle();
 
-  test('a retry after failure goes through the start path again', () {
-    final voice = _FailingStartVoicePlayer(failuresBeforeSuccess: 1);
-    final player = MusicPlayerController.forTest(player: voice);
+      // The failed track stays current: skipping to the next one silently
+      // would look like playback never started.
+      expect(player.current?.music?.file?.id, 1);
+      expect(player.isPlaying, isFalse);
+      expect(player.isLoading, isFalse);
+      expect(
+        voice.starts,
+        2,
+        reason: 'one silent recovery attempt, then report',
+      );
+      expect(player.playbackFailureReports, 1);
+    },
+  );
 
-    final only = track(7);
-    player.play(only, visibleQueue: [only], toggleIfActive: false);
-    expect(player.isPlaying, isFalse);
+  test(
+    'a retry after the reported failure goes through the start path again',
+    () async {
+      final voice = _FailingStartVoicePlayer(failuresBeforeSuccess: 2);
+      final player = MusicPlayerController.forTest(player: voice);
 
-    // The system Play command retries a retained-but-stopped track.
-    player.resume();
-    expect(player.isPlaying, isTrue);
-    expect(voice.starts, 2);
-  });
+      final only = track(7);
+      player.play(only, visibleQueue: [only], toggleIfActive: false);
+      await settle();
+      expect(player.isPlaying, isFalse);
+      expect(player.playbackFailureReports, 1);
+
+      // The system Play command retries a retained-but-stopped track.
+      player.resume();
+      await settle();
+      expect(player.isPlaying, isTrue);
+      expect(voice.starts, 3);
+      expect(player.playbackFailureReports, 1);
+    },
+  );
 }
 
 /// A [VoicePlayer] whose native start fails a number of times before
