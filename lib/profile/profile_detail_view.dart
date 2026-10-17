@@ -1013,19 +1013,23 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
             Row(
               children: [
                 Expanded(
-                  child: TelegramRichText(
-                    key: const ValueKey('profileBio'),
-                    text: _bio,
-                    entities: _bioEntities,
-                    style: TextStyle(fontSize: 15, color: c.textPrimary),
-                    onMentionTap: (userId, name) {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              ProfileDetailView(userId: userId, name: name),
-                        ),
-                      );
-                    },
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onLongPress: () => _copyValue(_bio),
+                    child: TelegramRichText(
+                      key: const ValueKey('profileBio'),
+                      text: _bio,
+                      entities: _bioEntities,
+                      style: TextStyle(fontSize: 15, color: c.textPrimary),
+                      onMentionTap: (userId, name) {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                ProfileDetailView(userId: userId, name: name),
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
                 // Only your own bio is editable, so the pen must not promise

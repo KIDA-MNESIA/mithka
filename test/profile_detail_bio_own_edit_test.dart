@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/components/app_icons.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/profile/profile_detail_view.dart';
+import 'package:mithka/settings/edit_profile_view.dart';
 import 'package:mithka/tdlib/td_client.dart';
 import 'package:mithka/theme/app_theme.dart';
 import 'package:mithka/theme/theme_controller.dart';
@@ -139,6 +140,9 @@ void main() {
 
     expect(bioText(), findsOneWidget);
     expect(find.byKey(const ValueKey('profileBioEditIcon')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('profileBioEditIcon')));
+    await tester.pumpAndSettle();
+    expect(find.byType(EditProfileView), findsOneWidget);
   });
 
   testWidgets('the bio is not repeated among the detail rows', (tester) async {

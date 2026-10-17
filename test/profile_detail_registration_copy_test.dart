@@ -284,9 +284,7 @@ void main() {
     await drainToast(tester);
   });
 
-  testWidgets('copies an info row, and the bio has no duplicate to copy', (
-    tester,
-  ) async {
+  testWidgets('copies an info row and the single full bio', (tester) async {
     serveProfile(
       accountInfo: {'registration_year': 2021, 'registration_month': 3},
       bio: 'just a cat',
@@ -295,8 +293,10 @@ void main() {
 
     await tester.longPress(find.text('March 2021'));
     await tester.pumpAndSettle();
+    await tester.longPress(find.text('just a cat', findRichText: true));
+    await tester.pumpAndSettle();
 
-    expect(clipboard, ['March 2021']);
+    expect(clipboard, ['March 2021', 'just a cat']);
     // The bio lives in the header alone, so it renders once and no info-card
     // copy of it is left to long-press.
     expect(find.text('just a cat', findRichText: true), findsOneWidget);
