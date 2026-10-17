@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +7,7 @@ import 'package:mithka/chat/chat_view.dart'
     show ChatView, ReactionUsersSheetFrame, clearChatMemoryCaches;
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/translation_controller.dart';
+import 'package:mithka/tdlib/td_bindings.dart';
 import 'package:mithka/tdlib/td_client.dart';
 import 'package:mithka/theme/app_theme.dart';
 import 'package:mithka/theme/theme_controller.dart';
@@ -21,6 +23,17 @@ import 'support/l10n_fixtures.dart';
 const _chatId = -1000000004242;
 const _messageId = 5;
 const _meId = 1;
+
+class _ReportBindings implements TdBindings {
+  int next = 100;
+  @override
+  int createClientId() => next++;
+  @override
+  void send(int clientId, String request) {}
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw UnsupportedError('No native TDLib in ownership tests');
+}
 
 Map<String, dynamic> _reaction(int count, {bool chosen = false}) => {
   '@type': 'messageReaction',
@@ -91,92 +104,92 @@ void main() {
   late bool reactionsFail;
   late bool reportFails;
   late bool reactionsLoadedOnce;
+  late TdClientProxyTransport transport;
 
   setUpAll(() {
-    TdClient.shared.configureProxy(
-      TdClientProxyTransport(
-        accountSlot: 0,
-        query: (request) async {
-          requests.add(Map<String, dynamic>.from(request));
-          switch (request['@type']) {
-            case 'getChat':
-              return _chatJson();
-            case 'getChatHistory':
-              return {
-                '@type': 'messages',
-                'total_count': 1,
-                'messages': [_message()],
-              };
-            case 'getMe':
-              return _user(_meId, 'Me');
-            case 'getUser':
-              final id = request['user_id'] as int;
-              return switch (id) {
-                2 => _user(2, 'Alice'),
-                3 => _user(3, '', deleted: true),
-                _ => _user(id, 'Me'),
-              };
-            case 'getSupergroup':
-              return {'@type': 'supergroup', 'id': -_chatId - 1000000000000};
-            case 'getSupergroupFullInfo':
-              return {'@type': 'supergroupFullInfo', 'member_count': 3};
-            case 'getMessageProperties':
-              final gate = propertiesGate;
-              if (gate != null) await gate.future;
-              if (propertiesFail) {
-                throw StateError('properties unavailable');
-              }
-              return {
-                '@type': 'messageProperties',
-                'can_report_reactions': canReportProperty,
-              };
-            case 'getMessageAddedReactions':
-              if (reactionsFail) {
-                throw StateError('reactions unavailable');
-              }
-              reactionsLoadedOnce = true;
-              return {
-                '@type': 'addedReactions',
-                'total_count': 3,
-                'reactions': [
-                  _addedReaction(2, 1785862261),
-                  _addedReaction(_meId, 1785862262),
-                  _addedReaction(3, 1785862263),
-                ],
-              };
-            case 'reportMessageReactions':
-              if (reportFails) {
-                throw StateError('report unavailable');
-              }
-              return {'@type': 'ok'};
-            case 'getMessageAvailableReactions':
-              return {
-                '@type': 'availableReactions',
-                'top_reactions': [
-                  {
-                    '@type': 'availableReaction',
-                    'type': {'@type': 'reactionTypeEmoji', 'emoji': '👍'},
-                    'needs_premium': false,
-                  },
-                ],
-                'recent_reactions': <Map<String, dynamic>>[],
-                'popular_reactions': <Map<String, dynamic>>[],
-                'allow_custom_emoji': false,
-                'are_tags': false,
-                'unavailability_reason': null,
-              };
-            case 'getOption':
-              return {'@type': 'optionValueBoolean', 'value': false};
-            case 'addMessageReaction' || 'removeMessageReaction':
-              return {'@type': 'ok'};
-            default:
-              return {'@type': 'ok'};
-          }
-        },
-        send: (_) async {},
-        updates: const Stream.empty(),
-      ),
+    transport = TdClientProxyTransport(
+      accountSlot: 0,
+      query: (request) async {
+        requests.add(Map<String, dynamic>.from(request));
+        switch (request['@type']) {
+          case 'getChat':
+            return _chatJson();
+          case 'getChatHistory':
+            return {
+              '@type': 'messages',
+              'total_count': 1,
+              'messages': [_message()],
+            };
+          case 'getMe':
+            return _user(_meId, 'Me');
+          case 'getUser':
+            final id = request['user_id'] as int;
+            return switch (id) {
+              2 => _user(2, 'Alice'),
+              3 => _user(3, '', deleted: true),
+              _ => _user(id, 'Me'),
+            };
+          case 'getSupergroup':
+            return {'@type': 'supergroup', 'id': -_chatId - 1000000000000};
+          case 'getSupergroupFullInfo':
+            return {'@type': 'supergroupFullInfo', 'member_count': 3};
+          case 'getMessageProperties':
+            final gate = propertiesGate;
+            if (gate != null) await gate.future;
+            if (propertiesFail) {
+              throw StateError('properties unavailable');
+            }
+            return {
+              '@type': 'messageProperties',
+              'can_report_reactions': canReportProperty,
+            };
+          case 'getMessageAddedReactions':
+            if (reactionsFail) {
+              throw StateError('reactions unavailable');
+            }
+            reactionsLoadedOnce = true;
+            return {
+              '@type': 'addedReactions',
+              'total_count': 3,
+              'reactions': [
+                _addedReaction(2, 1785862261),
+                _addedReaction(_meId, 1785862262),
+                _addedReaction(3, 1785862263),
+              ],
+            };
+          case 'reportMessageReactions':
+            if (reportFails) {
+              throw StateError('report unavailable');
+            }
+            return {'@type': 'ok'};
+          case 'getMessageAvailableReactions':
+            return {
+              '@type': 'availableReactions',
+              'top_reactions': [
+                {
+                  '@type': 'availableReaction',
+                  'type': {'@type': 'reactionTypeEmoji', 'emoji': '👍'},
+                  'needs_premium': false,
+                },
+              ],
+              'recent_reactions': <Map<String, dynamic>>[],
+              'popular_reactions': <Map<String, dynamic>>[],
+              'allow_custom_emoji': false,
+              'are_tags': false,
+              'unavailability_reason': null,
+            };
+          case 'getOption':
+            return {'@type': 'optionValueBoolean', 'value': false};
+          case 'addMessageReaction' || 'removeMessageReaction':
+            return {'@type': 'ok'};
+          default:
+            return {'@type': 'ok'};
+        }
+      },
+      send: (_) async {},
+      updates: const Stream.empty(),
     );
+    TdClient.shared.configureProxy(transport);
   });
   tearDownAll(TdClient.shared.closeProxy);
 
@@ -489,5 +502,62 @@ void main() {
       requests.where((request) => request['@type'] == 'reportMessageReactions'),
       isEmpty,
     );
+  });
+
+  testWidgets('an account switch cancels permission and confirmed reporting', (
+    tester,
+  ) async {
+    final client = TdClient.shared;
+    final prefs = await SharedPreferences.getInstance();
+    final dir = Directory.systemTemp.createTempSync('mithka_reaction_owner_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final calls = <(int, String)>[];
+    client.prepareForTesting(
+      prefs: prefs,
+      supportDir: dir.path,
+      bindings: _ReportBindings(),
+      queryOverride: (request, clientId) async {
+        calls.add((clientId, request['@type'] as String));
+        return transport.query(request);
+      },
+    );
+    final betaSlot = client.addSlot();
+    final betaClient = client.clientId(betaSlot)!;
+    client.setActive(0);
+    final owner = client.activeClientId;
+    expect(betaClient, isNot(owner));
+
+    final gate = propertiesGate = Completer<bool>();
+    await pumpChat(tester);
+    await openReactions(tester);
+    expect(find.byKey(const ValueKey('reactionUserReport-2')), findsNothing);
+    client.setActive(betaSlot);
+    gate.complete(true);
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.byKey(const ValueKey('reactionUserReport-2')), findsNothing);
+    await settle(tester);
+
+    client.setActive(0);
+    propertiesGate = null;
+    await pumpChat(tester);
+    await openReactions(tester);
+    await tester.tap(find.byKey(const ValueKey('reactionUserReport-2')));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.text('Report reaction'));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(find.text('Report reaction?'), findsOneWidget);
+    client.setActive(betaSlot);
+    await tester.tap(find.text('Report'));
+    await tester.pump(const Duration(milliseconds: 400));
+    expect(calls.where((call) => call.$2 == 'reportMessageReactions'), isEmpty);
+    expect(calls.where((call) => call.$1 == betaClient), isEmpty);
+    expect(
+      calls.where((call) => call.$2 == 'getMessageProperties'),
+      hasLength(2),
+    );
+    await settle(tester);
+    client.setActive(0);
   });
 }
