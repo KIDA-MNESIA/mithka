@@ -229,6 +229,49 @@ Future<void> _pumpClosed(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets('an idle loaded sheet closes as soon as its owner changes', (
+    tester,
+  ) async {
+    final registry = await _startRegistry(_exceptionResponder());
+    await _pumpSheet(tester, accounts: registry.accounts);
+    expect(find.text('Alpha'), findsOneWidget);
+    registry.switchToBeta();
+    await _pumpClosed(tester);
+    expect(
+      find.byKey(const ValueKey('notification-exceptions-sheet')),
+      findsNothing,
+    );
+  });
+
+  testWidgets('stale completion never pops a different route above the sheet', (
+    tester,
+  ) async {
+    final holdList = Completer<void>();
+    final registry = await _startRegistry(
+      _exceptionResponder(holdList: holdList),
+    );
+    await _pumpSheet(tester, accounts: registry.accounts);
+    final navigator = tester.state<NavigatorState>(
+      find.byType(Navigator).first,
+    );
+    unawaited(
+      navigator.push<void>(
+        MaterialPageRoute(
+          builder: (_) => const Scaffold(body: Text('New account settings')),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 450));
+    registry.switchToBeta();
+    holdList.complete();
+    await _pumpClosed(tester);
+    expect(find.text('New account settings'), findsOneWidget);
+    expect(
+      find.byType(NotificationExceptionsSheet, skipOffstage: false),
+      findsNothing,
+    );
+  });
   testWidgets(
     'an unchanged owner lists, resolves and resets through its own client',
     (tester) async {

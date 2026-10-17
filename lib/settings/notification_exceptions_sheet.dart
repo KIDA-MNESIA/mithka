@@ -10,6 +10,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -158,6 +159,9 @@ int _soundId(Map<String, dynamic>? settings, String key) {
 abstract interface class NotificationExceptionOwner {
   int get clientId;
 
+  /// Foreground-account changes invalidate even an idle, already-loaded sheet.
+  Stream<int> get activeSlotChanges;
+
   /// Query bound to [clientId]. It never resolves the active account.
   Future<Map<String, dynamic>> query(Map<String, dynamic> request);
 
@@ -185,6 +189,9 @@ final class TdNotificationExceptionOwner implements NotificationExceptionOwner {
 
   @override
   final int clientId;
+
+  @override
+  Stream<int> get activeSlotChanges => _client.subscribeActiveSlotChanges();
 
   @override
   Future<Map<String, dynamic>> query(Map<String, dynamic> request) =>
@@ -290,6 +297,7 @@ class _NotificationExceptionsSheetState
     extends State<NotificationExceptionsSheet> {
   final Set<int> _resetting = {};
   NotificationExceptionOwner? _owner;
+  StreamSubscription<int>? _ownerChanges;
   List<_NotificationExceptionEntry> _entries = const [];
   int _loadGeneration = 0;
   bool _loading = true;
@@ -300,6 +308,7 @@ class _NotificationExceptionsSheetState
   void initState() {
     super.initState();
     _owner = widget.owner;
+    _ownerChanges = _owner?.activeSlotChanges.listen((_) => _onOwnerChanged());
     if (_owner == null) {
       // Nothing could be pinned: show the failure state rather than letting a
       // request fall through to the foreground client.
@@ -308,6 +317,16 @@ class _NotificationExceptionsSheetState
       return;
     }
     unawaited(_load());
+  }
+
+  void _onOwnerChanged() {
+    if (mounted && !(_owner?.isCurrent ?? false)) _closeForStaleOwner();
+  }
+
+  @override
+  void dispose() {
+    unawaited(_ownerChanges?.cancel());
+    super.dispose();
   }
 
   /// Ends the sheet when the account it was opened for is gone.
@@ -326,9 +345,36 @@ class _NotificationExceptionsSheetState
   void _closeForStaleOwner() {
     if (_closedForStaleOwner) return;
     _closedForStaleOwner = true;
-    final navigator = Navigator.maybeOf(context);
-    if (navigator != null && navigator.canPop()) {
-      navigator.pop();
+    setState(() {
+      _entries = const [];
+      _loading = false;
+      _failed = true;
+    });
+    // The sheet can be covered by a newer account/settings route, and an
+    // owner notification can arrive while navigation is already updating.
+    // Close this route, never whichever route happens to be top.
+    void closeRoute() {
+      if (!mounted) return;
+      final route = ModalRoute.of(context);
+      final navigator = Navigator.maybeOf(context);
+      if (route == null ||
+          route.isFirst ||
+          !route.isActive ||
+          navigator == null) {
+        return;
+      }
+      if (route.isCurrent) {
+        navigator.pop();
+      } else {
+        navigator.removeRoute(route);
+      }
+    }
+
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => closeRoute());
+    } else {
+      closeRoute();
     }
   }
 
@@ -541,7 +587,9 @@ class _NotificationExceptionsSheetState
         child: Center(child: AppActivityIndicator(size: 24)),
       );
     }
-    if (_failed) return _Failure(onRetry: _owner == null ? null : _retry);
+    if (_failed) {
+      return _Failure(onRetry: (_owner?.isCurrent ?? false) ? _retry : null);
+    }
     if (_entries.isEmpty) {
       return Padding(
         key: const ValueKey('notification-exceptions-empty'),
