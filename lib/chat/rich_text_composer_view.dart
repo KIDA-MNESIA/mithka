@@ -31,12 +31,19 @@ class RichTextComposerResult {
     required this.entities,
     required this.attachments,
     required this.segments,
+    this.hasRichBlocks = false,
   });
 
   final String text;
   final List<Map<String, dynamic>> entities;
   final List<OutgoingAttachment> attachments;
   final List<RichMessageSendSegment> segments;
+
+  /// Whether the document holds structure that a plain formatted message
+  /// cannot carry: headings, lists, quotes, tables, buttons, math, maps,
+  /// dividers or media. `text`/`entities` still hold every piece of text, so a
+  /// caller without a rich send path can deliver the text and drop the blocks.
+  final bool hasRichBlocks;
 
   FormattedTextPayload get formattedText =>
       FormattedTextPayload(text, entities);
@@ -664,7 +671,11 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
     block = _RichTextBlock(controller, focusNode, onTextChanged, kind: kind);
     controller.addListener(onTextChanged);
     focusNode.addListener(() {
-      if (focusNode.hasFocus) _activeTextBlock = block;
+      if (!focusNode.hasFocus) return;
+      _activeTextBlock = block;
+      // The inline format row reads its enabled state and selection from the
+      // active block, so it has to rebuild when focus moves to another one.
+      if (mounted) setState(() {});
     });
     return block;
   }
@@ -704,6 +715,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
     final inputBlocks = <Map<String, dynamic>>[];
     final pendingAttachments = <OutgoingAttachment>[];
     var hasContent = false;
+    var hasRichBlocks = false;
 
     void flushHtml() {
       final html = htmlBuffer.toString().trim();
@@ -735,6 +747,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
       final mediaGroup = block.mediaGroup;
       if (mediaGroup != null) {
         if (mediaGroup.items.isEmpty) continue;
+        hasRichBlocks = true;
         flushAttachments();
         final tag = mediaGroup.kind == _RichBlockKind.collage
             ? 'tg-collage'
@@ -770,6 +783,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
       }
       final attachment = block.attachment;
       if (attachment != null) {
+        hasRichBlocks = true;
         attachments.add(attachment);
         if (attachment.kind == OutgoingAttachmentKind.document) {
           flushHtml();
@@ -787,6 +801,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
       final buttonRow = block.buttonRow;
       if (buttonRow != null) {
         if (buttonRow.buttons.isEmpty) continue;
+        hasRichBlocks = true;
         final buttons = <Map<String, dynamic>>[];
         for (final button in buttonRow.buttons) {
           final label = button.label.text.trim();
@@ -823,6 +838,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
         final inputBlock = _textInputBlock(block.text!, text, blockEntities);
         if (inputBlock != null) inputBlocks.add(inputBlock);
       } else if (block.math != null) {
+        hasRichBlocks = true;
         text = block.math!.controller.text.trim();
         if (text.isNotEmpty) {
           htmlBuffer.write(
@@ -834,16 +850,24 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
           });
         }
       } else if (block.table != null) {
+        hasRichBlocks = true;
         text = block.table?.toMarkdown() ?? '';
         htmlBuffer.write(block.table?.toHtml() ?? '');
         inputBlocks.add(block.table!.toInputPageBlock());
       } else {
+        hasRichBlocks = true;
         text = block.generic?.primary.text.trim() ?? '';
         htmlBuffer.write(_genericBlockHtml(block));
         final inputBlock = _genericInputBlock(block);
         if (inputBlock != null) inputBlocks.add(inputBlock);
       }
       if (text.trim().isEmpty) continue;
+      final textBlock = block.text;
+      if (textBlock != null &&
+          textBlock.kind != _RichBlockKind.paragraph &&
+          textBlock.kind != _RichBlockKind.thinking) {
+        hasRichBlocks = true;
+      }
       if (hasContent) buffer.write('\n\n');
       final offset = buffer.length;
       buffer.write(text);
@@ -859,6 +883,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
       entities: entities,
       attachments: List.unmodifiable(attachments),
       segments: List.unmodifiable(segments),
+      hasRichBlocks: hasRichBlocks,
     );
     final callback = widget.onSubmit;
     if (callback != null) {
@@ -1482,11 +1507,22 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
     setState(() {
       final removed = _blocks.removeAt(index);
       _disposeBlock(removed);
+      final removedText = removed.text;
       if (_blocks.isEmpty || !_blocks.any((block) => block.text != null)) {
         final text = _createTextBlock('');
         final insertionIndex = index.clamp(0, _blocks.length);
         _blocks.insert(insertionIndex, _RichContentBlock.text(text));
         _activeTextBlock = text;
+      } else if (removedText != null &&
+          identical(removedText, _activeTextBlock)) {
+        // Keep the inline format row bound to a live controller.
+        for (final block in _blocks) {
+          final text = block.text;
+          if (text != null) {
+            _activeTextBlock = text;
+            break;
+          }
+        }
       }
     });
   }
@@ -1842,10 +1878,27 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
           _RichInlineFormatMenu(anchor: anchor, appliedFormats: appliedFormats),
     );
     if (!mounted || action == null) return;
-    textBlock.controller.selection = TextSelection(
-      baseOffset: start,
-      extentOffset: end,
+    await _applyInlineFormatAction(
+      action,
+      textBlock.controller,
+      textBlock.focusNode,
+      start,
+      end,
     );
+  }
+
+  /// Applies [action] over `start..end` of [controller], asking for the target
+  /// URL first when the action is a link. The selection menu and the toolbar
+  /// row share this so both act through one implementation.
+  Future<void> _applyInlineFormatAction(
+    _RichInlineFormatAction action,
+    EmojiTextEditingController controller,
+    FocusNode focusNode,
+    int start,
+    int end,
+  ) async {
+    if (start < 0 || end > controller.text.length || start >= end) return;
+    controller.selection = TextSelection(baseOffset: start, extentOffset: end);
     if (action == _RichInlineFormatAction.link) {
       final url = await _showRichValueDialog(
         AppStringKeys.composerFormatLink,
@@ -1853,18 +1906,15 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
       );
       if (!mounted || url == null || url.trim().isEmpty) return;
       final parsed = Uri.tryParse(url.trim());
-      textBlock.controller.applyEntityFormat(start, end, {
+      controller.applyEntityFormat(start, end, {
         '@type': 'textEntityTypeTextUrl',
         'url': parsed?.hasScheme == true ? url.trim() : 'https://${url.trim()}',
       });
     } else {
-      textBlock.controller.toggleFormat(action.entityType);
+      controller.toggleFormat(action.entityType);
     }
-    textBlock.controller.selection = TextSelection(
-      baseOffset: start,
-      extentOffset: end,
-    );
-    textBlock.focusNode.requestFocus();
+    controller.selection = TextSelection(baseOffset: start, extentOffset: end);
+    focusNode.requestFocus();
   }
 
   Future<void> _showRichBlockInsertMenu(
@@ -3007,23 +3057,7 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
           _RichInlineFormatMenu(anchor: anchor, appliedFormats: appliedFormats),
     );
     if (!mounted || action == null) return;
-    controller.selection = TextSelection(baseOffset: start, extentOffset: end);
-    if (action == _RichInlineFormatAction.link) {
-      final url = await _showRichValueDialog(
-        AppStringKeys.composerFormatLink,
-        AppStringKeys.composerFormatLinkPlaceholder,
-      );
-      if (!mounted || url == null || url.trim().isEmpty) return;
-      final parsed = Uri.tryParse(url.trim());
-      controller.applyEntityFormat(start, end, {
-        '@type': 'textEntityTypeTextUrl',
-        'url': parsed?.hasScheme == true ? url.trim() : 'https://${url.trim()}',
-      });
-    } else {
-      controller.toggleFormat(action.entityType);
-    }
-    controller.selection = TextSelection(baseOffset: start, extentOffset: end);
-    focusNode.requestFocus();
+    await _applyInlineFormatAction(action, controller, focusNode, start, end);
   }
 
   Future<void> _showTableActionsMenu(
@@ -3139,68 +3173,227 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
     );
   }
 
+  static const _inlineFormatBarActions = [
+    _RichInlineFormatAction.bold,
+    _RichInlineFormatAction.italic,
+    _RichInlineFormatAction.underline,
+    _RichInlineFormatAction.strikethrough,
+    _RichInlineFormatAction.monospace,
+    _RichInlineFormatAction.link,
+    _RichInlineFormatAction.spoiler,
+  ];
+
   Widget _toolbar(AppColors c) {
     return Container(
-      height: 48,
       decoration: BoxDecoration(
         color: c.background,
         border: Border(bottom: BorderSide(color: c.divider)),
       ),
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          _actionChip(
-            c,
-            'P',
-            () => unawaited(_insertBlockKind(_RichBlockKind.paragraph)),
-          ),
-          _actionChip(
-            c,
-            'H',
-            () => unawaited(_insertBlockKind(_RichBlockKind.heading)),
-          ),
-          _actionChip(
-            c,
-            '•',
-            () => unawaited(_insertBlockKind(_RichBlockKind.list)),
-          ),
-          _iconButton(
-            c,
-            icon: HeroAppIcons.quoteLeft,
-            label: _RichBlockKind.blockQuotation.labelKey.l10n(context),
-            onTap: () =>
-                unawaited(_insertBlockKind(_RichBlockKind.blockQuotation)),
-          ),
-          _iconButton(
-            c,
-            icon: HeroAppIcons.tableCells,
-            label: AppStringKeys.richTextComposerInsertTable.l10n(context),
-            onTap: () => unawaited(_insertBlockKind(_RichBlockKind.table)),
-          ),
-          _iconButton(
-            c,
-            icon: HeroAppIcons.link,
-            label: _RichBlockKind.buttonRow.labelKey.l10n(context),
-            onTap: () => unawaited(_insertBlockKind(_RichBlockKind.buttonRow)),
-          ),
-          _actionChip(
-            c,
-            '∑',
-            () => unawaited(
-              _insertBlockKind(_RichBlockKind.mathematicalExpression),
+          _inlineFormatBar(c),
+          SizedBox(
+            height: 48,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              children: [
+                _actionChip(
+                  c,
+                  'P',
+                  () => unawaited(_insertBlockKind(_RichBlockKind.paragraph)),
+                ),
+                _actionChip(
+                  c,
+                  'H',
+                  () => unawaited(_insertBlockKind(_RichBlockKind.heading)),
+                ),
+                _actionChip(
+                  c,
+                  '•',
+                  () => unawaited(_insertBlockKind(_RichBlockKind.list)),
+                ),
+                _iconButton(
+                  c,
+                  icon: HeroAppIcons.quoteLeft,
+                  label: _RichBlockKind.blockQuotation.labelKey.l10n(context),
+                  onTap: () => unawaited(
+                    _insertBlockKind(_RichBlockKind.blockQuotation),
+                  ),
+                ),
+                _iconButton(
+                  c,
+                  icon: HeroAppIcons.tableCells,
+                  label: AppStringKeys.richTextComposerInsertTable.l10n(
+                    context,
+                  ),
+                  onTap: () =>
+                      unawaited(_insertBlockKind(_RichBlockKind.table)),
+                ),
+                _iconButton(
+                  c,
+                  icon: HeroAppIcons.link,
+                  label: _RichBlockKind.buttonRow.labelKey.l10n(context),
+                  onTap: () =>
+                      unawaited(_insertBlockKind(_RichBlockKind.buttonRow)),
+                ),
+                _actionChip(
+                  c,
+                  '∑',
+                  () => unawaited(
+                    _insertBlockKind(_RichBlockKind.mathematicalExpression),
+                  ),
+                ),
+                _iconButton(
+                  c,
+                  icon: HeroAppIcons.locationPin,
+                  label: _RichBlockKind.map.labelKey.l10n(context),
+                  onTap: () => unawaited(_insertBlockKind(_RichBlockKind.map)),
+                ),
+                _toolbarInsertButton(c),
+              ],
             ),
           ),
-          _iconButton(
-            c,
-            icon: HeroAppIcons.locationPin,
-            label: _RichBlockKind.map.labelKey.l10n(context),
-            onTap: () => unawaited(_insertBlockKind(_RichBlockKind.map)),
-          ),
-          _toolbarInsertButton(c),
         ],
       ),
     );
+  }
+
+  /// Inline formatting for the current selection. The controller only applies
+  /// formats to a non-collapsed selection, so the buttons stay disabled until
+  /// the user selects text; the selection menu remains the full-featured path.
+  Widget _inlineFormatBar(AppColors c) {
+    final textBlock = _activeTextBlock;
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: textBlock.controller,
+      builder: (context, value, _) {
+        final selection = value.selection;
+        final hasSelection = selection.isValid && !selection.isCollapsed;
+        return SizedBox(
+          height: 38,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(12, 3, 12, 3),
+            children: [
+              for (final action in _inlineFormatBarActions)
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: _inlineFormatButton(
+                    c,
+                    action: action,
+                    enabled: hasSelection,
+                    selected:
+                        hasSelection &&
+                        textBlock.controller.selectionHasFormat(
+                          action.selectionEntityType,
+                        ),
+                    onTap: () => _applyInlineFormatToActiveBlock(action),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _applyInlineFormatToActiveBlock(_RichInlineFormatAction action) {
+    final textBlock = _activeTextBlock;
+    final selection = textBlock.controller.selection;
+    if (!selection.isValid || selection.isCollapsed) return;
+    final start = math.min(selection.start, selection.end);
+    final end = math.max(selection.start, selection.end);
+    unawaited(
+      _applyInlineFormatAction(
+        action,
+        textBlock.controller,
+        textBlock.focusNode,
+        start,
+        end,
+      ),
+    );
+  }
+
+  Widget _inlineFormatButton(
+    AppColors c, {
+    required _RichInlineFormatAction action,
+    required bool enabled,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    final foreground = !enabled
+        ? c.textTertiary.withValues(alpha: 0.48)
+        : selected
+        ? AppTheme.brand
+        : c.textSecondary;
+    final icon = switch (action) {
+      _RichInlineFormatAction.link => HeroAppIcons.link,
+      _RichInlineFormatAction.spoiler => HeroAppIcons.eyeSlash,
+      _ => null,
+    };
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      selected: selected,
+      label: action.labelKey.l10n(context),
+      excludeSemantics: true,
+      child: GestureDetector(
+        key: ValueKey('rich-inline-${action.name}'),
+        behavior: HitTestBehavior.opaque,
+        onTap: enabled ? onTap : null,
+        child: Container(
+          width: 34,
+          height: 32,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected
+                ? AppTheme.brand.withValues(alpha: 0.14)
+                : c.searchFill,
+            borderRadius: BorderRadius.circular(AppRadius.md),
+            border: Border.all(
+              color: selected
+                  ? AppTheme.brand.withValues(alpha: 0.54)
+                  : c.divider,
+            ),
+          ),
+          child: icon != null
+              ? AppIcon(icon, size: 16, color: foreground)
+              : Text(
+                  _inlineFormatMark(action),
+                  style: AppTextStyle.caption(foreground).copyWith(
+                    fontWeight: action == _RichInlineFormatAction.bold
+                        ? FontWeight.w600
+                        : FontWeight.w500,
+                    fontStyle: action == _RichInlineFormatAction.italic
+                        ? FontStyle.italic
+                        : null,
+                    decoration: switch (action) {
+                      _RichInlineFormatAction.underline =>
+                        TextDecoration.underline,
+                      _RichInlineFormatAction.strikethrough =>
+                        TextDecoration.lineThrough,
+                      _ => null,
+                    },
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+
+  String _inlineFormatMark(_RichInlineFormatAction action) {
+    return switch (action) {
+      _RichInlineFormatAction.bold =>
+        AppStringKeys.richTextComposerFormatBoldMark.l10n(context),
+      _RichInlineFormatAction.italic =>
+        AppStringKeys.richTextComposerFormatItalicMark.l10n(context),
+      _RichInlineFormatAction.underline =>
+        AppStringKeys.richTextComposerFormatUnderlineMark.l10n(context),
+      _RichInlineFormatAction.strikethrough =>
+        AppStringKeys.richTextComposerFormatStrikethroughMark.l10n(context),
+      _ => '</>',
+    };
   }
 
   Widget _toolbarInsertButton(AppColors c) {
@@ -4187,7 +4380,7 @@ enum _RichInlineFormatAction {
     spoiler => AppStringKeys.richTextComposerFormatSpoiler,
     bold => AppStringKeys.richTextComposerFormatBold,
     italic => AppStringKeys.richTextComposerFormatItalic,
-    monospace => AppStringKeys.composerFormatMonospace,
+    monospace => AppStringKeys.richTextComposerFormatCode,
     link => AppStringKeys.composerFormatLink,
     strikethrough => AppStringKeys.richTextComposerFormatStrikethrough,
     underline => AppStringKeys.richTextComposerFormatUnderline,

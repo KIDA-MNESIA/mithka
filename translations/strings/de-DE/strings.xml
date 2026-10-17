@@ -2812,6 +2812,7 @@
     <string name="richTextRelayProgressForward">Nachricht weiterleiten</string>
     <string name="richTextRelayProgressUpload">Medien hochladen {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">Auf Nachricht warten</string>
+    <string name="richTextSentFormattedOnly">Als formatierte Nachricht gesendet. Rich-Blöcke wurden verworfen.</string>
     <string name="richTextTableAddColumnLeft">Spalte links einfügen</string>
     <string name="richTextTableAddColumnRight">Spalte rechts einfügen</string>
     <string name="richTextTableAddRowAbove">Zeile darüber einfügen</string>

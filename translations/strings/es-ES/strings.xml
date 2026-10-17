@@ -2812,6 +2812,7 @@
     <string name="richTextRelayProgressForward">Reenviar mensaje</string>
     <string name="richTextRelayProgressUpload">Subir medios {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">Esperar el mensaje</string>
+    <string name="richTextSentFormattedOnly">Enviado como mensaje con formato. Se descartaron los bloques enriquecidos.</string>
     <string name="richTextTableAddColumnLeft">Añadir columna a la izquierda</string>
     <string name="richTextTableAddColumnRight">Añadir columna a la derecha</string>
     <string name="richTextTableAddRowAbove">Añadir fila arriba</string>

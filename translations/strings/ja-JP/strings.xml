@@ -2802,6 +2802,7 @@
     <string name="richTextRelayProgressForward">メッセージを転送</string>
     <string name="richTextRelayProgressUpload">メディアをアップロード {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">メッセージを受信待ち</string>
+    <string name="richTextSentFormattedOnly">書式付きメッセージとして送信しました。リッチブロックは破棄されました。</string>
     <string name="richTextTableAddColumnLeft">左に列を追加</string>
     <string name="richTextTableAddColumnRight">右に列を追加</string>
     <string name="richTextTableAddRowAbove">上に行を追加</string>

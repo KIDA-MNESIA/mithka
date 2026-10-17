@@ -2802,6 +2802,7 @@
     <string name="richTextRelayProgressForward">메시지 전달</string>
     <string name="richTextRelayProgressUpload">미디어 업로드 {value1}/{value2}</string>
     <string name="richTextRelayProgressWait">메시지 수신 대기</string>
+    <string name="richTextSentFormattedOnly">서식 있는 메시지로 전송되었습니다. 리치 블록은 제외되었습니다.</string>
     <string name="richTextTableAddColumnLeft">왼쪽에 열 추가</string>
     <string name="richTextTableAddColumnRight">오른쪽에 열 추가</string>
     <string name="richTextTableAddRowAbove">위에 행 추가</string>

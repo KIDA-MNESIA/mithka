@@ -1,4 +1,3 @@
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -128,35 +127,57 @@ void main() {
     expect(find.text('Not configured'), findsOneWidget);
   });
 
-  testWidgets('non-Premium rich message action offers relay setup', (
+  testWidgets('non-Premium rich message action opens the editor directly', (
     tester,
   ) async {
     final theme = await _themeController();
     final vm = _NonPremiumChatViewModel();
     addTearDown(theme.dispose);
     addTearDown(vm.dispose);
-    await tester.pumpWidget(
-      _app(
-        theme,
-        Scaffold(
-          body: Align(
-            alignment: Alignment.bottomCenter,
-            child: ChatInputBar(
-              vm: vm,
-              onStartCall: (_) {},
-              onMessageSent: () {},
-            ),
-          ),
-        ),
-      ),
-    );
+    await _pumpComposerBar(tester, theme, vm);
 
     await tester.tap(find.byIcon(HeroAppIcons.circlePlus.data));
     await tester.pump();
     await tester.tap(find.text('Rich text'));
     await tester.pumpAndSettle();
 
-    expect(find.byType(CupertinoAlertDialog), findsOneWidget);
+    expect(find.byType(RichTextComposerView), findsOneWidget);
+    expect(find.text('Configure a relay bot?'), findsNothing);
+  });
+
+  testWidgets('relay setup is offered when a block document is sent', (
+    tester,
+  ) async {
+    final theme = await _themeController();
+    final vm = _NonPremiumChatViewModel();
+    addTearDown(theme.dispose);
+    addTearDown(vm.dispose);
+    await _pumpComposerBar(tester, theme, vm);
+
+    await tester.tap(find.byIcon(HeroAppIcons.circlePlus.data));
+    await tester.pump();
+    await tester.tap(find.text('Rich text'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.descendant(
+        of: find.byType(RichTextComposerView),
+        matching: find.text('•'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find
+          .descendant(
+            of: find.byType(RichTextComposerView),
+            matching: find.byType(TextField),
+          )
+          .first,
+      'first item',
+    );
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+
     expect(find.text('Configure a relay bot?'), findsOneWidget);
     expect(find.text('Configure'), findsOneWidget);
 
@@ -274,6 +295,29 @@ void main() {
 Future<ThemeController> _themeController() async {
   SharedPreferences.setMockInitialValues({});
   return ThemeController(await SharedPreferences.getInstance());
+}
+
+Future<void> _pumpComposerBar(
+  WidgetTester tester,
+  ThemeController theme,
+  ChatViewModel vm,
+) async {
+  await tester.pumpWidget(
+    _app(
+      theme,
+      Scaffold(
+        body: Align(
+          alignment: Alignment.bottomCenter,
+          child: ChatInputBar(
+            vm: vm,
+            onStartCall: (_) {},
+            onMessageSent: () {},
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
 }
 
 Widget _app(ThemeController theme, Widget home) {
