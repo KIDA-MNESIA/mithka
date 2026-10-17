@@ -105,6 +105,9 @@ class _SenderInfo {
   final MemberRole role;
   final String? title;
   final bool isPremium;
+
+  /// TDLib reported `userTypeDeleted`: the account no longer exists, so it has
+  /// no profile to open and nothing to report.
   final bool isDeleted;
   final int accentColorId;
   final int emojiStatusId;
@@ -239,12 +242,16 @@ class MessageReactionUser {
     required this.title,
     this.photo,
     this.date = 0,
+    this.isDeleted = false,
   });
 
   final int senderId;
   final String title;
   final TdFileRef? photo;
   final int date;
+
+  /// The account behind the reaction no longer exists.
+  final bool isDeleted;
 }
 
 class BotCommandOption {
@@ -3439,6 +3446,21 @@ class ChatViewModel extends ChangeNotifier {
 
   Future<void> reportMessage(ChatMessage message) async {
     await _reportTelegramContent(message);
+  }
+
+  /// Reports one sender's reaction on a message. The caller must have checked
+  /// the message's `can_report_reactions` property first; the write stays on
+  /// the client that owns this pane, so a dialog confirmed after an account
+  /// switch cannot report into the replacement account.
+  Future<void> reportReaction(ChatMessage message, int senderId) async {
+    await _client.queryTo({
+      '@type': 'reportMessageReactions',
+      'chat_id': chatId,
+      'message_id': message.id,
+      'sender_id': senderId > 0
+          ? {'@type': 'messageSenderUser', 'user_id': senderId}
+          : {'@type': 'messageSenderChat', 'chat_id': senderId},
+    }, _accountClientId);
   }
 
   Future<void> blockSender(ChatMessage message) async {
@@ -6903,6 +6925,36 @@ class ChatViewModel extends ChangeNotifier {
     }
   }
 
+  /// Whether Telegram allows reporting a reaction on [messageId]
+  /// (`messageProperties.can_report_reactions`).
+  ///
+  /// This is a property of the message, not a field of the `message` object:
+  /// the pinned TDLib schema returns it only from `getMessageProperties`, and
+  /// `reportMessageReactions` depends on that same property. Fail closed — an
+  /// error or a switch away from this pane's account hides the action.
+  Future<bool> canReportMessageReactions(int messageId) async {
+    try {
+      final properties = await _client.queryTo({
+        '@type': 'getMessageProperties',
+        'chat_id': chatId,
+        'message_id': messageId,
+      }, _accountClientId);
+      if (_isDisposed || !isAccountCurrent) return false;
+      return properties.boolean('can_report_reactions') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// True while the client this pane was opened on is still the active one.
+  /// Destructive actions confirmed through a dialog re-check this after the
+  /// await so the write cannot land on a replacement account.
+  bool get isAccountCurrent =>
+      !_isDisposed &&
+      _accountClientId > 0 &&
+      _client.activeClientId == _accountClientId &&
+      _client.activeSlot == _accountSlot;
+
   /// Whether Telegram offers a shareable HTTPS link for [messageId]
   /// (`messageProperties.can_get_link`). Offline per the pinned schema, but
   /// still fail-closed: a property error hides the action, mirroring how the
@@ -7022,6 +7074,7 @@ class ChatViewModel extends ChangeNotifier {
           title: info.name,
           photo: info.photo,
           date: item.integer('date') ?? 0,
+          isDeleted: info.isDeleted,
         ),
       );
     }

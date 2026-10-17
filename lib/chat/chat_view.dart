@@ -37,6 +37,7 @@ import '../channels/topic_navigation.dart';
 import '../chats/search_token_views.dart';
 import '../communities/community_models.dart';
 import '../communities/community_view.dart';
+import '../components/app_confirm_dialog.dart';
 import '../components/app_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -6102,14 +6103,74 @@ class _ChatViewState extends State<ChatView> {
     MessageReaction reaction,
   ) async {
     if (!mounted || message.reactions.isEmpty) return;
+    // `can_report_reactions` is a messageProperties field, not a field of the
+    // message. Start the hydrated permission alongside the sheet so the report
+    // action appears only after TDLib granted it, and fails closed otherwise.
+    final reportPermission = _vm.canReportMessageReactions(message.id);
     await showReactionUsersModal<void>(
       context,
       builder: (dialogContext) => _ReactionUsersSheet(
         viewModel: _vm,
         message: message,
         initialReaction: reaction,
+        reportPermission: reportPermission,
+        onOpenSender: _openReactionSender,
+        onReportSender: (user) => _reportReactionSender(message, user),
       ),
     );
+  }
+
+  /// Opens the profile of a user who reacted, or the chat when the reaction
+  /// was sent by a chat. A deleted account has neither.
+  void _openReactionSender(MessageReactionUser user) {
+    final senderId = user.senderId;
+    if (user.isDeleted || senderId == 0) return;
+    // The list is left either way: it belongs to the message behind it, and
+    // keeping it alive under a pushed profile leaves a stale sheet to come
+    // back to.
+    Navigator.of(context).pop();
+    if (senderId > 0) {
+      _openUserProfile(senderId, user.title);
+      return;
+    }
+    if (senderId == widget.chatId) {
+      unawaited(_openChatInfo(title: user.title, useAppPageRoute: true));
+      return;
+    }
+    unawaited(
+      openChatFromCurrentWindow(context, chatId: senderId, title: user.title),
+    );
+  }
+
+  Future<void> _reportReactionSender(
+    ChatMessage message,
+    MessageReactionUser user,
+  ) async {
+    if (user.isDeleted) return;
+    if (user.senderId == _vm.meId) return;
+    final confirmed = await showAppConfirmDialog(
+      context,
+      title: AppStrings.t(AppStringKeys.chatReactionReportTitle),
+      message: AppStrings.t(AppStringKeys.chatReactionReportMessage, {
+        'value1': user.title,
+      }),
+      confirmText: AppStrings.t(AppStringKeys.chatReportConfirm),
+      destructive: true,
+    );
+    // The permission and the write belong to the pane's own account: a switch
+    // while the dialog was open must drop the report entirely.
+    if (!mounted || !confirmed || !_vm.isAccountCurrent) return;
+    try {
+      await _vm.reportReaction(message, user.senderId);
+      if (!mounted) return;
+      showToast(context, AppStringKeys.chatReactionReportSent);
+    } catch (e) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.chatReactionReportFailed, {'value1': e}),
+      );
+    }
   }
 
   Future<bool> _translateMessage(
@@ -11351,19 +11412,31 @@ class _ReactionUsersSheet extends StatefulWidget {
     required this.viewModel,
     required this.message,
     required this.initialReaction,
+    required this.reportPermission,
+    required this.onOpenSender,
+    required this.onReportSender,
   });
 
   final ChatViewModel viewModel;
   final ChatMessage message;
   final MessageReaction initialReaction;
 
+  /// `messageProperties.can_report_reactions` for [message], resolved when the
+  /// sheet opens. Hidden until true and never resurrected by a late answer.
+  final Future<bool> reportPermission;
+  final ValueChanged<MessageReactionUser> onOpenSender;
+  final ValueChanged<MessageReactionUser> onReportSender;
+
   @override
   State<_ReactionUsersSheet> createState() => _ReactionUsersSheetState();
 }
 
+enum _ReactionUserAction { report }
+
 class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   late MessageReaction _selected;
   final Map<String, Future<List<MessageReactionUser>>> _loads = {};
+  bool _allowReport = false;
 
   @override
   void initState() {
@@ -11373,6 +11446,13 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
       (reaction) => _reactionKey(reaction) == initialKey,
       orElse: () => widget.message.reactions.first,
     );
+    unawaited(_loadReportPermission());
+  }
+
+  Future<void> _loadReportPermission() async {
+    final allowed = await widget.reportPermission;
+    if (!mounted || !allowed) return;
+    setState(() => _allowReport = true);
   }
 
   Future<List<MessageReactionUser>> _load(MessageReaction reaction) {
@@ -11386,6 +11466,14 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   String _reactionKey(MessageReaction reaction) => reaction.customEmojiId != 0
       ? 'custom:${reaction.customEmojiId}'
       : 'emoji:${reaction.emoji ?? ''}';
+
+  bool _canReport(MessageReactionUser user) =>
+      _allowReport && !user.isDeleted && user.senderId != widget.viewModel.meId;
+
+  void _retrySelected() {
+    _loads.remove(_reactionKey(_selected));
+    setState(() {});
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -11466,6 +11554,43 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             ),
           );
         }
+        if (snapshot.hasError) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    AppStrings.t(AppStringKeys.chatReactionUsersLoadFailed),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 14, color: c.textSecondary),
+                  ),
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    key: const ValueKey('reaction-users-retry'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _retrySelected,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: c.searchFill,
+                        borderRadius: BorderRadius.circular(AppRadius.control),
+                      ),
+                      child: Text(
+                        AppStrings.t(AppStringKeys.chatReactionUsersRetry),
+                        style: TextStyle(fontSize: 14, color: c.textPrimary),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
         final users = snapshot.data ?? const <MessageReactionUser>[];
         if (users.isEmpty) {
           return Center(
@@ -11486,8 +11611,9 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
 
   Widget _reactionUserRow(AppColors c, MessageReactionUser user) {
     final time = DateText.listLabel(user.date);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+    final reportable = _canReport(user);
+    final row = Padding(
+      padding: EdgeInsets.fromLTRB(18, 9, reportable ? 6 : 18, 9),
       child: Row(
         children: [
           PhotoAvatar(title: user.title, photo: user.photo, size: 44),
@@ -11504,9 +11630,56 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             const SizedBox(width: 10),
             Text(time, style: TextStyle(fontSize: 12, color: c.textTertiary)),
           ],
+          if (reportable)
+            GestureDetector(
+              key: ValueKey('reactionUserReport-${user.senderId}'),
+              behavior: HitTestBehavior.opaque,
+              onTap: () => unawaited(_showUserActions(user)),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
+                child: AppIcon(
+                  HeroAppIcons.ellipsisVertical,
+                  size: 18,
+                  color: c.textTertiary,
+                ),
+              ),
+            ),
         ],
       ),
     );
+    if (user.isDeleted) return row;
+    return GestureDetector(
+      key: ValueKey('reactionUser-${user.senderId}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.onOpenSender(user),
+      child: row,
+    );
+  }
+
+  Future<void> _showUserActions(MessageReactionUser user) async {
+    final action = await showAppModalSheet<_ReactionUserAction>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: SettingsCard(
+          margin: const EdgeInsets.all(10),
+          children: [
+            SettingsRow(
+              key: const ValueKey('reaction-user-report-action'),
+              leading: const AppIcon(HeroAppIcons.triangleExclamation),
+              title: AppStrings.t(AppStringKeys.chatReactionReportAction),
+              titleColor: AppTheme.tagRed,
+              showChevron: false,
+              onTap: () =>
+                  Navigator.of(sheetContext).pop(_ReactionUserAction.report),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action != _ReactionUserAction.report) return;
+    widget.onReportSender(user);
   }
 
   Widget _reactionGlyph(MessageReaction reaction, Color color) {

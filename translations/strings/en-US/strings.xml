@@ -1046,6 +1046,14 @@
     <string name="chatPeopleDoingAction">{value1} people active…</string>
     <string name="chatPeopleTyping">{value1} people are typing…</string>
     <string name="chatPickerChooseChat">Choose a chat</string>
+    <string name="chatReactionReportAction">Report reaction</string>
+    <string name="chatReactionReportFailed">Could not report the reaction: {value1}</string>
+    <string name="chatReactionReportMessage">Report the reaction from {value1} as objectionable or abusive content?</string>
+    <string name="chatReactionReportSent">Reaction reported</string>
+    <string name="chatReactionReportTitle">Report reaction?</string>
+    <string name="chatReactionUsersCount">Show {value1} reactions</string>
+    <string name="chatReactionUsersLoadFailed">Could not load reactions</string>
+    <string name="chatReactionUsersRetry">Try again</string>
     <string name="chatReportConfirm">Report</string>
     <string name="chatReportFailed">Could not send report: {value1}</string>
     <string name="chatReportMessage">Report this message as objectionable or abusive content?</string>

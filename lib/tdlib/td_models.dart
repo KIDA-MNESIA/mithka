@@ -820,6 +820,7 @@ class ChatMessage {
   List<MessageTextEntity> restrictedContentTextEntities;
   bool containsUnreadMention;
   bool hasUnreadReactions;
+
   int? senderId;
   TdFileRef? senderPhoto;
   TdFileRef? image; // photo / sticker / video-thumb / gif

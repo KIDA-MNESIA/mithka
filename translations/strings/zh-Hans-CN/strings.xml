@@ -1044,6 +1044,14 @@
     <string name="chatPeopleDoingAction">{value1} 人正在操作…</string>
     <string name="chatPeopleTyping">{value1} 人正在输入…</string>
     <string name="chatPickerChooseChat">选择聊天</string>
+    <string name="chatReactionReportAction">举报回应</string>
+    <string name="chatReactionReportFailed">无法举报该回应：{value1}</string>
+    <string name="chatReactionReportMessage">将 {value1} 的回应举报为不当或滥用内容？</string>
+    <string name="chatReactionReportSent">已举报回应</string>
+    <string name="chatReactionReportTitle">举报回应？</string>
+    <string name="chatReactionUsersCount">显示 {value1} 个回应</string>
+    <string name="chatReactionUsersLoadFailed">无法加载回应</string>
+    <string name="chatReactionUsersRetry">重试</string>
     <string name="chatReportConfirm">举报</string>
     <string name="chatReportFailed">无法发送举报：{value1}</string>
     <string name="chatReportMessage">将此消息举报为令人反感或滥用内容？</string>
