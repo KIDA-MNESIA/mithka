@@ -55,6 +55,12 @@ jobs:
       - name: Run unit and widget tests
         run: flutter test --concurrency=4
 
+      - name: Verify the message-history mirror against every define state
+        run: |
+          flutter test test/message_history_gate_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=false
+          flutter test test/message_history_gate_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=true --dart-define=EXPECT_TOS_VIOLATIONS=true
+          flutter test test/message_history_gate_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=invalid
+
       - name: Verify Telegram API Terms compile-time gate
         run: |
           flutter test test/build_flags_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=false
