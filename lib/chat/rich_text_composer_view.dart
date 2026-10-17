@@ -3363,8 +3363,8 @@ class _RichTextComposerViewState extends State<RichTextComposerView> {
                   _inlineFormatMark(action),
                   style: AppTextStyle.caption(foreground).copyWith(
                     fontWeight: action == _RichInlineFormatAction.bold
-                        ? FontWeight.w700
-                        : FontWeight.w600,
+                        ? FontWeight.w600
+                        : FontWeight.w500,
                     fontStyle: action == _RichInlineFormatAction.italic
                         ? FontStyle.italic
                         : null,
