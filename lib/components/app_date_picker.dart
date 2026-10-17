@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 import 'package:intl/intl.dart';
 
 import '../l10n/app_localizations.dart';
@@ -26,7 +26,7 @@ Future<DateTime?> showAppDatePicker(
     context: context,
     barrierDismissible: true,
     barrierLabel: AppStrings.t(AppStringKeys.confirmCancel),
-    barrierColor: Colors.black.withValues(alpha: 0.52),
+    barrierColor: const Color(0xFF000000).withValues(alpha: 0.52),
     transitionDuration: AppMotion.duration(context, AppMotion.responsive),
     transitionBuilder: AppMotion.dialogTransition,
     pageBuilder: (dialogContext, _, _) => _AppDatePickerDialog(
@@ -240,7 +240,7 @@ class _AppDatePickerDialogState extends State<_AppDatePickerDialog> {
                     '$day',
                     style: AppTextStyle.bodyLarge(
                       selected
-                          ? Colors.white
+                          ? const Color(0xFFFFFFFF)
                           : enabled
                           ? c.dialogText
                           : c.textTertiary.withValues(alpha: 0.4),

@@ -491,9 +491,9 @@ class ChatMessageSearchController extends ChangeNotifier {
   /// own message (inclusive upper bound); that echo is skipped when scoring.
   ///
   /// The walk must prove that nothing earlier in the day exists: it succeeds
-  /// only on a message older than the day, an empty history page, or a
-  /// page shorter than the requested limit whose oldest message is the cursor
-  /// itself (the chat's history ends at the cursor). A page that returns only
+  /// only on a message older than the day, an empty history page, or the
+  /// smallest possible server message id. A short cursor-only page is not
+  /// proof of exhaustion. A page that returns only
   /// newer messages (ignoring the inclusive bound), a page with no usable
   /// message, or a transport error leaves the day unresolved:
   /// [DateLookupResult.message] is null and [DateLookupResult.emptyDay] is
