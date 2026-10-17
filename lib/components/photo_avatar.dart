@@ -340,6 +340,7 @@ class _PhotoAvatarState extends State<PhotoAvatar> with WidgetsBindingObserver {
         oldWidget.photo?.hasAnimation != widget.photo?.hasAnimation ||
         oldWidget.photo?.photoId != widget.photo?.photoId ||
         oldWidget.allowAnimation != widget.allowAnimation ||
+        oldWidget.isDeleted != widget.isDeleted ||
         _animationSlot != TdClient.shared.activeSlot) {
       _updateAnimationEligibility(forceReload: true);
     }
@@ -467,6 +468,14 @@ class _PhotoAvatarState extends State<PhotoAvatar> with WidgetsBindingObserver {
         await controller.setLooping(true);
         await controller.setVolume(0);
         disableLoopingMediaAudioTracks(controller);
+        // Initialization is a native callback: a deletion, slot switch or
+        // disposal may have invalidated this load while it was in flight.
+        if (!mounted ||
+            generation != _animationGeneration ||
+            slot != TdClient.shared.activeSlot) {
+          await controller.dispose();
+          return;
+        }
         await controller.play();
       } catch (_) {
         await controller.dispose();
