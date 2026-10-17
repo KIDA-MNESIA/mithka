@@ -61,8 +61,9 @@ import 'desktop_navigation_rail.dart';
 import 'desktop_utility_window.dart';
 import 'detail_content_reveal.dart';
 import 'horizontal_safe_viewport.dart';
-import 'liquid_glass_bottom_bar.dart';
-import 'native_bottom_tab_bar.dart';
+import 'liquid_glass_bottom_bar.dart'
+    show GlassSelectionIndicator, LiquidGlassBottomBar;
+import 'native_glass_surface.dart';
 import 'primary_chat_launcher.dart';
 import 'unread_badge_model.dart';
 
@@ -1271,11 +1272,6 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                         unread: _unread.countFor(
                                           theme.unreadBadgeMode,
                                         ),
-                                        // The system glass bar measures itself
-                                        // against the window bottom, not this
-                                        // sidebar column; draw the app glass
-                                        // whose indicator follows the tabs.
-                                        useNativeGlass: false,
                                       ),
                                     ),
                                   ),
@@ -2164,7 +2160,6 @@ class _MainBottomBar extends StatelessWidget {
     required this.items,
     required this.unread,
     this.chatListController,
-    this.useNativeGlass = true,
   });
   final int selection;
   final ValueChanged<int> onSelect;
@@ -2172,13 +2167,6 @@ class _MainBottomBar extends StatelessWidget {
   final List<_MainTabItem> items;
   final int unread;
   final ChatListController? chatListController;
-
-  /// The system glass bar is a window-bottom bar: UIKit paints its selection
-  /// capsule to its own slot metrics, so a split shell hosting it inside a
-  /// narrow sidebar column misplaces the highlight over the tabs. Split-shell
-  /// callers opt out to draw the app-owned glass bar instead, whose indicator
-  /// follows the actual tab slots.
-  final bool useNativeGlass;
 
   /// Label size the bar is laid out around. The icon block above it keeps its
   /// size at every text scale, so only this line's growth is added to the bar.
@@ -2273,26 +2261,6 @@ class _MainBottomBar extends StatelessWidget {
             ],
           ),
         ),
-      );
-    }
-    if (glass &&
-        useNativeGlass &&
-        !kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.iOS) {
-      return NativeBottomTabBar(
-        items: [
-          for (final item in items)
-            NativeBottomTabItem(
-              id: item.index,
-              label: item.label.l10n(context),
-              icon: item.icon,
-            ),
-        ],
-        selection: selection,
-        unread: unread,
-        unreadLabel: theme.unreadBadgeOverflowMode.format(unread),
-        onSelect: onSelect,
-        onClearUnread: onClearUnread,
       );
     }
     final labelGrowth = math.max(
@@ -2406,6 +2374,42 @@ class _MainBottomBar extends StatelessWidget {
       ),
     );
     if (glass) {
+      // iOS hosts the real Liquid Glass: a native surface draws only the glass
+      // (public UIGlassEffect on iOS 26+, system material blur before), while
+      // the app-owned row, its selection pill, and every gesture stay in
+      // Flutter above the surface — one geometry source in any host, window
+      // bottom bar or sidebar column. The Flutter glass bar remains the
+      // fallback for every other target.
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        // A platform view has no insets of its own, so the host repeats the
+        // exact containment chain the Flutter glass bar applies: the surface
+        // stops at the bottom safe area instead of reaching under the home
+        // indicator, and the shared lateral/top/capsule margins keep the row
+        // inside the stadium at the same rect either host draws it at.
+        return SafeArea(
+          top: false,
+          minimum: const EdgeInsets.only(bottom: 10),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+            child: NativeGlassSurface(
+              child: Padding(
+                padding: const EdgeInsets.all(5),
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: GlassSelectionIndicator(
+                        selection: selection,
+                        itemCount: items.length,
+                      ),
+                    ),
+                    controls,
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      }
       return LiquidGlassBottomBar(
         selection: selection,
         itemCount: items.length,
