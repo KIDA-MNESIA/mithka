@@ -2293,6 +2293,10 @@ abstract final class AppStringKeys {
   static const privacyAddExceptions = 'privacyAddExceptions';
   static const privacyAddUsers = 'privacyAddUsers';
   static const privacyAlwaysShareWith = 'privacyAlwaysShareWith';
+  static const privacyAutoRevealRestrictedMedia =
+      'privacyAutoRevealRestrictedMedia';
+  static const privacyAutoRevealRestrictedMediaHint =
+      'privacyAutoRevealRestrictedMediaHint';
   static const privacyBio = 'privacyBio';
   static const privacyBirthDate = 'privacyBirthDate';
   static const privacyBlockedUsers = 'privacyBlockedUsers';
