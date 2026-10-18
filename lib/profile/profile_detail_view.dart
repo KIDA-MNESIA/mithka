@@ -352,6 +352,38 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
     unawaited(openChatFromCurrentWindow(context, chatId: cid, title: _name));
   }
 
+  /// Resolves a typed `@username` from the bio to its person and opens that
+  /// profile. The entity carries no user id, so a public-chat lookup supplies
+  /// it; anything that is not a private chat keeps the public-link behavior.
+  Future<void> _openUsernameProfile(String username) async {
+    final Map<String, dynamic> chat;
+    try {
+      chat = await TdClient.shared.query({
+        '@type': 'searchPublicChat',
+        'username': username,
+      });
+    } catch (_) {
+      if (mounted) {
+        showToast(context, AppStringKeys.linkHandlerOpenTelegramLinkFailed);
+      }
+      return;
+    }
+    if (!mounted) return;
+    final type = chat.obj('type');
+    final userId = type?.int64('user_id');
+    if (type?.str('@type') == 'chatTypePrivate' && userId != null) {
+      unawaited(
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => ProfileDetailView(userId: userId, name: username),
+          ),
+        ),
+      );
+      return;
+    }
+    await openLink(context, 'https://t.me/$username');
+  }
+
   Future<void> _startSecretChat() async {
     if (_isMe || _isBot || _isDeleted || _isCreatingSecretChat) return;
     final confirmed = await confirmDialog(
@@ -1033,6 +1065,8 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
                           ),
                         );
                       },
+                      onUsernameTap: (username) =>
+                          unawaited(_openUsernameProfile(username)),
                     ),
                   ),
                 ),
