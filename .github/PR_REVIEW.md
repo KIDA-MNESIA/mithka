@@ -11,8 +11,15 @@ patches, bounded head/master source, human review/comment feedback, unresolved
 threads and current CI. It uses the current master `AGENTS.md`, not instructions
 provided by a PR. Prior change requests are revisited on updated evidence.
 
-The first LLM reviews the code. A `ready` answer gets an independent challenge
-pass before it can become a merge candidate. Both passes must return complete,
+The first LLM reviews the code. Both `ready` and source-grounded `request_changes`
+answers get an independent challenge pass. A finding must quote current-head
+code at an exact line; the controller mechanically verifies it against head
+source or the added/context side of the current patch. Prior-review claims and
+removed code are not current evidence. Unverifiable findings are downgraded to
+human review, not asserted as blockers. A quotation proves location, not the
+model's reasoning; a maintainer still needs to review the code.
+
+Before a merge candidate is selected, both passes must return complete,
 consistent JSON, agree on the allowed Terms classification, and report no
 remaining findings. Models give advice in one updated bot comment; they never
 create GitHub approvals, execute commands, modify PR code or close PRs.
@@ -128,6 +135,7 @@ git diff --check
 
 The regression suite covers exact-head identity/approval, dismissal, spoofing,
 checklist/Terms gates, CI provenance, source completeness, prompt-injection data
-boundaries, free-only routing, provider/JSON failures, duplicate suppression,
+boundaries, mechanically grounded current-head citations (not removed or
+historical code), free-only routing, provider/JSON failures, duplicate suppression,
 two-pass decisions, in-flight ownership changes, exact merge parents, normal
 push races, authoritative state readback and Quality-only post-merge dispatch.

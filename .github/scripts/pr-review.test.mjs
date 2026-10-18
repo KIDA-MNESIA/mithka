@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import {
   REPOSITORY, OWNER, BOT_ID, MARKER, GitHub, redact, templateGate,
   hasOwnerApproval, manualPath, deterministicGates, validateDecision,
-  combinedReady, openRouterRequest, collectSnapshot, fingerprint,
+  combinedReady, openRouterRequest, collectSnapshot, fingerprint, patchHeadLines, groundFindings,
   buildContext, askModel, report, reviewAll, publishMerge, verifyTestedResult,
 } from './pr-review.mjs';
 
@@ -197,6 +197,30 @@ test('two complete, agreeing reviews and the correct classification are necessar
   assert.equal(combinedReady([decision(), decision()], 'compliant_unchanged', false), false);
 });
 
+test('removed-side and prior-review quotations cannot masquerade as current-head findings', () => {
+  const patch = '@@ -20,3 +30,3 @@\n-oldEightPassLoop();\n+newCancellableDrain();\n unchangedContext();\n nextContextLine();';
+  const lines = patchHeadLines(patch);
+  assert.equal(lines.get(30), 'newCancellableDrain();');
+  assert.equal(lines.get(31), 'unchangedContext();');
+  const context = { files: [{ path: 'lib/example.dart', patch }] };
+  const result = { ...ready(), decision: 'request_changes', complete_review: false, findings: [
+    { priority: 'P2', path: 'lib/example.dart', line: 30, quote: 'oldEightPassLoop();', message: 'A historical claim.' },
+  ] };
+  assert.throws(() => groundFindings(result, context), /current-head code/);
+  result.findings[0].quote = 'newCancellableDrain();';
+  assert.equal(groundFindings(validateDecision(result, ['lib/example.dart']), context), result);
+  result.findings[0].line = 31;
+  assert.throws(() => groundFindings(result, context), /current-head code/);
+});
+
+test('full-head source citations need the exact line and contiguous current code', () => {
+  const context = { files: [{ path: 'lib/example.dart', head: { text: 'firstLine();\n  await currentWrite();\n  nextWrite();\n' } }] };
+  const result = { findings: [{ path: 'lib/example.dart', line: 2, quote: 'await currentWrite();\n  nextWrite();' }] };
+  assert.equal(groundFindings(result, context), result);
+  result.findings[0].quote = 'await oldWrite();';
+  assert.throws(() => groundFindings(result, context), /current-head code/);
+});
+
 test('the API request is free-only with zero prices, no tools, plugins or paid fallback', () => {
   const request = openRouterRequest([]);
   assert.equal(request.model, 'openrouter/free');
@@ -342,6 +366,31 @@ test('a dissenting second review blocks merge; first ready is not sufficient', a
   const dissent = { ...ready(), decision: 'needs_human', complete_review: false };
   t.mock.method(globalThis, 'fetch', async () => response(++calls === 1 ? ready() : dissent));
   assert.equal(await reviewAll(api, { number: '7', key: 'test', policy: 'policy' }), null);
+});
+
+test('change requests require grounded source and an independent challenge, not old review prose', async t => {
+  const api = fixtureApi(); api.source = 'currentBehavior();\n';
+  const finding = { priority: 'P2', path: 'lib/example.dart', line: 1, quote: 'currentBehavior();', message: 'Concrete current behavior needs a regression.' };
+  const change = { ...ready(), decision: 'request_changes', findings: [finding] };
+  let calls = 0; t.mock.method(globalThis, 'fetch', async () => { calls++; return response(change); });
+  assert.equal(await reviewAll(api, { number: '7', key: 'test-key', policy: 'policy' }), null);
+  assert.equal(calls, 2);
+  const posted = api.calls.find(call => call.body?.body?.includes('Automated PR review')).body.body;
+  assert.match(posted, /recommendation: \*\*request_changes\*\*/);
+  assert.match(posted, /Current-head citation/);
+});
+
+test('unverifiable stale LLM findings are downgraded and not asserted in the posted review', async t => {
+  const api = fixtureApi(); api.source = 'currentBehavior();\n';
+  const stale = { ...ready(), decision: 'request_changes', summary: 'The old eight-pass defect remains.', findings: [
+    { priority: 'P2', path: 'lib/example.dart', line: 1, quote: 'oldEightPassLoop();', message: 'The old defect is present.' },
+  ] };
+  t.mock.method(globalThis, 'fetch', async () => response(stale));
+  assert.equal(await reviewAll(api, { number: '7', key: 'test-key', policy: 'policy' }), null);
+  const posted = api.calls.find(call => call.body?.body?.includes('Automated PR review')).body.body;
+  assert.match(posted, /recommendation: \*\*needs_human\*\*/);
+  assert.ok(!posted.includes('The old eight-pass defect remains'));
+  assert.match(posted, /no blocking finding is asserted/);
 });
 
 test('quota failure posts a bounded manual-review result, never grants eligibility', async t => {
