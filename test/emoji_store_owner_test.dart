@@ -61,6 +61,21 @@ void main() {
     CustomEmojiCenter.shared.reset();
   });
 
+  test('an ownerless load stays lazy until an account is available', () async {
+    _client.debugSetActiveAccountForTesting(0, 0);
+    EmojiStore.shared.loadIfNeeded();
+    await _settleStore();
+    expect(_registry.calls, isEmpty);
+
+    final only = _addAccount(premium: true, packs: const [_alpha]);
+    _client.setActive(only.slot);
+    EmojiStore.shared.loadIfNeeded();
+    await _settleStore();
+
+    expect(EmojiStore.shared.customPacks.map((pack) => pack.id), [_alpha.id]);
+    expect(_registry.callsTo('getOption', only.clientId), 1);
+  });
+
   testWidgets('a stale pack completion never replaces the new account picker', (
     tester,
   ) async {

@@ -61,7 +61,6 @@ class EmojiStore extends ChangeNotifier {
 
   void loadIfNeeded() {
     if (_loaded) return;
-    _loaded = true;
     // Starting a load supersedes every older one, including a load for this
     // same account that is still in flight.
     final generation = ++_loadGeneration;
@@ -69,6 +68,7 @@ class EmojiStore extends ChangeNotifier {
     // Nothing to pin (no signed-in account, or a slot whose client was
     // replaced mid-read): leave the store lazy rather than guess an account.
     if (owner == null) return;
+    _loaded = true;
     _load(owner, generation);
   }
 
