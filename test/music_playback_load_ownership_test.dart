@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter_sound/flutter_sound.dart' show PlayerState;
 // The fake native stack extends the platform interface's method-channel
 // implementation; it is a transitive dependency of flutter_sound.
@@ -395,5 +396,33 @@ void main() {
       );
     },
     timeout: const Timeout(Duration(seconds: 20)),
+  );
+
+  test(
+    'an account switch during native preparation cancels the start',
+    () async {
+      const fileId = 710005;
+      final local = downloadedFile('$fileId');
+      TdClient.shared.setActive(oldSlot);
+      TdFileCenter.shared.rememberForTest(oldSlot, fileId, local.path);
+      final activation = Completer<AudioSession?>();
+      final voice = VoicePlayer()
+        ..audioSessionActivationOverride = (() => activation.future);
+      addTearDown(voice.dispose);
+      final load = voice.toggleAudio(TdFileRef(id: fileId));
+      for (var turn = 0; turn < 100 && !voice.isPlaying; turn++) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(voice.isPlaying, isTrue, reason: 'native preparation is pending');
+      expect(platform.startedUris, isEmpty);
+
+      TdClient.shared.setActive(newSlot);
+      activation.complete(null);
+      await load;
+
+      expect(platform.startedUris, isEmpty);
+      expect(allDownloads(), isEmpty);
+      await voice.stop();
+    },
   );
 }

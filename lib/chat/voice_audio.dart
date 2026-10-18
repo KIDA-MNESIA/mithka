@@ -659,6 +659,7 @@ class VoicePlayer extends ChangeNotifier {
       audioReady: audioReady,
       generation: _playbackGeneration,
       path: path,
+      isLoadCurrent: () => _loadIsCurrent(file.id, owner, loadGeneration),
     );
   }
 
@@ -703,6 +704,7 @@ class VoicePlayer extends ChangeNotifier {
     required Codec codec,
     required int generation,
     required String path,
+    required bool Function() isLoadCurrent,
     Future<AudioSession?>? audioReady,
   }) async {
     isPlaying = true;
@@ -721,6 +723,10 @@ class VoicePlayer extends ChangeNotifier {
       if (ready == null) {
         debugPrint('VoicePlayer: audio session inactive, starting anyway');
       }
+      // Pause and account changes can land after the path resolves but before
+      // audio-session preparation finishes. They cancel the pending start,
+      // without invalidating the finish callback of an already-playing track.
+      if (!isLoadCurrent()) return;
       // The await above straddles user actions and native recovery. A stop,
       // a dispose, another load or a retirement during it must cancel this
       // start before it touches the native player: the captured path may
@@ -840,8 +846,10 @@ class VoicePlayer extends ChangeNotifier {
     _loadGeneration++;
     final player = _player;
     if (player == null || !player.isPlaying) {
-      if (isLoading) {
+      if (isLoading || isPlaying) {
         isLoading = false;
+        isPlaying = false;
+        _syncPolling();
         notifyListeners();
       }
       return;
