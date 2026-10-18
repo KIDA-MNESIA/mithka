@@ -5613,6 +5613,8 @@ class _ChatViewState extends State<ChatView> {
 
   Future<void> _perform(MessageAction action, ChatMessage message) async {
     final selectedQuote = _actionQuote;
+    final canReplyInCurrentChat =
+        _vm.canSendMessages && _actionCanReply == true;
     setState(() {
       _actionTarget = null;
       _actionQuote = null;
@@ -5638,11 +5640,12 @@ class _ChatViewState extends State<ChatView> {
       case MessageAction.displayTranslation:
         setState(() => _showOriginalTranslationMessageIds.remove(message.id));
       case MessageAction.reply:
-        if (_vm.isChannel && _vm.hasLinkedDiscussion && !_vm.canSendMessages) {
-          // This channel takes no messages of its own, so the reply is a
-          // comment in the linked group. Open the thread there instead of
-          // arming a reply the composer here can never send; the sheet shows
-          // the group's own state, including when it refuses messages.
+        if (_vm.isChannel &&
+            _vm.hasLinkedDiscussion &&
+            !canReplyInCurrentChat) {
+          // A channel composer does not override the message's same-chat
+          // reply permission. When either is unavailable, answer in the
+          // linked group instead; its sheet applies that group's permissions.
           await _openMessageComments(message);
         } else if (selectedQuote != null && _vm.canQuoteText) {
           await _quoteMessageText(message, selectedQuote: selectedQuote);
@@ -11064,7 +11067,7 @@ class _ChatViewState extends State<ChatView> {
       isPinned: _vm.pinnedMessage?.id == target.id,
       allowForwarding: _vm.canForwardContent,
       allowTranslation: _hasAvailableTranslationOption,
-      allowQuote: _vm.canQuoteText,
+      allowQuote: _vm.canQuoteText && _actionCanReply == true,
       // A channel post is answered in its linked discussion group, so a
       // channel that has one keeps Reply even when the channel itself takes no
       // messages — the comments sheet, which speaks for the group, decides

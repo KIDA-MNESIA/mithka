@@ -8,6 +8,7 @@ import 'package:mithka/chat/chat_view.dart'
     show ChatView, clearChatMemoryCaches;
 import 'package:mithka/chat/message_action_menu.dart' show MessageActionSource;
 import 'package:mithka/chat/message_bubble.dart' show MessageBubble;
+import 'package:mithka/chat/sticker_store.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/translation_controller.dart';
 import 'package:mithka/tdlib/td_client.dart';
@@ -101,6 +102,7 @@ void main() {
   late bool canGetLink;
   var canBeReplied = true;
   var channelChat = false;
+  var channelOwner = false;
   var linkedDiscussion = false;
   setUpAll(() {
     TdClient.shared.configureProxy(
@@ -155,7 +157,13 @@ void main() {
               '@type': 'supergroup',
               'id': -_chatId - 1000000000000,
               'is_channel': channelChat,
-              if (channelChat) 'status': {'@type': 'chatMemberStatusMember'},
+              if (channelChat)
+                'status': {
+                  '@type': channelOwner
+                      ? 'chatMemberStatusCreator'
+                      : 'chatMemberStatusMember',
+                  if (channelOwner) 'is_member': true,
+                },
             },
             'getSupergroupFullInfo' => {
               '@type': 'supergroupFullInfo',
@@ -200,6 +208,7 @@ void main() {
     canGetLink = true;
     canBeReplied = true;
     channelChat = false;
+    channelOwner = false;
     linkedDiscussion = false;
     clipboard.clear();
     clipboardCompletion = null;
@@ -493,6 +502,85 @@ void main() {
       await tester.pump(const Duration(seconds: 6));
     }
   });
+
+  testWidgets(
+    'a channel owner cannot quote a post that forbids same-chat replies',
+    (tester) async {
+      channelChat = true;
+      channelOwner = true;
+      linkedDiscussion = true;
+      canBeReplied = false;
+      await openMenuOnMessage(tester);
+      try {
+        expect(
+          find.byKey(const ValueKey('message-action-reply')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('message-action-quote')),
+          findsNothing,
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(seconds: 6));
+      }
+    },
+  );
+
+  testWidgets(
+    'a channel owner replies in discussion when same-chat replies are forbidden',
+    (tester) async {
+      StickerStore.shared.reset();
+      channelChat = true;
+      channelOwner = true;
+      linkedDiscussion = true;
+      canBeReplied = false;
+      await openMenuOnMessage(tester);
+      try {
+        await tester.tap(find.byKey(const ValueKey('message-action-reply')));
+        for (var i = 0; i < 12; i++) {
+          await tester.pump(const Duration(milliseconds: 120));
+        }
+        expect(
+          requests.any((request) => request['@type'] == 'getMessageThread'),
+          isTrue,
+        );
+        expect(
+          find.byKey(const ValueKey('messageRepliesComposer')),
+          findsOneWidget,
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(seconds: 6));
+      }
+    },
+  );
+
+  testWidgets(
+    'a channel owner can quote a post with same-chat reply permission',
+    (tester) async {
+      channelChat = true;
+      channelOwner = true;
+      linkedDiscussion = true;
+      await openMenuOnMessage(tester);
+      try {
+        expect(
+          find.byKey(const ValueKey('message-action-reply')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('message-action-quote')),
+          findsOneWidget,
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(seconds: 6));
+      }
+    },
+  );
 
   testWidgets('a read-only channel with no discussion group offers no Reply', (
     tester,
