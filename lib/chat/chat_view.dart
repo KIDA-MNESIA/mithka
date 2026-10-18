@@ -1271,7 +1271,8 @@ class _ChatViewState extends State<ChatView> {
   MessageReactionAvailability? _actionReactionAvailability;
   int _actionReactionAvailabilityGeneration = 0;
   bool? _actionMessageLinkAvailable;
-  int _actionMessageLinkAvailabilityGeneration = 0;
+  bool? _actionCanReply;
+  int _actionPropertiesGeneration = 0;
   Offset?
   _actionAnchor; // overlay-space point the HUD grows from / collapses to
   Widget? _actionOverlaySnapshot; // last visible overlay, replayed during exit
@@ -5637,7 +5638,13 @@ class _ChatViewState extends State<ChatView> {
       case MessageAction.displayTranslation:
         setState(() => _showOriginalTranslationMessageIds.remove(message.id));
       case MessageAction.reply:
-        if (selectedQuote != null && _vm.canQuoteText) {
+        if (_vm.isChannel && _vm.hasLinkedDiscussion && !_vm.canSendMessages) {
+          // This channel takes no messages of its own, so the reply is a
+          // comment in the linked group. Open the thread there instead of
+          // arming a reply the composer here can never send; the sheet shows
+          // the group's own state, including when it refuses messages.
+          await _openMessageComments(message);
+        } else if (selectedQuote != null && _vm.canQuoteText) {
           await _quoteMessageText(message, selectedQuote: selectedQuote);
         } else {
           _vm.setReply(message);
@@ -10458,7 +10465,7 @@ class _ChatViewState extends State<ChatView> {
   ]) {
     EmojiStore.shared.loadIfNeeded();
     final reactionGeneration = ++_actionReactionAvailabilityGeneration;
-    final linkGeneration = ++_actionMessageLinkAvailabilityGeneration;
+    final propertiesGeneration = ++_actionPropertiesGeneration;
     final overlayBox =
         _actionOverlayKey.currentContext?.findRenderObject() as RenderBox?;
     final platform = Theme.of(context).platform;
@@ -10507,6 +10514,7 @@ class _ChatViewState extends State<ChatView> {
       _reactionTab = 'standard';
       _actionReactionAvailability = null;
       _actionMessageLinkAvailable = null;
+      _actionCanReply = null;
     });
     oldSelectionState?.selectableRegion.clearSelection();
     if (!message.isCall) {
@@ -10514,29 +10522,35 @@ class _ChatViewState extends State<ChatView> {
         _loadActionReactionAvailability(message.id, reactionGeneration),
       );
     }
-    unawaited(_loadActionMessageLinkAvailability(message.id, linkGeneration));
+    unawaited(_loadActionAvailability(message.id, propertiesGeneration));
   }
 
-  /// The link action appears only once the server confirms the message
-  /// carries one (`messageProperties.can_get_link`). While the offline
-  /// properties query is in flight the entry stays hidden, so the menu never
-  /// grows a row it would have to remove a moment later.
-  Future<void> _loadActionMessageLinkAvailability(
-    int messageId,
-    int generation,
-  ) async {
-    bool? available;
+  /// The link row appears only once the server confirms the message carries
+  /// one (`messageProperties.can_get_link`), and the reply row only once it
+  /// confirms a reply is accepted (`messageProperties.can_be_replied`). A
+  /// chat without a composer never gets one at all. While the offline
+  /// properties query is in flight both entries stay hidden, so the menu
+  /// never grows a row it would have to remove a moment later.
+  Future<void> _loadActionAvailability(int messageId, int generation) async {
+    bool? canGetLink;
+    bool? canBeReplied;
     try {
-      available = await _vm.canCopyMessageLink(messageId);
+      final availability = await _vm.messageActionAvailability(messageId);
+      canGetLink = availability.canGetLink;
+      canBeReplied = availability.canBeReplied;
     } catch (_) {
-      available = false; // Fail closed — no query answer, no action.
+      canGetLink = false; // Fail closed — no query answer, no action.
+      canBeReplied = false;
     }
     if (!mounted ||
-        generation != _actionMessageLinkAvailabilityGeneration ||
+        generation != _actionPropertiesGeneration ||
         _actionTarget?.id != messageId) {
       return;
     }
-    setState(() => _actionMessageLinkAvailable = available);
+    setState(() {
+      _actionMessageLinkAvailable = canGetLink;
+      _actionCanReply = canBeReplied;
+    });
   }
 
   Future<void> _loadActionReactionAvailability(
@@ -11051,6 +11065,17 @@ class _ChatViewState extends State<ChatView> {
       allowForwarding: _vm.canForwardContent,
       allowTranslation: _hasAvailableTranslationOption,
       allowQuote: _vm.canQuoteText,
+      // A channel post is answered in its linked discussion group, so a
+      // channel that has one keeps Reply even when the channel itself takes no
+      // messages — the comments sheet, which speaks for the group, decides
+      // whether this account can send and says so after it opens. Everywhere
+      // else a reply needs a composer here, and a message the server refuses
+      // to have replied to is dropped even where posting is allowed. Null
+      // while the properties query is in flight: fail closed, exactly like the
+      // link row.
+      allowReply:
+          (_vm.isChannel && _vm.hasLinkedDiscussion && !target.isService) ||
+          (_vm.canSendMessages && _actionCanReply == true),
       hasSelectedQuote: _actionQuote != null,
       allowSuggestedPostOffer:
           _vm.isDirectMessagesGroup && !_vm.isAdministeredDirectMessagesGroup,
