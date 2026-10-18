@@ -52,9 +52,12 @@ import 'call/call_overlay_host.dart';
 import 'chat/animated_sticker_view.dart';
 import 'chat/chat_view.dart';
 import 'chat/group_remark_controller.dart';
+import 'chat/link_preview_fixer.dart';
 import 'chat/music_player_controller.dart';
 import 'chats/chat_folder_tag_controller.dart';
 import 'components/drawer_controller.dart' as dc;
+import 'config/build_flags.dart';
+import 'history/message_history_store.dart';
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
 import 'media/video_playback_reporting.dart';
@@ -77,6 +80,7 @@ import 'settings/business_service.dart';
 import 'settings/country_message_filter.dart';
 import 'settings/desktop_hotkey_controller.dart';
 import 'settings/developer_mode_controller.dart';
+import 'settings/ghost_mode_controller.dart';
 import 'settings/hidden_sender_store.dart';
 import 'settings/keyword_blocker.dart';
 import 'settings/safety_notice_controller.dart';
@@ -246,10 +250,24 @@ Future<void> _bootstrapAndRunApp() async {
   ]);
   DesktopHotkeyController.initializeShared(prefs, replace: true);
   KeywordBlocker.shared.initialize(prefs);
+  LinkPreviewFixer.shared.initialize(prefs);
   HiddenSenderStore.shared.initialize(prefs);
   CountryMessageFilter.shared.initialize(prefs);
+  // Compile-time gated: reads persisted ghost-mode prefs and pushes the
+  // `online` TDLib option only in opted-in self-built binaries.
+  if (allowTelegramTosViolations) {
+    GhostModeController.shared.initialize(prefs);
+  }
   unawaited(SensitiveContentController.shared.initialize());
   MusicPlayerController.shared.initialize(prefs);
+  // Telegram §1.4 exception: the deleted/edited message mirror exists only in
+  // opted-in self-builds — with the flag off nothing is subscribed, read or
+  // written, and old saved state stays inert.
+  if (allowTelegramTosViolations) {
+    MessageHistoryStore.shared.initialize(prefs);
+    unawaited(MessageHistoryStore.shared.ensureLoaded());
+    MessageHistoryStore.shared.startObserving();
+  }
   // Preload Telegram blocked-user list so chat filters have data right away.
   unawaited(BlockedUserService.shared.loadBlockedUsers());
   // Firebase + analytics + Sentry tags are several platform-channel round
@@ -638,6 +656,9 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
         KeywordBlocker.shared.initialize(widget.prefs);
         HiddenSenderStore.shared.initialize(widget.prefs);
         CountryMessageFilter.shared.initialize(widget.prefs);
+        if (allowTelegramTosViolations) {
+          GhostModeController.shared.initialize(widget.prefs);
+        }
         MusicPlayerController.shared.initialize(widget.prefs);
         BlockedUserService.shared.enabled = nextTheme.hideBlockedUserMessages;
         if (nextTheme.hideBlockedUserMessages) {

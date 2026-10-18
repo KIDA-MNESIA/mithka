@@ -9,6 +9,7 @@
 import 'dart:async';
 import 'dart:math';
 
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:heroicons_flutter/heroicons_flutter.dart';
@@ -59,6 +60,7 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
   final VoicePlayer _player;
   late final MusicNowPlayingBridge _nowPlaying = MusicNowPlayingBridge(this);
   final Set<Object> _embeddedPlayerHosts = <Object>{};
+  final Set<Object> _dockedMiniPlayerHosts = <Object>{};
   SharedPreferences? _prefs;
   int _accountSlot = 0;
   int? _loadedSlot;
@@ -120,6 +122,11 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
   bool get playbackSourceIsPlaylist => _playbackSourceIsPlaylist;
   bool get hasEmbeddedPlayerHost => _embeddedPlayerHosts.isNotEmpty;
 
+  /// True while a split shell hosts the mini player inside its chat list
+  /// column. The window-level collapsed overlay stands down then, so the
+  /// player is never drawn twice.
+  bool get hasDockedMiniPlayerHost => _dockedMiniPlayerHosts.isNotEmpty;
+
   // Playlist chats are loaded lazily after authorization, when the library is
   // opened. main() calls this before TDLib reaches authorizationStateReady.
   void initialize(SharedPreferences prefs) {
@@ -165,6 +172,26 @@ class MusicPlayerController extends ChangeNotifier implements NowPlayingTarget {
 
   void detachEmbeddedPlayerHost(Object host) {
     if (_embeddedPlayerHosts.remove(host)) notifyListeners();
+  }
+
+  void attachDockedMiniPlayerHost(Object host) {
+    if (_dockedMiniPlayerHosts.add(host)) _notifyDockHostsChanged();
+  }
+
+  void detachDockedMiniPlayerHost(Object host) {
+    if (_dockedMiniPlayerHosts.remove(host)) _notifyDockHostsChanged();
+  }
+
+  // A dock mounts and unmounts inside a build pass, so the set changes there
+  // are reported once the frame that made them has finished; notifying during
+  // that build would mark the overlay dirty while it is being built.
+  void _notifyDockHostsChanged() {
+    if (SchedulerBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      SchedulerBinding.instance.addPostFrameCallback((_) => notifyListeners());
+      return;
+    }
+    notifyListeners();
   }
 
   bool isInPlaylist(ChatMessage message) {
@@ -799,6 +826,11 @@ class _GlobalMusicPlayerOverlayState extends State<GlobalMusicPlayerOverlay> {
           if (!controller.isVisible || !controller.collapsed) {
             return const SizedBox.shrink();
           }
+          // A split shell draws the collapsed pill itself, docked in the chat
+          // list column; this window-level copy would double it.
+          if (controller.hasDockedMiniPlayerHost) {
+            return const SizedBox.shrink();
+          }
           final width = MediaQuery.sizeOf(context).width;
           final duration = _dragging
               ? Duration.zero
@@ -822,7 +854,10 @@ class _GlobalMusicPlayerOverlayState extends State<GlobalMusicPlayerOverlay> {
                     behavior: HitTestBehavior.opaque,
                     onPanUpdate: (details) => _onPanUpdate(details, controller),
                     onPanEnd: (details) => _onPanEnd(details, controller),
-                    child: _CollapsedMusicPlayer(controller: controller),
+                    child: _CollapsedMusicPlayer(
+                      key: musicCollapsedOverlayKey,
+                      controller: controller,
+                    ),
                   ),
                 ),
               ),
@@ -1157,9 +1192,472 @@ class _MusicPlayerBarContents extends StatelessWidget {
   }
 }
 
-class _CollapsedMusicPlayer extends StatelessWidget {
-  const _CollapsedMusicPlayer({required this.controller});
+/// Docks the mini player at the bottom of a split shell's chat list column.
+/// It registers with the controller so the window-level collapsed overlay
+/// stands down while a dock is on screen, and it owns the vertical rhythm
+/// (8pt inset on every side) around [MusicMiniPlayerCard].
+class MusicMiniPlayerDock extends StatefulWidget {
+  const MusicMiniPlayerDock({super.key});
 
+  @override
+  State<MusicMiniPlayerDock> createState() => _MusicMiniPlayerDockState();
+}
+
+class _MusicMiniPlayerDockState extends State<MusicMiniPlayerDock> {
+  bool _registered = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Navigator retains covered routes. Only a visible, ticking dock may
+    // suppress the window-level player on the route above it.
+    final visible =
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.isCurrentOf(context) ?? true);
+    if (visible == _registered) return;
+    _registered = visible;
+    if (visible) {
+      MusicPlayerController.shared.attachDockedMiniPlayerHost(this);
+    } else {
+      MusicPlayerController.shared.detachDockedMiniPlayerHost(this);
+    }
+  }
+
+  @override
+  void dispose() {
+    MusicPlayerController.shared.detachDockedMiniPlayerHost(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: MusicPlayerController.shared,
+      builder: (context, _) {
+        final player = MusicPlayerController.shared;
+        if (!_registered || !player.isVisible || player.hasEmbeddedPlayerHost) {
+          return const SizedBox.shrink();
+        }
+        const card = Padding(
+          padding: EdgeInsets.all(musicMiniPlayerEdgeInset),
+          child: MusicMiniPlayerCard(key: musicMiniPlayerCardKey),
+        );
+        if (AppMotion.isReduced(context)) return card;
+        return AnimatedSize(
+          duration: AppMotion.duration(context, AppMotion.responsive),
+          curve: AppMotion.standard,
+          alignment: Alignment.bottomCenter,
+          child: card,
+        );
+      },
+    );
+  }
+}
+
+/// Now-playing card for a split shell's chat list column. It takes the width
+/// of the column it is hosted in, never the window's, and collapses to a
+/// pill in the same slot. Horizontal drags keep the window-level bar's
+/// vocabulary: left dismisses, right minimises.
+class MusicMiniPlayerCard extends StatefulWidget {
+  const MusicMiniPlayerCard({super.key});
+
+  @override
+  State<MusicMiniPlayerCard> createState() => _MusicMiniPlayerCardState();
+}
+
+class _MusicMiniPlayerCardState extends State<MusicMiniPlayerCard> {
+  double _dragX = 0;
+  double _cardWidth = 0;
+  bool _dragging = false;
+  bool _settling = false;
+  int _settleRevision = 0;
+  ChatMessage? _gestureTrack;
+
+  MusicPlayerController get controller => MusicPlayerController.shared;
+
+  // The dock rebuilds this card from the controller listener, but a host may
+  // also mount it directly; listening here keeps progress and play state live.
+  @override
+  void initState() {
+    super.initState();
+    controller.addListener(_onControllerChanged);
+  }
+
+  @override
+  void dispose() {
+    controller.removeListener(_onControllerChanged);
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    if (!identical(_gestureTrack, controller.current)) {
+      _settleRevision++;
+      _gestureTrack = controller.current;
+      _settling = false;
+      _dragging = false;
+      _dragX = 0;
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _onHorizontalDragStart(DragStartDetails details) {
+    if (_settling) return;
+    _gestureTrack = controller.current;
+    _settleRevision++;
+    setState(() {
+      _dragging = true;
+      _dragX = 0;
+    });
+  }
+
+  void _onHorizontalDragUpdate(DragUpdateDetails details) {
+    if (_settling || _cardWidth <= 0) return;
+    setState(() {
+      _dragX = (_dragX + details.delta.dx).clamp(-_cardWidth, _cardWidth);
+    });
+  }
+
+  void _onHorizontalDragEnd(DragEndDetails details) {
+    if (_settling || _cardWidth <= 0) return;
+    final width = _cardWidth;
+    final velocity = details.primaryVelocity ?? 0;
+    final shouldClose = _dragX <= -width * 0.32 || velocity < -700;
+    final shouldCollapse =
+        !controller.collapsed && (_dragX >= width * 0.32 || velocity > 700);
+    if (shouldCollapse) {
+      setState(() {
+        _dragging = false;
+        _dragX = 0;
+      });
+      controller.collapse();
+      return;
+    }
+    if (!shouldClose) {
+      setState(() {
+        _dragging = false;
+        _dragX = 0;
+      });
+      return;
+    }
+
+    final revision = ++_settleRevision;
+    setState(() {
+      _dragging = false;
+      _settling = true;
+      _dragX = -width;
+    });
+    Future<void>.delayed(const Duration(milliseconds: 190), () {
+      if (!mounted || revision != _settleRevision) return;
+      controller.closeWidget();
+    });
+  }
+
+  void _onHorizontalDragCancel() {
+    if (_settling) return;
+    setState(() {
+      _dragging = false;
+      _dragX = 0;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final message = controller.current;
+    final music = message?.music;
+    if (message == null || music == null) return const SizedBox.shrink();
+    final total = controller.total.inMilliseconds > 0
+        ? controller.total
+        : Duration(seconds: music.duration);
+    final fraction = total.inMilliseconds > 0
+        ? (controller.position.inMilliseconds / total.inMilliseconds).clamp(
+            0.0,
+            1.0,
+          )
+        : 0.0;
+    final collapsed = controller.collapsed;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        _cardWidth = width;
+        final slideDuration = _dragging
+            ? Duration.zero
+            : const Duration(milliseconds: 190);
+        final closeReveal = width <= 0
+            ? 0.0
+            : (-_dragX / (width * 0.32)).clamp(0.0, 1.0);
+        final radius = BorderRadius.circular(AppRadius.card);
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onHorizontalDragStart: _onHorizontalDragStart,
+          onHorizontalDragUpdate: _onHorizontalDragUpdate,
+          onHorizontalDragEnd: _onHorizontalDragEnd,
+          onHorizontalDragCancel: _onHorizontalDragCancel,
+          child: SizedBox(
+            height: collapsed
+                ? musicMiniPlayerPillHeight
+                : musicMiniPlayerCardHeight,
+            // The shadow lives outside the clip, so it can paint past the
+            // rounded edge instead of being cut off by it.
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                borderRadius: radius,
+                boxShadow: [
+                  BoxShadow(
+                    color: _musicBlack.withValues(alpha: 0.10),
+                    blurRadius: 14,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: radius,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ColoredBox(color: context.colors.navBar),
+                    if (closeReveal > 0)
+                      Opacity(
+                        key: musicMiniPlayerTrashKey,
+                        opacity: closeReveal,
+                        child: Container(
+                          alignment: Alignment.centerRight,
+                          padding: const EdgeInsets.only(right: 18),
+                          color: const Color(0xFFFF3B30),
+                          child: const AppIcon(
+                            HeroAppIcons.trash,
+                            size: 22,
+                            color: _musicWhite,
+                          ),
+                        ),
+                      ),
+                    AnimatedSlide(
+                      duration: slideDuration,
+                      curve: Curves.easeOutCubic,
+                      offset: Offset(width <= 0 ? 0 : _dragX / width, 0),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: context.colors.navBar,
+                          borderRadius: radius,
+                          border: Border.all(
+                            color: context.colors.divider,
+                            width: 0.5,
+                          ),
+                        ),
+                        child: Stack(
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 2),
+                              child: collapsed
+                                  ? _pill(context, music)
+                                  : _card(context, music, message),
+                            ),
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              bottom: 0,
+                              height: 2,
+                              child: _MiniProgressLine(
+                                fraction: fraction,
+                                track: context.colors.divider,
+                                fill: musicPlayerAccent,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _card(BuildContext context, MessageMusic music, ChatMessage message) {
+    final c = context.colors;
+    final subtitle = (music.performer ?? '').trim().replaceAll('\n', ' ');
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      child: Row(
+        children: [
+          _MusicCover(music: music, size: 40),
+          const SizedBox(width: 8),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => _openOriginal(message),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _musicName(music),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: c.textPrimary,
+                    ),
+                  ),
+                  if (subtitle.isNotEmpty) ...[
+                    const SizedBox(height: 1),
+                    Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 11, color: c.textTertiary),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          _transport(context, controller, size: 30, iconSize: 19),
+        ],
+      ),
+    );
+  }
+
+  Widget _pill(BuildContext context, MessageMusic music) {
+    final c = context.colors;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: controller.expand,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Row(
+          children: [
+            _MusicCover(music: music, size: 32),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                _musicName(music),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: c.textPrimary,
+                ),
+              ),
+            ),
+            _MiniButton(
+              tooltip: controller.isPlaying
+                  ? AppStrings.t(AppStringKeys.musicPlayerPause)
+                  : AppStrings.t(AppStringKeys.musicPlayerPlay),
+              onTap: controller.toggleCurrent,
+              size: 30,
+              child: controller.isLoading
+                  ? _ArcSpinner(size: 16, color: c.textSecondary)
+                  : AppIcon(
+                      controller.isPlaying
+                          ? HeroAppIcons.pause
+                          : HeroAppIcons.play,
+                      size: 19,
+                      color: c.textPrimary,
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Widget _transport(
+  BuildContext context,
+  MusicPlayerController controller, {
+  required double size,
+  required double iconSize,
+}) {
+  final c = context.colors;
+  return Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      _MiniButton(
+        tooltip: AppStrings.t(AppStringKeys.musicPlayerPreviousTrack),
+        onTap: controller.previous,
+        size: size,
+        child: AppIcon(
+          const AppIconData(HeroiconsOutline.backward),
+          size: iconSize,
+          color: c.textPrimary,
+        ),
+      ),
+      _MiniButton(
+        tooltip: controller.isPlaying
+            ? AppStrings.t(AppStringKeys.musicPlayerPause)
+            : AppStrings.t(AppStringKeys.musicPlayerPlay),
+        onTap: controller.toggleCurrent,
+        size: size,
+        child: controller.isLoading
+            ? _ArcSpinner(size: iconSize - 3, color: c.textSecondary)
+            : AppIcon(
+                controller.isPlaying ? HeroAppIcons.pause : HeroAppIcons.play,
+                size: iconSize,
+                color: c.textPrimary,
+              ),
+      ),
+      _MiniButton(
+        tooltip: AppStrings.t(AppStringKeys.musicPlayerNextTrack),
+        onTap: controller.next,
+        size: size,
+        child: AppIcon(
+          const AppIconData(HeroiconsOutline.forward),
+          size: iconSize,
+          color: c.textPrimary,
+        ),
+      ),
+      _MiniButton(
+        tooltip: AppStrings.t(AppStringKeys.musicPlayerShowPlaylist),
+        onTap: () => _showMusicQueue(context, controller),
+        size: size,
+        child: AppIcon(
+          HeroAppIcons.listCheck,
+          size: iconSize,
+          color: c.textPrimary,
+        ),
+      ),
+    ],
+  );
+}
+
+class _MiniProgressLine extends StatelessWidget {
+  const _MiniProgressLine({
+    required this.fraction,
+    required this.track,
+    required this.fill,
+  });
+
+  final double fraction;
+  final Color track;
+  final Color fill;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ColoredBox(color: track),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: FractionallySizedBox(
+            widthFactor: fraction,
+            heightFactor: 1,
+            child: ColoredBox(color: fill),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CollapsedMusicPlayer extends StatelessWidget {
+  const _CollapsedMusicPlayer({super.key, required this.controller});
   final MusicPlayerController controller;
 
   @override
@@ -1235,8 +1733,27 @@ class _MusicCover extends StatelessWidget {
 @visibleForTesting
 const musicPlayerProgressKey = ValueKey<String>('music-player-progress');
 
+@visibleForTesting
+const musicMiniPlayerCardKey = ValueKey<String>('music-mini-player-card');
+
+@visibleForTesting
+const musicMiniPlayerTrashKey = ValueKey<String>('music-mini-player-trash');
+
+@visibleForTesting
+const musicCollapsedOverlayKey = ValueKey<String>('music-collapsed-overlay');
+
 /// Height of the expanded player bar, excluding host bottom padding.
 const double musicPlayerBarHeight = 82;
+
+/// Height of the mini player card a split shell docks in its chat list
+/// column, its 2pt progress line included.
+const double musicMiniPlayerCardHeight = 52;
+
+/// Height of the same card once collapsed to a pill.
+const double musicMiniPlayerPillHeight = 40;
+
+/// Inset a split shell leaves around the docked card.
+const double musicMiniPlayerEdgeInset = 8;
 
 /// Seekable scrubber of the expanded player bar, modeled on Telegram iOS:
 /// a rounded line with elapsed time on the left and remaining time on the
@@ -1511,11 +2028,13 @@ class _MiniButton extends StatelessWidget {
     required this.tooltip,
     required this.onTap,
     required this.child,
+    this.size = 38,
   });
 
   final String tooltip;
   final VoidCallback? onTap;
   final Widget child;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
@@ -1528,7 +2047,11 @@ class _MiniButton extends StatelessWidget {
         onTap: onTap,
         child: Opacity(
           opacity: onTap == null ? 0.42 : 1,
-          child: SizedBox(width: 38, height: 38, child: Center(child: child)),
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Center(child: child),
+          ),
         ),
       ),
     );

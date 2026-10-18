@@ -113,6 +113,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
   String _lastName = '';
   String _rawPhone = '';
   bool _isBot = false;
+  bool _isDeleted = false;
   bool _isRegularUser = false;
   bool _hasLoadedUser = false;
   bool _isCreatingSecretChat = false;
@@ -166,6 +167,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
           _isPremium = user.boolean('is_premium') ?? false;
           _isContact = _isMe || (user.boolean('is_contact') ?? false);
           _isBot = user.obj('type')?.type == 'userTypeBot';
+          _isDeleted = TDParse.isDeletedUser(user);
           _isRegularUser = user.obj('type')?.type == 'userTypeRegular';
           _hasLoadedUser = true;
           _emojiStatusId = TDParse.emojiStatusCustomEmojiId(
@@ -351,7 +353,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
   }
 
   Future<void> _startSecretChat() async {
-    if (_isMe || _isBot || _isCreatingSecretChat) return;
+    if (_isMe || _isBot || _isDeleted || _isCreatingSecretChat) return;
     final confirmed = await confirmDialog(
       context,
       title: AppStringKeys.secretChatStartTitle,
@@ -457,7 +459,8 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
       context: context,
       backgroundColor: Colors.transparent,
       builder: (_) => _ProfileContextMenu(
-        showBlock: !_isMe && !_isBlocked,
+        showManage: !_isDeleted,
+        showBlock: !_isMe && !_isBlocked && !_isDeleted,
         manageLabel: _isMe
             ? context.l10n.t(AppStringKeys.profileToolsTitle)
             : context.l10n.t(AppStringKeys.profileContactManagementTitle),
@@ -620,7 +623,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
                     _profileCollectionsCard(),
                   ],
                   _profileGap(wallpaper != null),
-                  _profileToolsCard(),
+                  if (!_isDeleted) _profileToolsCard(),
                   if (_infoRows.isNotEmpty) ...[
                     _profileGap(wallpaper != null),
                     _infoCard(),
@@ -629,7 +632,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
                 ],
               ),
             ),
-            _bottomBar(),
+            if (!_isDeleted) _bottomBar(),
           ],
         ),
       ),
@@ -646,7 +649,8 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
   List<(String, String)> get _infoRows {
     final registration = _registrationText;
     return [
-      if (_bio.isNotEmpty) (AppStrings.t(AppStringKeys.profileDetailBio), _bio),
+      // The bio lives in the header (and only there), so it never needs a
+      // second, truncated-looking home among the detail rows.
       if (_birthday.isNotEmpty)
         (AppStrings.t(AppStringKeys.profileDetailBirthday), _birthday),
       if (registration.isNotEmpty)
@@ -937,6 +941,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
                     title: _name.isEmpty ? '?' : _name,
                     photo: _photo,
                     size: 80,
+                    isDeleted: _isDeleted,
                   ),
                 ),
               ),
@@ -1012,24 +1017,40 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
             Row(
               children: [
                 Expanded(
-                  child: TelegramRichText(
-                    text: _bio,
-                    entities: _bioEntities,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 15, color: c.textPrimary),
-                    onMentionTap: (userId, name) {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) =>
-                              ProfileDetailView(userId: userId, name: name),
-                        ),
-                      );
-                    },
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onLongPress: () => _copyValue(_bio),
+                    child: TelegramRichText(
+                      key: const ValueKey('profileBio'),
+                      text: _bio,
+                      entities: _bioEntities,
+                      style: TextStyle(fontSize: 15, color: c.textPrimary),
+                      onMentionTap: (userId, name) {
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                ProfileDetailView(userId: userId, name: name),
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
-                const SizedBox(width: 8),
-                AppIcon(HeroAppIcons.pen, size: 17, color: c.textTertiary),
+                // Only your own bio is editable, so the pen must not promise
+                // an edit on someone else's profile.
+                if (_isMe) ...[
+                  const SizedBox(width: 8),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _openEditProfile,
+                    child: AppIcon(
+                      HeroAppIcons.pen,
+                      key: const ValueKey('profileBioEditIcon'),
+                      size: 17,
+                      color: c.textTertiary,
+                    ),
+                  ),
+                ],
               ],
             ),
           ],
@@ -1981,10 +2002,12 @@ enum _ProfileContextAction { manage, copyLink, blockUser }
 
 class _ProfileContextMenu extends StatelessWidget {
   const _ProfileContextMenu({
+    required this.showManage,
     required this.showBlock,
     required this.manageLabel,
   });
 
+  final bool showManage;
   final bool showBlock;
   final String manageLabel;
 
@@ -2010,15 +2033,17 @@ class _ProfileContextMenu extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            _item(
-              context,
-              key: const ValueKey('profile-context-manage'),
-              icon: HeroAppIcons.penToSquare,
-              label: manageLabel,
-              onTap: () =>
-                  Navigator.of(context).pop(_ProfileContextAction.manage),
-            ),
-            const InsetDivider(leadingInset: 56),
+            if (showManage) ...[
+              _item(
+                context,
+                key: const ValueKey('profile-context-manage'),
+                icon: HeroAppIcons.penToSquare,
+                label: manageLabel,
+                onTap: () =>
+                    Navigator.of(context).pop(_ProfileContextAction.manage),
+              ),
+              const InsetDivider(leadingInset: 56),
+            ],
             _item(
               context,
               key: const ValueKey('profile-context-copy-link'),

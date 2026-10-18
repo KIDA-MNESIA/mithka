@@ -61,8 +61,9 @@ import 'desktop_navigation_rail.dart';
 import 'desktop_utility_window.dart';
 import 'detail_content_reveal.dart';
 import 'horizontal_safe_viewport.dart';
-import 'liquid_glass_bottom_bar.dart';
-import 'native_bottom_tab_bar.dart';
+import 'liquid_glass_bottom_bar.dart'
+    show GlassSelectionIndicator, LiquidGlassBottomBar;
+import 'native_glass_surface.dart';
 import 'primary_chat_launcher.dart';
 import 'unread_badge_model.dart';
 
@@ -102,6 +103,8 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
   late final ChatListController _chatListController = ChatListController();
   late final ChatViewExitController _messageChatExitController =
       ChatViewExitController();
+  late final ChatRevealLatestController _messageRevealLatestController =
+      ChatRevealLatestController();
   ChatListSelection? _selectedMessageChat;
   final _chatPaneController = ChatPaneController();
   CommunityListSelection? _selectedMessageCommunity;
@@ -532,12 +535,8 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
         title: request.title,
         initialMessageId: request.messageId,
       );
-      _prepareMessageChatReplacement(nextSelection);
-      setState(() {
-        _selection = 0;
-        _selectedMessageCommunity = null;
-        _selectedMessageChat = nextSelection;
-      });
+      setState(() => _selection = 0);
+      _showMessageChat(nextSelection);
       return;
     }
 
@@ -743,6 +742,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                   selection: selection,
                   onSelect: _select,
                   items: tabs,
+                  reserveBottomInset: true,
                   onClearUnread: _chatListController.markAllRead,
                   unread: _unread.countFor(theme.unreadBadgeMode),
                 ),
@@ -797,6 +797,10 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
   }
 
   Widget _musicAwareContent(Widget child, {bool reserveForShellPlayer = true}) {
+    // The split shell docks the player in its list column instead of a
+    // window-wide strip, so the pane keeps its own bottom inset and needs no
+    // media query juggling.
+    if (!reserveForShellPlayer) return child;
     return AnimatedBuilder(
       animation: MusicPlayerController.shared,
       child: child,
@@ -1243,6 +1247,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                       Row(
                         children: [
                           SizedBox(
+                            key: const ValueKey('tablet-list-pane'),
                             width: compact ? 0 : sidebarWidth,
                             child: Offstage(
                               offstage: compact,
@@ -1259,24 +1264,30 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                       builder: (tab) =>
                                           _tabletSidebarRoot(tab.index),
                                     ),
-                                    footer: AnimatedBuilder(
-                                      animation: _unread,
-                                      builder: (context, _) => _MainBottomBar(
-                                        chatListController: _chatListController,
-                                        selection: selection,
-                                        onSelect: _select,
-                                        items: tabs,
-                                        onClearUnread:
-                                            _chatListController.markAllRead,
-                                        unread: _unread.countFor(
-                                          theme.unreadBadgeMode,
+                                    footer: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        if (!compact)
+                                          const MusicMiniPlayerDock(),
+                                        AnimatedBuilder(
+                                          animation: _unread,
+                                          builder: (context, _) =>
+                                              _MainBottomBar(
+                                                chatListController:
+                                                    _chatListController,
+                                                selection: selection,
+                                                onSelect: _select,
+                                                items: tabs,
+                                                reserveBottomInset: false,
+                                                onClearUnread:
+                                                    _chatListController
+                                                        .markAllRead,
+                                                unread: _unread.countFor(
+                                                  theme.unreadBadgeMode,
+                                                ),
+                                              ),
                                         ),
-                                        // The system glass bar measures itself
-                                        // against the window bottom, not this
-                                        // sidebar column; draw the app glass
-                                        // whose indicator follows the tabs.
-                                        useNativeGlass: false,
-                                      ),
+                                      ],
                                     ),
                                   ),
                                   overlayVisible: !compact,
@@ -1304,6 +1315,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                                       desktopInfoPaneWidth,
                                 ),
                               ),
+                              reserveForShellPlayer: compact,
                             ),
                           ),
                         ],
@@ -1322,7 +1334,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
                   ),
                 ),
               ),
-              _fixedMusicPlayer(safeBottom: true),
+              if (compact) _fixedMusicPlayer(safeBottom: true),
             ],
           ),
         );
@@ -1396,13 +1408,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
             selectedCommunityId: communitiesEnabled
                 ? _selectedMessageCommunity?.community.id
                 : null,
-            onChatSelected: (chat) {
-              _prepareMessageChatReplacement(chat);
-              setState(() {
-                _selectedMessageCommunity = null;
-                _selectedMessageChat = chat;
-              });
-            },
+            onChatSelected: _showMessageChat,
             onCommunitySelected: (community) {
               if (!communitiesEnabled) return;
               _messageChatExitController.prepareExit();
@@ -1427,12 +1433,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
             onUnarchive: archivedSelection.onUnarchive,
             onBack: () => setState(() => _selectedArchivedChats = null),
             onChatSelected: (chat) {
-              final nextSelection = ChatListSelection.fromChat(chat);
-              _prepareMessageChatReplacement(nextSelection);
-              setState(() {
-                _selectedMessageCommunity = null;
-                _selectedMessageChat = nextSelection;
-              });
+              _showMessageChat(ChatListSelection.fromChat(chat));
             },
           ),
       ],
@@ -1558,12 +1559,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
               ? () => setState(() => _selectedMessageCommunity = null)
               : null,
           onChatSelected: (chat) {
-            final nextSelection = ChatListSelection.fromChat(chat);
-            _prepareMessageChatReplacement(nextSelection);
-            setState(() {
-              _selectedMessageCommunity = null;
-              _selectedMessageChat = nextSelection;
-            });
+            _showMessageChat(ChatListSelection.fromChat(chat));
           },
         ),
       );
@@ -1594,6 +1590,7 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
         trailingPaneWidth: trailingPaneWidth,
         requestComposerFocusOnReady: selected.composerFocusRequestId != 0,
         exitController: _messageChatExitController,
+        revealLatestController: _messageRevealLatestController,
         onChatKindResolved: (kind) =>
             _handleSelectedChatKindResolved(selected.chatId, kind),
         onInfoPressed: onInfoPressed,
@@ -1633,6 +1630,31 @@ abstract class _MainRootViewState<T extends StatefulWidget> extends State<T> {
       name,
       userId: userId,
     );
+  }
+
+  /// Shows [next] in the split pane, or — when it is the conversation already
+  /// on screen — asks that transcript for its newest message.
+  ///
+  /// Without this, tapping the open conversation in the list rebuilt an equal
+  /// selection: nothing moved, so the tap did nothing at all. The reader's
+  /// expectation is a jump to the latest message, which is also what the
+  /// return-to-latest arrow does.
+  void _showMessageChat(ChatListSelection next) {
+    final current = _selectedMessageChat;
+    // A jump target always means "go to that message", so only a plain
+    // request for the conversation already on screen is read as "show me the
+    // newest message".
+    if (current != null &&
+        next.initialMessageId == null &&
+        current.showsSameTranscript(next)) {
+      _messageRevealLatestController.revealLatest();
+      return;
+    }
+    _prepareMessageChatReplacement(next);
+    setState(() {
+      _selectedMessageCommunity = null;
+      _selectedMessageChat = next;
+    });
   }
 
   void _prepareMessageChatReplacement(ChatListSelection? nextSelection) {
@@ -2163,8 +2185,8 @@ class _MainBottomBar extends StatelessWidget {
     required this.onClearUnread,
     required this.items,
     required this.unread,
+    required this.reserveBottomInset,
     this.chatListController,
-    this.useNativeGlass = true,
   });
   final int selection;
   final ValueChanged<int> onSelect;
@@ -2173,12 +2195,13 @@ class _MainBottomBar extends StatelessWidget {
   final int unread;
   final ChatListController? chatListController;
 
-  /// The system glass bar is a window-bottom bar: UIKit paints its selection
-  /// capsule to its own slot metrics, so a split shell hosting it inside a
-  /// narrow sidebar column misplaces the highlight over the tabs. Split-shell
-  /// callers opt out to draw the app-owned glass bar instead, whose indicator
-  /// follows the actual tab slots.
-  final bool useNativeGlass;
+  /// Whether the bar owns the home-indicator band at the window's bottom edge.
+  ///
+  /// The compact shell docks the bar against the window edge, so the band has
+  /// to stay part of the bar and every tab has to fill it. Docked in the split
+  /// shell's column the bar keeps no band at all: the row spends the full
+  /// height and the space goes back to the content above.
+  final bool reserveBottomInset;
 
   /// Label size the bar is laid out around. The icon block above it keeps its
   /// size at every text scale, so only this line's growth is added to the bar.
@@ -2275,33 +2298,24 @@ class _MainBottomBar extends StatelessWidget {
         ),
       );
     }
-    if (glass &&
-        useNativeGlass &&
-        !kIsWeb &&
-        defaultTargetPlatform == TargetPlatform.iOS) {
-      return NativeBottomTabBar(
-        items: [
-          for (final item in items)
-            NativeBottomTabItem(
-              id: item.index,
-              label: item.label.l10n(context),
-              icon: item.icon,
-            ),
-        ],
-        selection: selection,
-        unread: unread,
-        unreadLabel: theme.unreadBadgeOverflowMode.format(unread),
-        onSelect: onSelect,
-        onClearUnread: onClearUnread,
-      );
-    }
     final labelGrowth = math.max(
       0.0,
       (MediaQuery.textScalerOf(context).scale(_labelSize) - _labelSize) *
           _labelLineHeight,
     );
-    final controls = SizedBox(
-      height: 62 + labelGrowth,
+    // Only the compact shell reserves the home-indicator band; the split shell
+    // leaves it to the content instead, so the row keeps the bar's whole box.
+    final bottomInset = reserveBottomInset
+        ? MediaQuery.paddingOf(context).bottom
+        : 0.0;
+
+    // The reserved band belongs to every tab, not to the container: the tab's
+    // press surface, ripple, and hover tint then reach the window edge and no
+    // strip under the buttons is left painted-but-unowned. The band is applied
+    // as padding inside each tab so the icon and label keep their centre. The
+    // glass hosts pass 0 — their capsules carry the inset themselves.
+    Widget controlsWithBottomInset(double inset) => SizedBox(
+      height: 62 + labelGrowth + inset,
       child: Row(
         children: [
           for (var i = 0; i < items.length; i++)
@@ -2318,85 +2332,88 @@ class _MainBottomBar extends StatelessWidget {
                 semanticLabel: items[i].label.l10n(context),
                 selected: selection == i,
                 onTap: () => onSelect(i),
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.xxs,
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: 36,
-                          height: 28,
-                          child: Stack(
-                            clipBehavior: Clip.none,
-                            alignment: Alignment.center,
-                            children: [
-                              TweenAnimationBuilder<double>(
-                                duration: AppMotion.duration(
-                                  context,
-                                  AppMotion.responsive,
-                                ),
-                                curve: AppMotion.standard,
-                                tween: Tween<double>(
-                                  end: selection == i ? 1 : 0,
-                                ),
-                                builder: (context, value, child) =>
-                                    Transform.translate(
-                                      offset: Offset(0, -value),
-                                      child: Transform.scale(
-                                        scale: 1 + value * 0.08,
-                                        child: AppIcon(
-                                          items[i].icon,
-                                          size: 24,
-                                          color: Color.lerp(
-                                            c.textTertiary,
-                                            AppTheme.brand,
-                                            value,
+                child: Padding(
+                  padding: EdgeInsets.only(bottom: inset),
+                  child: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.xxs,
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 36,
+                            height: 28,
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              alignment: Alignment.center,
+                              children: [
+                                TweenAnimationBuilder<double>(
+                                  duration: AppMotion.duration(
+                                    context,
+                                    AppMotion.responsive,
+                                  ),
+                                  curve: AppMotion.standard,
+                                  tween: Tween<double>(
+                                    end: selection == i ? 1 : 0,
+                                  ),
+                                  builder: (context, value, child) =>
+                                      Transform.translate(
+                                        offset: Offset(0, -value),
+                                        child: Transform.scale(
+                                          scale: 1 + value * 0.08,
+                                          child: AppIcon(
+                                            items[i].icon,
+                                            size: 24,
+                                            color: Color.lerp(
+                                              c.textTertiary,
+                                              AppTheme.brand,
+                                              value,
+                                            ),
                                           ),
                                         ),
                                       ),
-                                    ),
-                              ),
-                              if (i == 0 && unread > 0)
-                                Positioned(
-                                  right: -14,
-                                  top: -2,
-                                  child: UnreadBadge(
-                                    count: unread,
-                                    onClear: onClearUnread,
-                                  ),
                                 ),
-                            ],
+                                if (i == 0 && unread > 0)
+                                  Positioned(
+                                    right: -14,
+                                    top: -2,
+                                    child: UnreadBadge(
+                                      count: unread,
+                                      onClear: onClearUnread,
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        AnimatedDefaultTextStyle(
-                          duration: AppMotion.duration(
-                            context,
-                            AppMotion.responsive,
+                          const SizedBox(height: 2),
+                          AnimatedDefaultTextStyle(
+                            duration: AppMotion.duration(
+                              context,
+                              AppMotion.responsive,
+                            ),
+                            curve: AppMotion.standard,
+                            style: TextStyle(
+                              fontSize: _labelSize,
+                              fontWeight: selection == i
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: selection == i
+                                  ? AppTheme.brand
+                                  : c.textTertiary,
+                            ),
+                            // A wrapped label would outgrow the bar; the tab
+                            // is identified by its icon either way.
+                            child: Text(
+                              items[i].label.l10n(context),
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                          curve: AppMotion.standard,
-                          style: TextStyle(
-                            fontSize: _labelSize,
-                            fontWeight: selection == i
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                            color: selection == i
-                                ? AppTheme.brand
-                                : c.textTertiary,
-                          ),
-                          // A wrapped label would outgrow the bar; the tab
-                          // is identified by its icon either way.
-                          child: Text(
-                            items[i].label.l10n(context),
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -2405,7 +2422,44 @@ class _MainBottomBar extends StatelessWidget {
         ],
       ),
     );
+    final controls = controlsWithBottomInset(0.0);
     if (glass) {
+      // iOS hosts the real Liquid Glass: a native surface draws only the glass
+      // (public UIGlassEffect on iOS 26+, system material blur before), while
+      // the app-owned row, its selection pill, and every gesture stay in
+      // Flutter above the surface — one geometry source in any host, window
+      // bottom bar or sidebar column. The Flutter glass bar remains the
+      // fallback for every other target.
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        // A platform view has no insets of its own, so the host repeats the
+        // exact containment chain the Flutter glass bar applies: the surface
+        // stops at the bottom safe area instead of reaching under the home
+        // indicator, and the shared lateral/top/capsule margins keep the row
+        // inside the stadium at the same rect either host draws it at.
+        return SafeArea(
+          top: false,
+          minimum: const EdgeInsets.only(bottom: 10),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+            child: NativeGlassSurface(
+              child: Padding(
+                padding: const EdgeInsets.all(5),
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: GlassSelectionIndicator(
+                        selection: selection,
+                        itemCount: items.length,
+                      ),
+                    ),
+                    controls,
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      }
       return LiquidGlassBottomBar(
         selection: selection,
         itemCount: items.length,
@@ -2418,7 +2472,7 @@ class _MainBottomBar extends StatelessWidget {
         color: c.navBar,
         border: Border(top: BorderSide(color: c.divider, width: 0.5)),
       ),
-      child: SafeArea(top: false, child: controls),
+      child: controlsWithBottomInset(bottomInset),
     );
   }
 }

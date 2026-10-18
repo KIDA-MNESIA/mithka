@@ -12,9 +12,10 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show precisionErrorTolerance;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show SelectedContent;
+import 'package:flutter/rendering.dart' show RenderProxyBox, SelectedContent;
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:mithka/l10n/app_localizations.dart';
@@ -22,6 +23,7 @@ import 'package:provider/provider.dart';
 
 import '../call/call_elapsed_text.dart';
 import '../components/app_icons.dart';
+import '../components/app_press_ripple.dart';
 import '../components/document_file_icon.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
@@ -97,6 +99,7 @@ class MessageBubble extends StatefulWidget {
     this.onAvatarLongPress,
     this.onOpenReply,
     this.onOpenForwarded,
+    this.onTapViaBot,
     this.onOpenImage,
     this.onOpenImageGallery,
     this.onApplyMessageBubble,
@@ -169,6 +172,7 @@ class MessageBubble extends StatefulWidget {
   final ValueChanged<ChatMessage>? onAvatarLongPress;
   final ValueChanged<int>? onOpenReply;
   final ValueChanged<ChatMessage>? onOpenForwarded;
+  final ValueChanged<ChatMessage>? onTapViaBot;
   final ValueChanged<ChatMessage>? onOpenImage;
   final ImageGalleryOpenCallback? onOpenImageGallery;
   final ValueChanged<ChatMessage>? onApplyMessageBubble;
@@ -230,6 +234,15 @@ class _MessageBubbleState extends State<MessageBubble>
   final ValueNotifier<bool> _hoveringTimestamp = ValueNotifier(false);
   double? _layoutWidth;
   final Set<String> _expandedQuotes = {};
+  // Rich block quotes that measured taller than the fold cap. The measurement
+  // is exact — the body is laid out at the incoming width — because a block
+  // quote carries no expandable flag on the wire.
+  final Set<String> _foldableRichQuotes = {};
+  // A block quote folds at three lines of its body text. The quote frame's
+  // padding sits outside that cap, so a folded rich quote shows the same three
+  // lines plus frame as an entity quote does.
+  static const int _richQuoteFoldLines = 3;
+  static const EdgeInsets _richQuotePadding = EdgeInsets.fromLTRB(10, 7, 8, 7);
   final Set<String> _revealedSpoilers = {};
   // 盘古之白 results for this bubble's texts. A rebuild reuses the spaced text
   // and the very same entity list, so the paragraphs below keep their spans.
@@ -250,7 +263,17 @@ class _MessageBubbleState extends State<MessageBubble>
       widget.sensitiveContentController ?? SensitiveContentController.shared;
 
   bool get _revealsRestrictedContent =>
-      _showRestrictedContent || _sensitiveContentController.enabled;
+      _showRestrictedContent ||
+      _sensitiveContentController.enabled ||
+      (_theme.autoRevealRestrictedMedia && message.hasRestrictedRevealContent);
+
+  /// A long press flips the per-message reveal, so content uncovered by hand can
+  /// be masked again. Reveals that come from the account option or from the
+  /// auto-reveal preference are not per-message state: there the press belongs
+  /// to the ordinary action menu.
+  bool get _togglesRestrictedContentOnLongPress =>
+      message.hasRestrictedRevealContent &&
+      (_showRestrictedContent || !_revealsRestrictedContent);
 
   Rect? _bubbleBounds() {
     final box = _bubbleKey.currentContext?.findRenderObject() as RenderBox?;
@@ -312,7 +335,7 @@ class _MessageBubbleState extends State<MessageBubble>
       unawaited(_showSensitiveContentUnblockPrompt(anchor: _bubbleBounds()));
       return;
     }
-    if (message.hasRestrictedRevealContent) {
+    if (_togglesRestrictedContentOnLongPress) {
       setState(() => _showRestrictedContent = !_showRestrictedContent);
       return;
     }
@@ -843,6 +866,14 @@ class _MessageBubbleState extends State<MessageBubble>
   @override
   void didUpdateWidget(covariant MessageBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // A bubble is stateful per list slot, not per message: a list rebinds the
+    // same State object to another message as rows move. The manual reveal is
+    // the reader's confirmation for ONE message, so it must not follow the
+    // slot onto a message that was never confirmed.
+    if (oldWidget.message.id != widget.message.id ||
+        oldWidget.message.chatId != widget.message.chatId) {
+      _showRestrictedContent = false;
+    }
     final oldController =
         oldWidget.sensitiveContentController ??
         SensitiveContentController.shared;
@@ -1022,6 +1053,7 @@ class _MessageBubbleState extends State<MessageBubble>
                         ? message.senderPhoto
                         : widget.peerPhoto,
                     size: 38,
+                    isDeleted: widget.isGroup && message.senderIsDeleted,
                   ),
                   withLongPress: true,
                 ),
@@ -1196,51 +1228,76 @@ class _MessageBubbleState extends State<MessageBubble>
       spacing: 5,
       runSpacing: 5,
       alignment: outgoing ? WrapAlignment.end : WrapAlignment.start,
-      children: [
-        for (final r in message.reactions)
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => widget.onToggleReaction?.call(r),
-            onLongPress: () => widget.onShowReactionUsers?.call(message, r),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: r.chosen
-                    ? AppTheme.brand.withValues(alpha: 0.18)
-                    : c.searchFill,
-                borderRadius: BorderRadius.circular(AppRadius.card),
-                border: r.chosen ? Border.all(color: AppTheme.brand) : null,
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  r.customEmojiId != 0
-                      ? CustomEmojiView(
-                          id: r.customEmojiId,
-                          size: 16,
-                          color: r.chosen ? AppTheme.brand : c.textSecondary,
-                        )
-                      : Text(
-                          r.emoji ?? '',
-                          style: const TextStyle(fontSize: 14),
-                        ),
-                  if (r.count > 1) ...[
-                    const SizedBox(width: 4),
-                    Text(
-                      '${r.count}',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: r.chosen ? AppTheme.brand : c.textSecondary,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-      ],
+      children: [for (final r in message.reactions) _reactionChip(c, r)],
     );
   }
+
+  /// The emoji toggles the reaction; the count is a separate target that opens
+  /// the reactors sheet, so a multi-reaction chip no longer hides that list
+  /// behind an undiscoverable long press.
+  Widget _reactionChip(AppColors c, MessageReaction r) {
+    final foreground = r.chosen ? AppTheme.brand : c.textSecondary;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.onToggleReaction?.call(r),
+      onLongPress: () => widget.onShowReactionUsers?.call(message, r),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: r.chosen
+              ? AppTheme.brand.withValues(alpha: 0.18)
+              : c.searchFill,
+          borderRadius: BorderRadius.circular(AppRadius.card),
+          border: r.chosen ? Border.all(color: AppTheme.brand) : null,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            r.customEmojiId != 0
+                ? CustomEmojiView(
+                    id: r.customEmojiId,
+                    size: 16,
+                    color: foreground,
+                  )
+                : Text(r.emoji ?? '', style: const TextStyle(fontSize: 14)),
+            if (r.count > 1) _reactionCountTarget(r, foreground),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _reactionCountTarget(MessageReaction r, Color color) {
+    final count = Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Text('${r.count}', style: TextStyle(fontSize: 12, color: color)),
+    );
+    final onShow = widget.onShowReactionUsers;
+    // Without a list callback the count stays plain text, so the whole chip
+    // keeps toggling the reaction exactly as before.
+    if (onShow == null) return count;
+    return Semantics(
+      key: ValueKey('reactionCount-${message.id}-${_reactionKey(r)}'),
+      button: true,
+      label: AppStrings.t(AppStringKeys.chatReactionUsersCount, {
+        'value1': r.count,
+      }),
+      excludeSemantics: true,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => onShow(message, r),
+        child: AppPressRipple(
+          borderRadius: BorderRadius.circular(AppRadius.control),
+          color: color,
+          child: count,
+        ),
+      ),
+    );
+  }
+
+  String _reactionKey(MessageReaction reaction) => reaction.customEmojiId != 0
+      ? 'custom:${reaction.customEmojiId}'
+      : 'emoji:${reaction.emoji ?? ''}';
 
   Widget _repeatBadge() => GestureDetector(
     key: const ValueKey('messageRepeatBadge'),
@@ -1893,17 +1950,36 @@ class _MessageBubbleState extends State<MessageBubble>
         onTap: () => widget.onButtonTap?.call(message, button),
         child: Container(
           height: 36,
-          alignment: Alignment.center,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(AppRadius.md),
             border: Border.all(color: colors.border, width: 0.5),
           ),
-          child: BotButtonLabel(
-            button: button,
-            color: colors.foreground,
-            fontSize: 14,
-            fontWeight: FontWeight.w500,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Padding(
+                padding: EdgeInsets.symmetric(
+                  horizontal: botButtonBadgeIcon(button) != null ? 18 : 8,
+                ),
+                child: BotButtonLabel(
+                  button: button,
+                  color: colors.foreground,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              if (botButtonBadgeIcon(button) case final badgeIcon?)
+                Positioned(
+                  top: 4,
+                  right: 5,
+                  child: AppIcon(
+                    badgeIcon,
+                    key: ValueKey('message-button-badge-${button.text}'),
+                    size: 11,
+                    color: colors.foreground.withValues(alpha: 0.72),
+                  ),
+                ),
+            ],
           ),
         ),
       ),
@@ -2083,6 +2159,10 @@ class _MessageBubbleState extends State<MessageBubble>
         _forwardHeader(outgoing),
         const SizedBox(height: 3),
       ],
+      if (includeForwardHeader && message.hasViaBotAttribution) ...[
+        _viaBotHeader(outgoing),
+        const SizedBox(height: 3),
+      ],
       if (includeReplyQuote && message.replyPreviewText != null) ...[
         _replyQuote(outgoing),
         const SizedBox(height: 5),
@@ -2231,6 +2311,7 @@ class _MessageBubbleState extends State<MessageBubble>
     List<RichMessageBlock> blocks,
     bool outgoing, {
     Color? textLinkColor,
+    String blockPath = '',
   }) {
     final widgets = <Widget>[];
     for (var index = 0; index < blocks.length; index++) {
@@ -2240,6 +2321,9 @@ class _MessageBubbleState extends State<MessageBubble>
         block,
         outgoing,
         textLinkColor: textLinkColor,
+        // Nested quotes fold independently, so every block carries the index
+        // path that reaches it inside this message's rich tree.
+        blockPath: blockPath.isEmpty ? '$index' : '$blockPath.$index',
       );
       if (widget != null) {
         widgets.add(
@@ -2257,6 +2341,7 @@ class _MessageBubbleState extends State<MessageBubble>
     RichMessageBlock block,
     bool outgoing, {
     Color? textLinkColor,
+    String blockPath = '',
   }) {
     return switch (block.kind) {
       RichMessageBlockKind.paragraph ||
@@ -2280,9 +2365,13 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.buttonRow => SelectionContainer.disabled(
         child: _richButtonRowBlock(block, outgoing),
       ),
-      RichMessageBlockKind.list => _richListBlock(block, outgoing),
-      RichMessageBlockKind.blockQuote ||
-      RichMessageBlockKind.pullQuote => _richQuoteContainer(block, outgoing),
+      RichMessageBlockKind.list => _richListBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
+      RichMessageBlockKind.blockQuote || RichMessageBlockKind.pullQuote =>
+        _richQuoteContainer(block, outgoing, blockKey: blockPath),
       RichMessageBlockKind.animation ||
       RichMessageBlockKind.audio ||
       RichMessageBlockKind.photo ||
@@ -2291,7 +2380,11 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.collage => _richCollageBlock(block, outgoing),
       RichMessageBlockKind.slideshow => _richSlideshowBlock(block, outgoing),
       RichMessageBlockKind.table => _richTableBlock(block, outgoing),
-      RichMessageBlockKind.details => _richDetailsBlock(block, outgoing),
+      RichMessageBlockKind.details => _richDetailsBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
       RichMessageBlockKind.map => _richMapBlock(block, outgoing),
     };
   }
@@ -2387,7 +2480,11 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  Widget _richListBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richListBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final c = _colors;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2428,6 +2525,7 @@ class _MessageBubbleState extends State<MessageBubble>
                     children: _richBlockWidgets(
                       block.listItems[index].blocks,
                       outgoing,
+                      blockPath: '$blockPath.item$index',
                     ),
                   ),
                 ),
@@ -2446,12 +2544,51 @@ class _MessageBubbleState extends State<MessageBubble>
     return '•';
   }
 
-  Widget _richQuoteContainer(RichMessageBlock block, bool outgoing) {
+  /// One line of rich-block body text, measured with the same style, font size
+  /// and text scaler the block's paragraphs are laid out with.
+  double _richQuoteLineHeight() {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: 'M',
+        style: DefaultTextStyle.of(
+          context,
+        ).style.merge(TextStyle(fontSize: _chatFontSize(AppTextSize.body))),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    final height = painter.height;
+    painter.dispose();
+    return height;
+  }
+
+  /// A rich quote reports its measured height after layout, so a short quote
+  /// never builds the affordance and a long one gains it on the next frame.
+  void _handleRichQuoteOverflow(String key, bool overflows) {
+    if (!mounted) return;
+    final changed = overflows
+        ? _foldableRichQuotes.add(key)
+        : _foldableRichQuotes.remove(key);
+    if (changed) setState(() {});
+  }
+
+  void _toggleRichQuoteExpanded(String key) {
+    setState(() {
+      if (!_expandedQuotes.remove(key)) _expandedQuotes.add(key);
+    });
+  }
+
+  Widget _richQuoteContainer(
+    RichMessageBlock block,
+    bool outgoing, {
+    String blockKey = '',
+  }) {
     final base = outgoing ? _outgoingTextColor : _incomingTextColor;
     final link = _messageLinkColor(outgoing);
     final quote = _messageColors == null ? base : _messageQuoteColor(outgoing);
     final quoteLink = !outgoing && _messageColors != null ? quote : link;
-    final body = block.kind == RichMessageBlockKind.pullQuote
+    final isPullQuote = block.kind == RichMessageBlockKind.pullQuote;
+    final body = isPullQuote
         ? _richTextWidgets(block.text, base, quoteLink, outgoing, false, [
             ...block.textEntities,
             if (block.text.isNotEmpty)
@@ -2461,10 +2598,38 @@ class _MessageBubbleState extends State<MessageBubble>
                 type: 'textEntityTypeItalic',
               ),
           ])
-        : _richBlockWidgets(block.children, outgoing, textLinkColor: quoteLink);
-    return Container(
+        : _richBlockWidgets(
+            block.children,
+            outgoing,
+            textLinkColor: quoteLink,
+            blockPath: blockKey,
+          );
+    final key = 'rich:${message.chatId}:${message.id}:$blockKey';
+    // A quote that carries media, a table or a map has no meaningful "three
+    // lines": the cap would slice a photo into a sliver. Only a body made of
+    // text blocks folds, which is also the only case where the entity quote's
+    // behaviour applies.
+    bool isTextOnly(RichMessageBlock child) => switch (child.kind) {
+      RichMessageBlockKind.paragraph ||
+      RichMessageBlockKind.heading ||
+      RichMessageBlockKind.preformatted ||
+      RichMessageBlockKind.footer ||
+      RichMessageBlockKind.thinking ||
+      RichMessageBlockKind.math ||
+      RichMessageBlockKind.divider ||
+      RichMessageBlockKind.anchor => true,
+      RichMessageBlockKind.list => child.listItems.every(
+        (item) => item.blocks.every(isTextOnly),
+      ),
+      _ => false,
+    };
+    final foldable = !isPullQuote && block.children.every(isTextOnly);
+    final overflows = foldable && _foldableRichQuotes.contains(key);
+    final expanded = !foldable || _expandedQuotes.contains(key);
+    final lineHeight = foldable ? _richQuoteLineHeight() : 0.0;
+    final content = Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(10, 7, 8, 7),
+      padding: _richQuotePadding,
       decoration: BoxDecoration(
         color: _messageColors == null
             ? base.withValues(alpha: 0.07)
@@ -2472,12 +2637,43 @@ class _MessageBubbleState extends State<MessageBubble>
         border: Border(left: BorderSide(color: quote, width: 3)),
       ),
       child: Column(
-        crossAxisAlignment: block.kind == RichMessageBlockKind.pullQuote
+        crossAxisAlignment: isPullQuote
             ? CrossAxisAlignment.center
             : CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          ...body,
+          if (foldable)
+            _QuoteFold(
+              maxHeight: _richQuoteFoldLines * lineHeight,
+              collapsed: !expanded,
+              fadeExtent: lineHeight,
+              onOverflowChanged: (overflows) =>
+                  _handleRichQuoteOverflow(key, overflows),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: body,
+              ),
+            )
+          else
+            ...body,
+          if (overflows) ...[
+            const SizedBox(height: 4),
+            SelectionContainer.disabled(
+              child: Text(
+                AppStrings.t(
+                  expanded
+                      ? AppStringKeys.messageBubbleCollapse
+                      : AppStringKeys.messageBubbleExpandQuote,
+                ),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: quote,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
           if (block.caption.isNotEmpty) ...[
             const SizedBox(height: 5),
             ..._richTextWidgets(
@@ -2493,9 +2689,19 @@ class _MessageBubbleState extends State<MessageBubble>
         ],
       ),
     );
+    if (!foldable) return content;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: overflows ? () => _toggleRichQuoteExpanded(key) : null,
+      child: content,
+    );
   }
 
-  Widget _richDetailsBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richDetailsBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final base = outgoing ? _outgoingTextColor : _incomingTextColor;
     final link = _messageLinkColor(outgoing);
     return _RichDetailsBlock(
@@ -2516,7 +2722,11 @@ class _MessageBubbleState extends State<MessageBubble>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
-        children: _richBlockWidgets(block.children, outgoing),
+        children: _richBlockWidgets(
+          block.children,
+          outgoing,
+          blockPath: '$blockPath.details',
+        ),
       ),
     );
   }
@@ -4013,6 +4223,37 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  /// Inline-bot attribution shown above inline-sent content: `via @bot`.
+  Widget _viaBotHeader(bool outgoing) {
+    final textColor = _messageForwardedNameColor(outgoing);
+    return GestureDetector(
+      key: ValueKey('messageViaBotHeader-${message.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTapViaBot != null
+          ? () => widget.onTapViaBot!.call(message)
+          : null,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              AppStrings.t(AppStringKeys.messageBubbleViaBot, {
+                'value1': message.viaBotDisplayName,
+              }),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: textColor,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// 引用 quote block shown above a reply's text.
   Widget _replyQuote(bool outgoing) {
     final labelColor = _messageReplyNameColor(outgoing);
@@ -5065,12 +5306,14 @@ class _MessageBubbleState extends State<MessageBubble>
     required bool outgoing,
   }) {
     final hasForwardHeader = message.hasForwardAttribution;
+    final hasViaBotHeader = message.hasViaBotAttribution;
+    final hasAttributionHeader = hasForwardHeader || hasViaBotHeader;
     final hasReplyQuote = message.replyPreviewText != null;
     if (!_groupsMediaCaption(caption)) {
-      final attributedMedia = hasForwardHeader || hasReplyQuote
+      final attributedMedia = hasAttributionHeader || hasReplyQuote
           ? _bubbleBackground(
               key: ValueKey(
-                hasForwardHeader
+                hasAttributionHeader
                     ? 'messageForwardedMedia-${message.id}'
                     : 'messageRepliedMedia-${message.id}',
               ),
@@ -5084,14 +5327,29 @@ class _MessageBubbleState extends State<MessageBubble>
                 children: [
                   if (hasForwardHeader)
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(10, 7, 10, 6),
+                      padding: EdgeInsets.fromLTRB(
+                        10,
+                        7,
+                        10,
+                        hasViaBotHeader ? 2 : 6,
+                      ),
                       child: _forwardHeader(outgoing),
+                    ),
+                  if (hasViaBotHeader)
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        10,
+                        hasForwardHeader ? 0 : 7,
+                        10,
+                        6,
+                      ),
+                      child: _viaBotHeader(outgoing),
                     ),
                   if (hasReplyQuote)
                     Padding(
                       padding: EdgeInsets.fromLTRB(
                         6,
-                        hasForwardHeader ? 0 : 6,
+                        hasAttributionHeader ? 0 : 6,
                         6,
                         6,
                       ),
@@ -5114,7 +5372,7 @@ class _MessageBubbleState extends State<MessageBubble>
             _textBubble(
               caption,
               outgoing,
-              includeForwardHeader: !hasForwardHeader,
+              includeForwardHeader: !hasAttributionHeader,
               includeReplyQuote: false,
             ),
           ],
@@ -5159,12 +5417,22 @@ class _MessageBubbleState extends State<MessageBubble>
         children: [
           if (hasForwardHeader)
             Padding(
-              padding: const EdgeInsets.fromLTRB(10, 7, 10, 6),
+              padding: EdgeInsets.fromLTRB(10, 7, 10, hasViaBotHeader ? 2 : 6),
               child: _forwardHeader(outgoing),
+            ),
+          if (hasViaBotHeader)
+            Padding(
+              padding: EdgeInsets.fromLTRB(10, hasForwardHeader ? 0 : 7, 10, 6),
+              child: _viaBotHeader(outgoing),
             ),
           if (hasReplyQuote)
             Padding(
-              padding: EdgeInsets.fromLTRB(6, hasForwardHeader ? 0 : 6, 6, 6),
+              padding: EdgeInsets.fromLTRB(
+                6,
+                hasAttributionHeader ? 0 : 6,
+                6,
+                6,
+              ),
               child: _replyQuote(outgoing),
             ),
           media,
@@ -6286,4 +6554,154 @@ class _MessageDeliveryPainter extends CustomPainter {
   @override
   bool shouldRepaint(_MessageDeliveryPainter oldDelegate) =>
       oldDelegate.isSending != isSending || oldDelegate.color != color;
+}
+
+/// Folds a rich quote body to [maxHeight]. The child is laid out with an
+/// unbounded height at the incoming width, so the fold follows the real layout
+/// instead of a character count or an intrinsic pass, and while [collapsed] it
+/// paints clipped to the cap with a short bottom fade. The measurement is
+/// reported after the frame — through [onOverflowChanged] — so the caller only
+/// builds an affordance when there is something to fold.
+class _QuoteFold extends SingleChildRenderObjectWidget {
+  const _QuoteFold({
+    required this.maxHeight,
+    required this.collapsed,
+    required this.fadeExtent,
+    required this.onOverflowChanged,
+    super.child,
+  });
+
+  final double maxHeight;
+  final bool collapsed;
+  final double fadeExtent;
+  final ValueChanged<bool> onOverflowChanged;
+
+  @override
+  _RenderQuoteFold createRenderObject(BuildContext context) => _RenderQuoteFold(
+    maxHeight: maxHeight,
+    collapsed: collapsed,
+    fadeExtent: fadeExtent,
+    onOverflowChanged: onOverflowChanged,
+  );
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderQuoteFold renderObject) {
+    renderObject
+      ..maxHeight = maxHeight
+      ..collapsed = collapsed
+      ..fadeExtent = fadeExtent
+      ..onOverflowChanged = onOverflowChanged;
+  }
+}
+
+class _RenderQuoteFold extends RenderProxyBox {
+  _RenderQuoteFold({
+    required this._maxHeight,
+    required this._collapsed,
+    required this._fadeExtent,
+    required this._onOverflowChanged,
+  });
+
+  double get maxHeight => _maxHeight;
+  double _maxHeight;
+  set maxHeight(double value) {
+    if (value == _maxHeight) return;
+    _maxHeight = value;
+    markNeedsLayout();
+  }
+
+  bool get collapsed => _collapsed;
+  bool _collapsed;
+  set collapsed(bool value) {
+    if (value == _collapsed) return;
+    _collapsed = value;
+    markNeedsLayout();
+  }
+
+  double get fadeExtent => _fadeExtent;
+  double _fadeExtent;
+  set fadeExtent(double value) {
+    if (value == _fadeExtent) return;
+    _fadeExtent = value;
+    markNeedsPaint();
+  }
+
+  set onOverflowChanged(ValueChanged<bool> value) {
+    if (value == _onOverflowChanged) return;
+    _onOverflowChanged = value;
+  }
+
+  ValueChanged<bool> _onOverflowChanged;
+  bool _overflows = false;
+  bool _reportedOverflow = false;
+
+  @override
+  void performLayout() {
+    final child = this.child;
+    if (child == null) {
+      size = constraints.smallest;
+      return;
+    }
+    child.layout(
+      BoxConstraints(
+        minWidth: constraints.minWidth,
+        maxWidth: constraints.maxWidth,
+      ),
+      parentUsesSize: true,
+    );
+    final bodyHeight = child.size.height;
+    _overflows = bodyHeight > _maxHeight + precisionErrorTolerance;
+    size = constraints.constrain(
+      Size(
+        child.size.width,
+        _overflows && _collapsed ? _maxHeight : bodyHeight,
+      ),
+    );
+    if (_overflows != _reportedOverflow) {
+      _reportedOverflow = _overflows;
+      final report = _onOverflowChanged;
+      // The caller rebuilds to add or drop the affordance, and a layout-time
+      // setState is illegal: the report lands right after this frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (attached) report(_overflows);
+      });
+    }
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    final child = this.child;
+    if (child == null) return;
+    if (!_overflows || !_collapsed) {
+      context.paintChild(child, offset);
+      return;
+    }
+    context.pushClipRect(needsCompositing, offset, Offset.zero & size, (
+      PaintingContext context,
+      Offset clippedOffset,
+    ) {
+      final fadeTop = math.max(0.0, size.height - _fadeExtent);
+      if (fadeTop <= 0) {
+        context.paintChild(child, clippedOffset);
+        return;
+      }
+      final bounds = clippedOffset & size;
+      final canvas = context.canvas;
+      canvas.saveLayer(bounds, Paint());
+      context.paintChild(child, clippedOffset);
+      // Alpha-only fade: the body thins out towards the cut without assuming
+      // which fill sits behind the quote.
+      canvas.drawRect(
+        bounds,
+        Paint()
+          ..blendMode = BlendMode.dstIn
+          ..shader = ui.Gradient.linear(
+            Offset(bounds.left, bounds.top + fadeTop),
+            Offset(bounds.left, bounds.bottom),
+            const [Color(0xFFFFFFFF), Color(0x00FFFFFF)],
+          ),
+      );
+      canvas.restore();
+    });
+  }
 }

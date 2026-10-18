@@ -20,6 +20,7 @@ import '../chat/chat_view.dart';
 import '../chat/forum_topic_transcript.dart';
 import '../chat/forward_options.dart';
 import '../chat/group_remark_controller.dart';
+import '../chat/link_preview_fixer.dart';
 import '../chat/message_replies_sheet.dart';
 import '../chat/outgoing_attachment.dart';
 import '../chat/pangu_spacing.dart';
@@ -30,8 +31,11 @@ import '../components/confirm_dialog.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../l10n/app_localizations.dart';
 import '../notifications/notification_settings_payload.dart';
+import '../settings/ghost_mode_controller.dart';
+import '../tdlib/forum_topic_index.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -46,7 +50,11 @@ import 'topic_list_row.dart';
 import 'topic_navigation.dart';
 import 'topic_post_content.dart';
 
-export 'topic_list_actions.dart' show forumTopicViewMessagesRequest;
+export 'topic_list_actions.dart'
+    show
+        ForumTopicReadTarget,
+        forumTopicMarkAllReadRequests,
+        forumTopicViewMessagesRequest;
 
 /// Keeps a forum browser suspended while its topic route is replaced by other
 /// views in the same conversation. Only the newest route can reveal it.
@@ -258,6 +266,13 @@ List<int> takeNewlyVisibleForumTopicMessageIds({
   return visible;
 }
 
+/// Whether the viewport report may leave the app: ghost mode (compile-time
+/// opt-in only) withholds it exactly like the ordinary chat read reports.
+/// Kept as a plain function so both flag variants can pin the decision.
+bool shouldReportForumTopicReads(int chatId) =>
+    !(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock);
+
 typedef ForumTopicMessageQuery =
     Future<Map<String, dynamic>> Function(Map<String, dynamic> request);
 
@@ -343,6 +358,7 @@ class _TopicChatViewState extends State<TopicChatView> {
   int? _pendingInitialMessageId;
   late bool _hasForumTabs = widget.hasForumTabs;
   final int _accountClientId = TdClient.shared.activeClientId;
+  final int _accountSlot = TdClient.shared.activeSlot;
   int? _supergroupId;
   int _topicLayoutRevision = 0;
   StreamSubscription<Map<String, dynamic>>? _supergroupUpdates;
@@ -548,16 +564,29 @@ class _TopicChatViewState extends State<TopicChatView> {
         final index = _topics.indexWhere((topic) => topic.id == topicId);
         if (index < 0) return;
         final settings = update.obj('notification_settings');
-        _topics[index] = _topics[index].copyWith(
+        final current = _topics[index];
+        final lastReadInbox = update.int64('last_read_inbox_message_id');
+        // An authoritative read reaching the newest known message clears the
+        // badge locally, exactly like the shared index does. A partial read
+        // leaves the remaining counter for the next page to confirm.
+        final readEverything =
+            lastReadInbox != null &&
+            current.hasRealLastMessage &&
+            lastReadInbox >= current.lastMessage.id;
+        _topics[index] = current.copyWith(
           isPinned: update.boolean('is_pinned'),
           isMuted: settings == null
               ? null
               : (settings.integer('mute_for') ?? 0) > 0,
+          unreadCount: readEverything ? 0 : null,
         );
         setState(() {});
         _syncTopicListHost();
 
       case 'updateForumTopicInfo':
+        // forumTopicInfo carries the topic's name and icon — never its pin:
+        // `is_pinned` lives on the forumTopic/updateForumTopic side only, so
+        // folding a pin from here would read null and lose the state.
         final info = update.obj('info');
         if (info?.int64('chat_id') != chatId) return;
         final topicId = info?.integer('forum_topic_id');
@@ -640,8 +669,11 @@ class _TopicChatViewState extends State<TopicChatView> {
     selectedTopicId: _selectedThreadId,
     onSelect: _selectTopic,
     onCreateTopic: _canCreateTopics ? _openCreateTopicDialog : null,
+    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
     onTopicMenu: _showTopicRowMenu,
   );
+
+  bool get _hasUnreadTopics => _topics.any((topic) => topic.unreadCount > 0);
 
   Future<Map<String, dynamic>> _query(Map<String, dynamic> request) =>
       widget.query?.call(request) ??
@@ -706,6 +738,7 @@ class _TopicChatViewState extends State<TopicChatView> {
       final rawTopics =
           response.objects('topics') ?? const <Map<String, dynamic>>[];
       final next = <_ForumTopic>[];
+      final pageEntries = <ForumTopicIndexEntry>[];
       for (final topic in rawTopics) {
         final info = topic.obj('info') ?? topic;
         final last = topic.obj('last_message');
@@ -714,6 +747,8 @@ class _TopicChatViewState extends State<TopicChatView> {
         if (id == null || id == 0) continue;
         final isServiceLast = message?.isService == true;
         final fallbackDate = last?.integer('date');
+        final indexed = ForumTopicIndexEntry.fromTopic(topic);
+        if (indexed != null) pageEntries.add(indexed);
         next.add(
           _ForumTopic(
             id: id,
@@ -747,6 +782,41 @@ class _TopicChatViewState extends State<TopicChatView> {
             creatorId: _topicCreatorId(info),
           ),
         );
+      }
+      final previousById = {for (final topic in _topics) topic.id: topic};
+      // Store the page so the shared index keeps its watermark bookkeeping
+      // current. storeAll keeps a live read position the page predates.
+      ForumTopicIndex.shared.storeAll(
+        _accountSlot,
+        widget.chat.id,
+        pageEntries,
+      );
+      // A page fetched before a successful read (or an authoritative update)
+      // must not resurrect a counter the index already cleared. The merged
+      // entry is the live state: its counter wins, and a live newer last
+      // message keeps the row's later mark-read targeting real traffic.
+      for (var i = 0; i < next.length; i++) {
+        var topic = next[i];
+        final live = ForumTopicIndex.shared.entryFor(
+          _accountSlot,
+          widget.chat.id,
+          topic.id,
+        );
+        if (live == null) continue;
+        if (topic.unreadCount != live.unreadCount) {
+          topic = topic.copyWith(unreadCount: live.unreadCount);
+        }
+        final previous = previousById[topic.id];
+        if (previous != null &&
+            live.lastMessageId > topic.lastMessage.id &&
+            previous.lastMessage.id == live.lastMessageId) {
+          topic = topic.copyWith(
+            lastMessage: previous.lastMessage,
+            lastMessageIsSynthetic: previous.lastMessageIsSynthetic,
+            hasRealLastMessage: true,
+          );
+        }
+        next[i] = topic;
       }
       next.sort((a, b) => b.lastMessage.date.compareTo(a.lastMessage.date));
       _topics
@@ -1156,6 +1226,116 @@ class _TopicChatViewState extends State<TopicChatView> {
   String _topicActionError(String fallback, Object error) =>
       topicActionErrorText(fallback, error);
 
+  /// Clears every topic in the list at once: one scoped read per topic, with
+  /// the rows' unread counters cleared optimistically and each failed read
+  /// restoring only its own topic. Topics with no real last message have no
+  /// watermark to advance.
+  ///
+  /// A rollback never overwrites a read the index saw move: an authoritative
+  /// updateForumTopic during the batch (or a successful read of that topic)
+  /// keeps its zero.
+  Future<void> _markAllTopicsRead() async {
+    final targets = [
+      for (final topic in _topics)
+        if (topic.hasRealLastMessage)
+          ForumTopicReadTarget(
+            topicId: topic.id,
+            lastMessageId: topic.lastMessage.id,
+            unreadCount: topic.unreadCount,
+          ),
+    ];
+    final plan = forumTopicMarkAllReadPlan(
+      chatId: widget.chat.id,
+      topics: targets,
+    );
+    if (plan.isEmpty) return;
+    final previous =
+        <
+          int,
+          ({int unreadCount, int? lastReadInboxMessageId, int? lastMessageId})
+        >{};
+    for (final target in targets) {
+      if (target.unreadCount <= 0) continue;
+      final entry = ForumTopicIndex.shared.entryFor(
+        _accountSlot,
+        widget.chat.id,
+        target.topicId,
+      );
+      previous[target.topicId] = (
+        unreadCount: target.unreadCount,
+        lastReadInboxMessageId: entry?.lastReadInboxMessageId,
+        lastMessageId: entry?.lastMessageId,
+      );
+    }
+    setState(() {
+      for (final target in targets) {
+        if (target.unreadCount <= 0) continue;
+        final index = _topics.indexWhere((item) => item.id == target.topicId);
+        if (index >= 0) {
+          _topics[index] = _topics[index].copyWith(unreadCount: 0);
+        }
+      }
+    });
+    if (previous.isNotEmpty) {
+      ForumTopicIndex.shared.setUnreadCounts(_accountSlot, widget.chat.id, {
+        for (final topicId in previous.keys) topicId: 0,
+      });
+    }
+    _syncTopicListHost();
+    final failed = <int>{};
+    for (final entry in plan) {
+      if (!mounted) return;
+      try {
+        await _query(entry.request);
+        if (!mounted) return;
+        // The read advanced this topic's inbox watermark; record it so the
+        // next getForumTopics page cannot resurrect the cleared counter.
+        ForumTopicIndex.shared.recordRead(
+          _accountSlot,
+          widget.chat.id,
+          entry.target.topicId,
+          readMessageId: entry.target.lastMessageId,
+          lastMessageId: entry.target.lastMessageId,
+        );
+      } catch (_) {
+        failed.add(entry.target.topicId);
+      }
+    }
+    if (!mounted) return;
+    if (failed.isNotEmpty) {
+      setState(() {
+        for (final topicId in failed) {
+          final snapshot = previous[topicId];
+          if (snapshot == null) continue;
+          // Restore only this topic, and only while no authoritative read
+          // moved its watermark or newest message during the batch.
+          final restored = ForumTopicIndex.shared.restoreUnreadCountIfUnmoved(
+            _accountSlot,
+            widget.chat.id,
+            topicId,
+            restoreCount: snapshot.unreadCount,
+            expectedUnreadCount: 0,
+            expectedLastReadInboxMessageId: snapshot.lastReadInboxMessageId,
+            expectedLastMessageId: snapshot.lastMessageId,
+          );
+          if (!restored) continue;
+          final index = _topics.indexWhere((item) => item.id == topicId);
+          if (index >= 0) {
+            _topics[index] = _topics[index].copyWith(
+              unreadCount: snapshot.unreadCount,
+            );
+          }
+        }
+      });
+      _syncTopicListHost();
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+    }
+    await _loadTopics();
+  }
+
   /// The topic row's context menu (iOS swipe action / long press). Destructive
   /// and management items only appear while the account holds the right;
   /// mute and mark-read stay available to everyone.
@@ -1329,6 +1509,9 @@ class _TopicChatViewState extends State<TopicChatView> {
       alreadyReported: _reportedVisibleMessageIds,
     );
     if (visible.isEmpty) return;
+    // Ghost mode withholds the read report for forum topics too; the
+    // locally tracked visible set below keeps working.
+    if (!shouldReportForumTopicReads(widget.chat.id)) return;
     TdClient.shared.send(
       forumTopicViewMessagesRequest(
         chatId: widget.chat.id,
@@ -1447,13 +1630,16 @@ class _TopicChatViewState extends State<TopicChatView> {
   }
 
   Future<void> _sendForumMessage(Map<String, dynamic> request) async {
-    if (!request.containsKey('topic_id')) {
-      await TdClient.shared.query(request);
+    // The topic composer builds its own request, so it opts into the same
+    // preview fix as the main chat composer.
+    final outgoing = LinkPreviewFixer.shared.applyTo(request);
+    if (!outgoing.containsKey('topic_id')) {
+      await TdClient.shared.query(outgoing);
       return;
     }
     await sendScopedForumTopicMessage(
       query: TdClient.shared.query,
-      request: request,
+      request: outgoing,
     );
   }
 
@@ -1754,6 +1940,7 @@ class _TopicChatViewState extends State<TopicChatView> {
                     onCreateTopic: _canCreateTopics
                         ? _openCreateTopicDialog
                         : null,
+                    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
                     onTopicMenu: _showTopicRowMenu,
                     generalAvatarTitle: widget.chat.title,
                     generalAvatarPhoto: widget.chat.photo,
@@ -2006,6 +2193,7 @@ class _TopicChatViewState extends State<TopicChatView> {
               sender: _senderCache[post.message.senderId],
               showTopicChip: _selectedThreadId == null,
               onOpenTopic: () => _selectTopic(post.topic.id),
+              onOpenCurrentChat: () => unawaited(_openChatView()),
               onLike: () => _addReaction(post, '❤️'),
               onPickReaction: () => _showReactionPicker(post),
               onComments: () => _openComments(post),
@@ -2085,6 +2273,7 @@ class _TopicPostRow extends StatelessWidget {
     required this.onShare,
     this.showTopicChip = false,
     this.onOpenTopic,
+    this.onOpenCurrentChat,
     this.sender,
   });
 
@@ -2101,6 +2290,7 @@ class _TopicPostRow extends StatelessWidget {
   /// redundant there.
   final bool showTopicChip;
   final VoidCallback? onOpenTopic;
+  final VoidCallback? onOpenCurrentChat;
 
   @override
   Widget build(BuildContext context) {
@@ -2161,6 +2351,7 @@ class _TopicPostRow extends StatelessWidget {
                 color: c.textPrimary,
               ),
               imageReactions: _ExtraReactions(message: post.message),
+              onOpenCurrentChat: onOpenCurrentChat,
             ),
           ],
           const SizedBox(height: 13),

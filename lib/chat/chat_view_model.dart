@@ -16,8 +16,10 @@ import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/notifications/scope_notification_settings.dart';
 
 import '../channels/topic_list_actions.dart';
+import '../config/build_flags.dart';
 import '../notifications/notification_settings_payload.dart';
 import '../settings/blocked_user_service.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../tdlib/forum_topic_index.dart';
@@ -39,6 +41,7 @@ import 'forum_topic_transcript.dart';
 import 'forward_markdown.dart';
 import 'forward_options.dart';
 import 'gif_item.dart';
+import 'link_preview_fixer.dart';
 import 'message_reaction_availability.dart';
 import 'message_send_options.dart';
 import 'message_text_quote.dart';
@@ -93,6 +96,7 @@ class _SenderInfo {
     this.role,
     this.title, {
     this.isPremium = false,
+    this.isDeleted = false,
     this.accentColorId = -1,
     this.emojiStatusId = 0,
   });
@@ -101,6 +105,10 @@ class _SenderInfo {
   final MemberRole role;
   final String? title;
   final bool isPremium;
+
+  /// TDLib reported `userTypeDeleted`: the account no longer exists, so it has
+  /// no profile to open and nothing to report.
+  final bool isDeleted;
   final int accentColorId;
   final int emojiStatusId;
 }
@@ -216,12 +224,16 @@ class MentionCandidate {
     required this.name,
     this.username = '',
     this.photo,
+    this.isDeleted = false,
+    this.isInlineBot = false,
   });
 
   final int userId;
   final String name;
   final String username;
   final TdFileRef? photo;
+  final bool isDeleted;
+  final bool isInlineBot;
 }
 
 class MessageReactionUser {
@@ -230,12 +242,16 @@ class MessageReactionUser {
     required this.title,
     this.photo,
     this.date = 0,
+    this.isDeleted = false,
   });
 
   final int senderId;
   final String title;
   final TdFileRef? photo;
   final int date;
+
+  /// The account behind the reaction no longer exists.
+  final bool isDeleted;
 }
 
 class BotCommandOption {
@@ -423,6 +439,28 @@ class ForumTopicOption {
     iconColor: entry.iconColor,
     unreadCount: entry.unreadCount,
     isMuted: entry.isMuted,
+    isPinned: isPinned,
+    isGeneral: isGeneral,
+    isClosed: isClosed,
+    creatorId: creatorId,
+    lastPreview: lastPreview,
+    lastSender: lastSender,
+    lastMessageDate: lastMessageDate,
+    // The index can know a newer message than a stale page row: keep the
+    // newer id so a later mark-read targets live traffic, not the old page.
+    lastMessageId: entry.lastMessageId > lastMessageId
+        ? entry.lastMessageId
+        : lastMessageId,
+  );
+
+  /// The same row with a new unread counter, every other field untouched.
+  ForumTopicOption _withUnreadCount(int unread) => ForumTopicOption(
+    id: id,
+    name: name,
+    iconCustomEmojiId: iconCustomEmojiId,
+    iconColor: iconColor,
+    unreadCount: unread,
+    isMuted: isMuted,
     isPinned: isPinned,
     isGeneral: isGeneral,
     isClosed: isClosed,
@@ -1156,9 +1194,17 @@ class ChatViewModel extends ChangeNotifier {
     return true;
   }
 
+  /// Points TDLib at a preview mirror for the message's first link when the user
+  /// opted in to fixing link previews. Requests that already carry
+  /// `link_preview_options` keep them: an explicit choice beats a preference.
+  Map<String, dynamic> _withFixedLinkPreview(Map<String, dynamic> request) =>
+      LinkPreviewFixer.shared.applyTo(request);
+
   Future<bool> _submitMessageRequest(Map<String, dynamic> request) async {
     try {
-      await _client.query(_withPaidMessageOptions(request));
+      await _client.query(
+        _withPaidMessageOptions(_withFixedLinkPreview(request)),
+      );
       return true;
     } catch (error) {
       _publishSendFailure(
@@ -1497,6 +1543,10 @@ class ChatViewModel extends ChangeNotifier {
 
   /// Tell TDLib the user is typing (drives the peer's typing indicator).
   void sendTyping() {
+    if (allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockTyping(chatId).isBlock) {
+      return;
+    }
     _client.send({
       '@type': 'sendChatAction',
       'chat_id': chatId,
@@ -1732,8 +1782,15 @@ class ChatViewModel extends ChangeNotifier {
     _insertMention(name, userId);
   }
 
-  Future<List<MentionCandidate>> searchMentionCandidates(String query) async {
-    if (!isGroup) return const [];
+  Future<List<MentionCandidate>> searchMentionCandidates(
+    String query, {
+    bool includeInlineBots = false,
+  }) async {
+    final inlineBots = includeInlineBots
+        ? await _recentInlineBotCandidates(query)
+        : const <MentionCandidate>[];
+    if (!isGroup) return inlineBots;
+    List<MentionCandidate> memberCandidates;
     try {
       final result = await _client.query({
         '@type': 'searchChatMembers',
@@ -1746,9 +1803,86 @@ class ChatViewModel extends ChangeNotifier {
       final resolved = await Future.wait(
         members.map(_mentionCandidateFromMember),
       );
+      memberCandidates = resolved.whereType<MentionCandidate>().toList(
+        growable: false,
+      );
+    } catch (_) {
+      memberCandidates = _recentMentionCandidates(query);
+    }
+    if (inlineBots.isEmpty) return memberCandidates;
+    final seen = <int>{for (final bot in inlineBots) bot.userId};
+    return [
+      ...inlineBots,
+      for (final member in memberCandidates)
+        if (seen.add(member.userId)) member,
+    ];
+  }
+
+  Future<List<MentionCandidate>> _recentInlineBotCandidates(
+    String query,
+  ) async {
+    if (isSecretChat) return const [];
+    try {
+      final response = await _client.query({'@type': 'getRecentInlineBots'});
+      // The await can outlive the view model (disposed while the response was
+      // held): no follow-up getUser may be issued and no candidate returned.
+      if (_isDisposed) return const [];
+      final rawIds = response['user_ids'];
+      if (rawIds is! List || rawIds.isEmpty) return const [];
+      final ids = rawIds
+          .map(
+            (v) => switch (v) {
+              final int n => n,
+              final String s => int.tryParse(s),
+              _ => null,
+            },
+          )
+          .whereType<int>()
+          .where((id) => id > 0)
+          .take(20)
+          .toList(growable: false);
+      if (ids.isEmpty) return const [];
+      final normalized = query.trim().toLowerCase();
+      final resolved = await Future.wait(
+        ids.map((userId) async {
+          try {
+            final user = await _client.query({
+              '@type': 'getUser',
+              'user_id': userId,
+            });
+            if (_isDisposed) return null;
+            final type = user.obj('type');
+            if (type?.type != 'userTypeBot' ||
+                (type?.boolean('is_inline') ?? false) == false) {
+              return null;
+            }
+            final username = _primaryUsername(user);
+            if (username.isEmpty) return null;
+            final rawName = TDParse.userName(user).trim();
+            final name = rawName.isEmpty
+                ? username
+                : (rawName.startsWith('@') ? rawName.substring(1) : rawName);
+            if (normalized.isNotEmpty &&
+                !username.toLowerCase().startsWith(normalized) &&
+                !name.toLowerCase().contains(normalized)) {
+              return null;
+            }
+            return MentionCandidate(
+              userId: userId,
+              name: name,
+              username: username,
+              photo: TDParse.smallPhoto(user.obj('profile_photo')),
+              isInlineBot: true,
+            );
+          } catch (_) {
+            return null;
+          }
+        }),
+      );
+      if (_isDisposed) return const [];
       return resolved.whereType<MentionCandidate>().toList(growable: false);
     } catch (_) {
-      return _recentMentionCandidates(query);
+      return const [];
     }
   }
 
@@ -1776,6 +1910,7 @@ class ChatViewModel extends ChangeNotifier {
         name: name.startsWith('@') ? name.substring(1) : name,
         username: username,
         photo: TDParse.smallPhoto(user.obj('profile_photo')),
+        isDeleted: TDParse.isDeletedUser(user),
       );
     } catch (_) {
       return null;
@@ -1800,6 +1935,7 @@ class ChatViewModel extends ChangeNotifier {
           userId: userId,
           name: name,
           photo: message.senderPhoto,
+          isDeleted: message.senderIsDeleted,
         ),
       );
       if (result.length == 30) break;
@@ -1818,6 +1954,24 @@ class ChatViewModel extends ChangeNotifier {
     _draftFormattedEntities = const [];
     _draftMentions.add(_DraftMention(text: mention, userId: userId));
     if (editingMessage == null) _scheduleDraftSave();
+    notifyListeners();
+  }
+
+  /// Replaces the composer draft with `@botUsername query` and asks the
+  /// composer to focus and run an inline-bot lookup immediately.
+  void activateInlineQuery(String botUsername, [String query = '']) {
+    final cleanUsername = botUsername.trim().replaceFirst(RegExp(r'^@+'), '');
+    if (cleanUsername.isEmpty) return;
+    if (editingMessage != null) {
+      _restoreComposerAfterMessageEdit(notify: false, scheduleDraftSave: false);
+    }
+    final text = '@$cleanUsername $query';
+    draft = text;
+    _draftFormattedText = text;
+    _draftFormattedEntities = const [];
+    _draftMentions.clear();
+    _scheduleDraftSave();
+    _composerFocusTick++;
     notifyListeners();
   }
 
@@ -1880,7 +2034,9 @@ class ChatViewModel extends ChangeNotifier {
       },
       'input_message_content': content,
     };
-    final response = await _client.query(_withPaidMessageOptions(request));
+    final response = await _client.query(
+      _withPaidMessageOptions(_withFixedLinkPreview(request)),
+    );
     final message = TDParse.message(response);
     if (message != null) {
       _merge([message]);
@@ -3292,6 +3448,21 @@ class ChatViewModel extends ChangeNotifier {
     await _reportTelegramContent(message);
   }
 
+  /// Reports one sender's reaction on a message. The caller must have checked
+  /// the message's `can_report_reactions` property first; the write stays on
+  /// the client that owns this pane, so a dialog confirmed after an account
+  /// switch cannot report into the replacement account.
+  Future<void> reportReaction(ChatMessage message, int senderId) async {
+    await _client.queryTo({
+      '@type': 'reportMessageReactions',
+      'chat_id': chatId,
+      'message_id': message.id,
+      'sender_id': senderId > 0
+          ? {'@type': 'messageSenderUser', 'user_id': senderId}
+          : {'@type': 'messageSenderChat', 'chat_id': senderId},
+    }, _accountClientId);
+  }
+
   Future<void> blockSender(ChatMessage message) async {
     final senderId = message.senderId;
     final sender = _messageSenderFor(message);
@@ -3352,6 +3523,15 @@ class ChatViewModel extends ChangeNotifier {
     List<Map<String, dynamic>> entities = const [],
   }) async {
     if (text.trim().isEmpty) return;
+    final parsed = TDParse.textEntities({
+      '@type': 'formattedText',
+      'text': text,
+      'entities': entities,
+    });
+    final previewUrl = LinkPreviewFixer.shared.previewUrl(
+      text,
+      entities: parsed,
+    );
     await _client.query({
       '@type': 'editMessageText',
       'chat_id': chatId,
@@ -3366,14 +3546,10 @@ class ChatViewModel extends ChangeNotifier {
         'link_preview_options': {
           '@type': 'linkPreviewOptions',
           'is_disabled': false,
+          'url': ?previewUrl,
         },
         'clear_draft': false,
       },
-    });
-    final parsed = TDParse.textEntities({
-      '@type': 'formattedText',
-      'text': text,
-      'entities': entities,
     });
     _replaceText(
       id,
@@ -4463,6 +4639,7 @@ class ChatViewModel extends ChangeNotifier {
         iconColor: entry.iconColor,
         unreadCount: entry.unreadCount,
         isMuted: entry.isMuted,
+        lastMessageId: entry.lastMessageId,
       );
 
   int? _forumTopicId(Map<String, dynamic> topic, Map<String, dynamic> info) {
@@ -4679,6 +4856,141 @@ class ChatViewModel extends ChangeNotifier {
     }
   }
 
+  /// Clears every one of [topicIds] at once: the rows drop their unread
+  /// counters before the first request leaves, each topic's read is sent
+  /// scoped to its own newest message, and a failed topic gets its own counter
+  /// back. Reads run even for topics that already report zero locally, so a
+  /// stale counter cannot survive on the server.
+  ///
+  /// Rollback is deliberately per topic and state-guarded: a topic whose
+  /// request failed regains its counter only while the index still holds the
+  /// exact read state captured before the optimistic clear. An authoritative
+  /// updateForumTopic (or new traffic) that moved the watermark while the
+  /// batch was in flight wins, so a successful read's zero is never
+  /// overwritten by an older counter.
+  ///
+  /// Throws only when no topic could be read at all. With [failureFeedback]
+  /// false a partial failure is silent (the counters still roll back); the
+  /// caller decides what to say.
+  Future<void> markForumTopicsRead(
+    Iterable<int> topicIds, {
+    bool failureFeedback = true,
+  }) async {
+    if (_isDisposed) return;
+    final wanted = topicIds.toSet();
+    final targets = [
+      for (final topic in forumTopics)
+        if (wanted.contains(topic.id) && topic.lastMessageId > 0) topic,
+    ];
+    if (targets.isEmpty) return;
+    // Snapshot the index state behind each counter, not just the number: the
+    // rollback guard needs to know whether the read position moved since.
+    final previous =
+        <
+          int,
+          ({int unreadCount, int? lastReadInboxMessageId, int? lastMessageId})
+        >{};
+    for (final topic in targets) {
+      if (topic.unreadCount <= 0) continue;
+      final entry = ForumTopicIndex.shared.entryFor(
+        _accountSlot,
+        chatId,
+        topic.id,
+      );
+      previous[topic.id] = (
+        unreadCount: topic.unreadCount,
+        lastReadInboxMessageId: entry?.lastReadInboxMessageId,
+        lastMessageId: entry?.lastMessageId,
+      );
+    }
+    if (previous.isNotEmpty) {
+      _applyTopicUnreadCounts({
+        for (final topicId in previous.keys) topicId: 0,
+      });
+    }
+    var failures = 0;
+    Object? firstError;
+    for (final topic in targets) {
+      try {
+        await _topicAccountQuery(
+          forumTopicViewMessagesRequest(
+            chatId: chatId,
+            messageIds: [topic.lastMessageId],
+          ),
+        );
+        if (_isDisposed) return;
+        // TDLib advanced this topic's inbox watermark; remember it so a stale
+        // getForumTopics page cannot regress the successful read.
+        ForumTopicIndex.shared.recordRead(
+          _accountSlot,
+          chatId,
+          topic.id,
+          readMessageId: topic.lastMessageId,
+          lastMessageId: topic.lastMessageId,
+        );
+      } catch (error) {
+        if (_isDisposed) return;
+        failures++;
+        firstError ??= error;
+        final snapshot = previous[topic.id];
+        if (snapshot == null) continue;
+        // Restore only this topic, and only while nothing authoritative moved
+        // its read position or newest message during the batch.
+        final restored = ForumTopicIndex.shared.restoreUnreadCountIfUnmoved(
+          _accountSlot,
+          chatId,
+          topic.id,
+          restoreCount: snapshot.unreadCount,
+          expectedUnreadCount: 0,
+          expectedLastReadInboxMessageId: snapshot.lastReadInboxMessageId,
+          expectedLastMessageId: snapshot.lastMessageId,
+        );
+        if (restored) {
+          _applyTopicUnreadCounts({topic.id: snapshot.unreadCount});
+        }
+      }
+    }
+    if (failures > 0) {
+      if (failures == targets.length) throw firstError!;
+      if (failureFeedback) {
+        // Some topics could not be read: say so once, after the rollback.
+        _bulkReadFailed = true;
+        notifyListeners();
+      }
+    }
+    await loadForumTopics();
+  }
+
+  /// True when the last bulk read lost some topics; the surface reads and
+  /// clears it to raise one toast.
+  bool _bulkReadFailed = false;
+  bool takeBulkReadFailure() {
+    final failed = _bulkReadFailed;
+    _bulkReadFailed = false;
+    return failed;
+  }
+
+  /// Rewrites the unread counter of the named rows in place (the index owns
+  /// every other displayed field), notifying only on a real change.
+  void _applyTopicUnreadCounts(Map<int, int> counts) {
+    if (counts.isEmpty) return;
+    var changed = false;
+    final next = <ForumTopicOption>[];
+    for (final topic in forumTopics) {
+      final count = counts[topic.id];
+      if (count == null || count == topic.unreadCount) {
+        next.add(topic);
+        continue;
+      }
+      changed = true;
+      next.add(topic._withUnreadCount(count));
+    }
+    ForumTopicIndex.shared.setUnreadCounts(_accountSlot, chatId, counts);
+    if (!changed) return;
+    forumTopics = next;
+    notifyListeners();
+  }
+
   /// Folds live updates into the topic rows so previews, pins, closes and
   /// renames move without a full getForumTopics round-trip. Runs for every
   /// update of this chat — including topics other than the open transcript.
@@ -4847,6 +5159,8 @@ class ChatViewModel extends ChangeNotifier {
   }
 
   Future<int?> webAppBotUserId(ChatMessage? message) async {
+    final viaBotId = message?.viaBotUserId;
+    if (viaBotId != null && viaBotId > 0) return viaBotId;
     if (peerIsBot && peerUserId != null) return peerUserId;
     final senderId = message?.senderId;
     if (senderId == null || senderId <= 0) return null;
@@ -4859,6 +5173,59 @@ class ChatViewModel extends ChangeNotifier {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Resolves the `@username` of the bot that owns [message] (either its
+  /// `via_bot_user_id`, the message's bot sender, or the current bot peer).
+  Future<String?> resolveInlineBotUsername(ChatMessage? message) async {
+    final cachedHandle = message?.viaBotUsername?.trim();
+    if (cachedHandle != null && cachedHandle.startsWith('@')) {
+      final clean = cachedHandle.substring(1).trim();
+      if (clean.isNotEmpty) return clean;
+    }
+    final candidates = <int>[
+      if (message?.viaBotUserId case final id? when id > 0) id,
+      if (message?.senderId case final id? when id > 0) id,
+      if (peerIsBot && peerUserId != null && peerUserId! > 0) peerUserId!,
+      if (message?.forwardFromUserId case final id? when id > 0) id,
+    ];
+    final seen = <int>{};
+    for (final userId in candidates) {
+      if (!seen.add(userId)) continue;
+      final cached = _viaBotUsernames[userId];
+      if (cached != null && cached.startsWith('@')) {
+        final clean = cached.substring(1).trim();
+        if (clean.isNotEmpty) return clean;
+      }
+      try {
+        final user = await _client.query({
+          '@type': 'getUser',
+          'user_id': userId,
+        });
+        if (!_isBotUser(user)) continue;
+        final username = _primaryUsername(user);
+        if (username.isNotEmpty) {
+          _viaBotUsernames[userId] = '@$username';
+          return username;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  static String _primaryUsername(Map<String, dynamic> user) {
+    final usernames = user.obj('usernames');
+    final active = usernames?['active_usernames'];
+    if (active is List) {
+      for (final value in active) {
+        if (value is String && value.trim().isNotEmpty) {
+          return value.trim();
+        }
+      }
+    }
+    final editable = usernames?.str('editable_username')?.trim();
+    if (editable != null && editable.isNotEmpty) return editable;
+    return (user.str('username') ?? '').trim();
   }
 
   Future<void> _loadBotInfo(int userId) async {
@@ -5371,12 +5738,17 @@ class ChatViewModel extends ChangeNotifier {
         )
         .toList(growable: false);
     if (viewed.isEmpty) return;
-    _client.send({
-      '@type': 'viewMessages',
-      'chat_id': chatId,
-      'message_ids': viewed.map((message) => message.id).toSet().toList(),
-      'force_read': true,
-    });
+    // Ghost mode skips only the server report; the local mention/reaction
+    // counters below still clear so the UI reads the chat as read.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      _client.send({
+        '@type': 'viewMessages',
+        'chat_id': chatId,
+        'message_ids': viewed.map((message) => message.id).toSet().toList(),
+        'force_read': true,
+      });
+    }
     _consumeViewedMentions(
       viewed
           .where((message) => message.containsUnreadMention)
@@ -5393,29 +5765,39 @@ class ChatViewModel extends ChangeNotifier {
   /// scrolled it into place. Awaiting TDLib prevents a quick second tap from
   /// resolving the same mention again.
   Future<void> markUnreadMentionRead(int messageId) async {
-    try {
-      await _client.query({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': [messageId],
-        'force_read': true,
-      });
-    } catch (_) {
-      return;
+    // Ghost mode skips only the server report; the blue-@ badge below still
+    // clears so the UI reads the mention as read.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      try {
+        await _client.query({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': [messageId],
+          'force_read': true,
+        });
+      } catch (_) {
+        return;
+      }
     }
     _consumeViewedMentions([messageId], force: true);
   }
 
   Future<void> markUnreadReactionRead(int messageId) async {
-    try {
-      await _client.query({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': [messageId],
-        'force_read': true,
-      });
-    } catch (_) {
-      return;
+    // Ghost mode skips only the server report; the local reaction counter
+    // below still clears so the UI reads the reaction as seen.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+      try {
+        await _client.query({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': [messageId],
+          'force_read': true,
+        });
+      } catch (_) {
+        return;
+      }
     }
     _consumeViewedReactions([messageId], force: true);
   }
@@ -5743,12 +6125,19 @@ class ChatViewModel extends ChangeNotifier {
       ++_chatReadStateRevision;
       notifyListeners();
 
+      final ghostRead =
+          allowTelegramTosViolations &&
+          GhostModeController.shared.shouldBlockRead(chatId).isBlock;
       if (shouldClearMarker) {
-        _client.send({
-          '@type': 'toggleChatIsMarkedAsUnread',
-          'chat_id': chatId,
-          'is_marked_as_unread': false,
-        });
+        // Ghost mode keeps the local unread bookkeeping (emitLocalUpdate)
+        // and only skips the server report.
+        if (!ghostRead) {
+          _client.send({
+            '@type': 'toggleChatIsMarkedAsUnread',
+            'chat_id': chatId,
+            'is_marked_as_unread': false,
+          });
+        }
         _client.emitLocalUpdate({
           '@type': 'updateChatIsMarkedAsUnread',
           'chat_id': chatId,
@@ -5757,15 +6146,17 @@ class ChatViewModel extends ChangeNotifier {
       }
       if (shouldForceRead) {
         _lastForcedReadMessageId = messageId;
-        _client.send({
-          '@type': 'viewMessages',
-          'chat_id': chatId,
-          'message_ids': [messageId],
-          'source': isForumTopicTranscript
-              ? {'@type': 'messageSourceForumTopicHistory'}
-              : null,
-          'force_read': true,
-        });
+        if (!ghostRead) {
+          _client.send({
+            '@type': 'viewMessages',
+            'chat_id': chatId,
+            'message_ids': [messageId],
+            'source': isForumTopicTranscript
+                ? {'@type': 'messageSourceForumTopicHistory'}
+                : null,
+            'force_read': true,
+          });
+        }
         // A topic's read position is not the chat's; TDLib reports the
         // resulting chat-wide counts through its own updates.
         if (!isForumTopicTranscript) {
@@ -6534,6 +6925,36 @@ class ChatViewModel extends ChangeNotifier {
     }
   }
 
+  /// Whether Telegram allows reporting a reaction on [messageId]
+  /// (`messageProperties.can_report_reactions`).
+  ///
+  /// This is a property of the message, not a field of the `message` object:
+  /// the pinned TDLib schema returns it only from `getMessageProperties`, and
+  /// `reportMessageReactions` depends on that same property. Fail closed — an
+  /// error or a switch away from this pane's account hides the action.
+  Future<bool> canReportMessageReactions(int messageId) async {
+    try {
+      final properties = await _client.queryTo({
+        '@type': 'getMessageProperties',
+        'chat_id': chatId,
+        'message_id': messageId,
+      }, _accountClientId);
+      if (_isDisposed || !isAccountCurrent) return false;
+      return properties.boolean('can_report_reactions') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// True while the client this pane was opened on is still the active one.
+  /// Destructive actions confirmed through a dialog re-check this after the
+  /// await so the write cannot land on a replacement account.
+  bool get isAccountCurrent =>
+      !_isDisposed &&
+      _accountClientId > 0 &&
+      _client.activeClientId == _accountClientId &&
+      _client.activeSlot == _accountSlot;
+
   /// Whether Telegram offers a shareable HTTPS link for [messageId]
   /// (`messageProperties.can_get_link`). Offline per the pinned schema, but
   /// still fail-closed: a property error hides the action, mirroring how the
@@ -6653,6 +7074,7 @@ class ChatViewModel extends ChangeNotifier {
           title: info.name,
           photo: info.photo,
           date: item.integer('date') ?? 0,
+          isDeleted: info.isDeleted,
         ),
       );
     }
@@ -6681,6 +7103,7 @@ class ChatViewModel extends ChangeNotifier {
           TDParse.smallPhoto(user.obj('profile_photo')),
           MemberRole.member,
           null,
+          isDeleted: TDParse.isDeletedUser(user),
         );
       } catch (_) {
         return _SenderInfo(
@@ -6804,40 +7227,62 @@ class ChatViewModel extends ChangeNotifier {
     // map for each history page (or scanning the transcript for a live reply)
     // made quoting increasingly expensive as more history was loaded.
     _ensureMessageIndexes();
-    final unresolved = <int, List<ChatMessage>>{};
+    final unresolvedByChat = <int, Map<int, List<ChatMessage>>>{};
     for (final m in repliesToResolve) {
       final rid = m.replyToMessageId!;
-      final quoted = _messagesById[rid];
+      final rChatId = m.replyToChatId ?? m.chatId ?? chatId;
+      final quoted = rChatId == chatId
+          ? (_messagesById[rid] ?? _allMessagesById[rid])
+          : null;
       if (quoted != null) {
-        _applyReply(m, quoted);
+        // The locally cached target is trusted only across the restriction
+        // boundary: a redacted message must not lend its text to this anchor,
+        // and no remote lookup can repair the hole it would leave.
+        if (!quoted.isContentRestricted) {
+          _applyReply(m, quoted);
+        }
         continue;
       }
+      final unresolved = unresolvedByChat.putIfAbsent(
+        rChatId,
+        () => <int, List<ChatMessage>>{},
+      );
       unresolved.putIfAbsent(rid, () => <ChatMessage>[]).add(m);
     }
-    if (unresolved.isEmpty) return;
+    if (unresolvedByChat.isEmpty) return;
     // One getMessage per distinct target meant 10-25 concurrent round trips for
     // a single reply-heavy history page, repeated for every page scrolled up.
     // getMessages answers them all at once, so the previews fill in together.
-    final targets = unresolved.keys.toList();
-    for (var start = 0; start < targets.length; start += 100) {
-      final end = start + 100 > targets.length ? targets.length : start + 100;
-      _resolveReplyTargets(targets.sublist(start, end), unresolved);
+    for (final entry in unresolvedByChat.entries) {
+      final targetChatId = entry.key;
+      final unresolved = entry.value;
+      final targets = unresolved.keys.toList();
+      for (var start = 0; start < targets.length; start += 100) {
+        final end = start + 100 > targets.length ? targets.length : start + 100;
+        _resolveReplyTargets(
+          targetChatId,
+          targets.sublist(start, end),
+          unresolved,
+        );
+      }
     }
   }
 
   /// Fetches one batch of reply targets and patches every message waiting on it.
   void _resolveReplyTargets(
+    int targetChatId,
     List<int> messageIds,
     Map<int, List<ChatMessage>> unresolved,
   ) {
     _client
         .query({
           '@type': 'getMessages',
-          'chat_id': chatId,
+          'chat_id': targetChatId,
           'message_ids': messageIds,
         })
         .then((response) {
-          var changed = false;
+          if (_chatOpenWorkIsStale) return;
+          final updatedIds = <int>{};
           // Unavailable ids come back as nulls that carry no identity, so the
           // bucket is looked up by the id on each returned message, not by
           // position.
@@ -6848,16 +7293,42 @@ class ChatViewModel extends ChangeNotifier {
             if (quoted == null) continue;
             final waiting = unresolved[quoted.id];
             if (waiting == null) continue;
-            for (final message in waiting) {
-              if (message.replyToMessageId != quoted.id ||
-                  message.replyToPreview != null) {
-                continue;
+            for (final m in waiting) {
+              final refs = _messageRefs(m.id);
+              final targets = refs.isEmpty ? <ChatMessage>[m] : refs;
+              for (final message in targets) {
+                // A held lookup belongs to the COMPLETE target captured when it
+                // was issued. The message id alone is not identity: the refresh
+                // may have retargeted this very reply to another chat that uses
+                // the same numeric id, and applying the old chat's payload
+                // would hydrate the new target with another message's text.
+                final liveChatId =
+                    message.replyToChatId ?? message.chatId ?? chatId;
+                if (message.replyToMessageId != quoted.id ||
+                    liveChatId != targetChatId ||
+                    message.replyToPreview != null) {
+                  continue;
+                }
+                // Returned quotes must come from the requested chat: a
+                // mis-addressed response would otherwise smuggle a same-id
+                // message of a foreign chat into the reply anchor.
+                final quotedChatId = quoted.chatId ?? targetChatId;
+                if (quotedChatId != targetChatId) continue;
+                // A restriction-redacted reply must never be hydrated from
+                // cached quote plaintext, and a redacted response is a
+                // withdrawal, not an anchor to copy.
+                if (message.isContentRestricted || quoted.isContentRestricted) {
+                  continue;
+                }
+                _applyReply(message, quoted);
+                updatedIds.add(message.id);
               }
-              _applyReply(message, quoted);
-              changed = true;
             }
           }
-          if (changed) _scheduleCoalescedNotify();
+          if (updatedIds.isNotEmpty) {
+            _bumpMaterializedMessageRevisions(updatedIds);
+            _scheduleCoalescedNotify();
+          }
         })
         .catchError((_) {});
   }
@@ -6895,8 +7366,9 @@ class ChatViewModel extends ChangeNotifier {
   /// the reply in place. Reuses the sender cache populated for the transcript.
   Future<void> _resolveQuotedSender(ChatMessage m, int senderId) async {
     final existing = _senderCache[senderId];
-    if (existing != null) {
+    if (existing != null && existing.name.isNotEmpty) {
       m.replyToSender = existing.name;
+      _bumpMaterializedMessageRevisions([m.id]);
       _scheduleCoalescedNotify();
       return;
     }
@@ -6918,6 +7390,7 @@ class ChatViewModel extends ChangeNotifier {
     } catch (_) {}
     if (name != null && name.isNotEmpty) {
       m.replyToSender = name;
+      _bumpMaterializedMessageRevisions([m.id]);
       _scheduleCoalescedNotify();
     }
   }
@@ -7111,12 +7584,17 @@ class ChatViewModel extends ChangeNotifier {
     for (var i = 0; i < ids.length; i += 100) {
       final end = i + 100 > ids.length ? ids.length : i + 100;
       final chunk = ids.sublist(i, end);
-      _client.send({
-        '@type': 'viewMessages',
-        'chat_id': chatId,
-        'message_ids': chunk,
-        'force_read': true,
-      });
+      // Blocked-country messages must clear locally too; only the server
+      // report is skipped in ghost mode.
+      if (!(allowTelegramTosViolations &&
+          GhostModeController.shared.shouldBlockRead(chatId).isBlock)) {
+        _client.send({
+          '@type': 'viewMessages',
+          'chat_id': chatId,
+          'message_ids': chunk,
+          'force_read': true,
+        });
+      }
     }
   }
 
@@ -7524,6 +8002,7 @@ class ChatViewModel extends ChangeNotifier {
             m.senderRole == info.role &&
             m.senderTitle == (info.title ?? m.senderTitle) &&
             m.senderIsPremium == info.isPremium &&
+            m.senderIsDeleted == info.isDeleted &&
             m.senderAccentColorId == info.accentColorId &&
             m.senderEmojiStatusId == info.emojiStatusId) {
           continue;
@@ -7533,6 +8012,7 @@ class ChatViewModel extends ChangeNotifier {
         m.senderRole = info.role;
         m.senderTitle = info.title ?? m.senderTitle;
         m.senderIsPremium = info.isPremium;
+        m.senderIsDeleted = info.isDeleted;
         m.senderAccentColorId = info.accentColorId;
         m.senderEmojiStatusId = info.emojiStatusId;
         changed = true;
@@ -7630,6 +8110,14 @@ class ChatViewModel extends ChangeNotifier {
     _handle(update);
   }
 
+  /// Marks the read-state gates satisfied so read-marking paths can be
+  /// exercised without replaying the whole history bootstrap.
+  @visibleForTesting
+  void markChatReadStateReadyForTesting() {
+    _chatReadStateLoaded = true;
+    _historyReachesLatest = true;
+  }
+
   @visibleForTesting
   void isForumForTesting(bool value) {
     isForum = value;
@@ -7690,6 +8178,7 @@ class ChatViewModel extends ChangeNotifier {
       role,
       title,
       isPremium: user.boolean('is_premium') ?? false,
+      isDeleted: TDParse.isDeletedUser(user),
       accentColorId: user.integer('accent_color_id') ?? -1,
       emojiStatusId: TDParse.emojiStatusCustomEmojiId(user.obj('emoji_status')),
     );
@@ -7698,6 +8187,7 @@ class ChatViewModel extends ChangeNotifier {
   /// Fills `forwardOrigin` for forwarded messages whose origin is a user or
   /// chat we can name (hidden-user names already arrive inline).
   void _resolveForwardsIfNeeded(List<ChatMessage> batch) {
+    _resolveViaBotsIfNeeded(batch);
     for (final m in batch) {
       if (m.forwardOrigin != null && m.forwardOrigin!.isNotEmpty) continue;
       final uid = m.forwardFromUserId;
@@ -7778,6 +8268,66 @@ class ChatViewModel extends ChangeNotifier {
     for (final message in waiting) {
       message.forwardOrigin = name;
     }
+    _bumpMaterializedMessageRevisions(waiting.map((m) => m.id));
+    _scheduleCoalescedNotify();
+  }
+
+  final Map<int, String> _viaBotUsernames = {};
+  final Map<int, List<ChatMessage>> _pendingViaBotUsers = {};
+
+  void _resolveViaBotsIfNeeded(List<ChatMessage> batch) {
+    for (final m in batch) {
+      if (m.isContentRestricted) continue;
+      if (m.viaBotUsername != null && m.viaBotUsername!.isNotEmpty) continue;
+      final botUserId = m.viaBotUserId;
+      if (botUserId == null || botUserId <= 0) continue;
+      final cached = _viaBotUsernames[botUserId];
+      if (cached != null) {
+        m.viaBotUsername = cached;
+        continue;
+      }
+      final waiting = _pendingViaBotUsers[botUserId];
+      if (waiting != null) {
+        waiting.add(m);
+        continue;
+      }
+      _pendingViaBotUsers[botUserId] = <ChatMessage>[m];
+      unawaited(_resolveViaBotUsername(botUserId));
+    }
+  }
+
+  Future<void> _resolveViaBotUsername(int botUserId) async {
+    String? label;
+    try {
+      final user = await _client.query({
+        '@type': 'getUser',
+        'user_id': botUserId,
+      });
+      final username = _primaryUsername(user);
+      if (username.isNotEmpty) {
+        label = '@$username';
+      } else {
+        final name = TDParse.userName(user).trim();
+        if (name.isNotEmpty) label = name;
+      }
+    } catch (_) {}
+    final waiting = _pendingViaBotUsers.remove(botUserId);
+    if (label == null || label.isEmpty || waiting == null) return;
+    _viaBotUsernames[botUserId] = label;
+    final updatedIds = <int>{};
+    for (final m in waiting) {
+      final refs = _messageRefs(m.id);
+      final targets = refs.isEmpty ? <ChatMessage>[m] : refs;
+      for (final message in targets) {
+        if (message.isContentRestricted || message.viaBotUserId != botUserId) {
+          continue;
+        }
+        message.viaBotUsername = label;
+        updatedIds.add(message.id);
+      }
+    }
+    if (updatedIds.isEmpty) return;
+    _bumpMaterializedMessageRevisions(updatedIds);
     _scheduleCoalescedNotify();
   }
 

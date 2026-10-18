@@ -37,6 +37,7 @@ import '../channels/topic_navigation.dart';
 import '../chats/search_token_views.dart';
 import '../communities/community_models.dart';
 import '../communities/community_view.dart';
+import '../components/app_confirm_dialog.dart';
 import '../components/app_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -66,6 +67,7 @@ import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_image_loader.dart';
 import '../tdlib/td_models.dart';
+import '../tdlib/td_requests.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
 import '../theme/date_text.dart';
@@ -898,6 +900,26 @@ class ChatViewExitController {
   void prepareExit() => _prepareExit?.call();
 }
 
+/// Lets an adaptive parent ask the transcript it already shows to reveal the
+/// newest message.
+///
+/// Tapping the conversation that is already open in the split pane has nothing
+/// to navigate to, so it has to mean "take me to the latest message" instead of
+/// rebuilding the same pane and leaving the reader wherever they had scrolled.
+class ChatRevealLatestController {
+  VoidCallback? _revealLatest;
+
+  /// Registers the currently visible chat and returns a matching detacher.
+  VoidCallback register(VoidCallback revealLatest) {
+    _revealLatest = revealLatest;
+    return () {
+      if (identical(_revealLatest, revealLatest)) _revealLatest = null;
+    };
+  }
+
+  void revealLatest() => _revealLatest?.call();
+}
+
 /// Keeps the chat header full-width while reserving a trailing context pane
 /// only below it. This avoids the empty header gutter produced by placing the
 /// context pane beside the entire chat view.
@@ -979,6 +1001,7 @@ class ChatView extends StatefulWidget {
     this.onOpenUserProfile,
     this.onBack,
     this.exitController,
+    this.revealLatestController,
   });
   final int chatId;
   final String title;
@@ -1008,6 +1031,10 @@ class ChatView extends StatefulWidget {
   final void Function(int userId, String name)? onOpenUserProfile;
   final VoidCallback? onBack;
   final ChatViewExitController? exitController;
+
+  /// Lets an owning shell ask this transcript — the one already on screen — to
+  /// show its newest message.
+  final ChatRevealLatestController? revealLatestController;
 
   @override
   State<ChatView> createState() => _ChatViewState();
@@ -1137,6 +1164,23 @@ class _TranscriptEntry {
   );
 }
 
+/// Where the reader was standing when an in-transcript jump (a reply quote tap
+/// or View in Chat) took them to another message. While this is live the
+/// floating arrow returns here instead of the newest message.
+class _ChatJumpOrigin {
+  const _ChatJumpOrigin({
+    required this.messageId,
+    required this.viewportOffset,
+  });
+
+  /// Topmost fully visible row (or the closest partially visible one above it)
+  /// at the moment the jump was requested.
+  final int messageId;
+
+  /// That row's top in viewport-local pixels, restored as-is on return.
+  final double viewportOffset;
+}
+
 class _ChatScrollSnapshot {
   const _ChatScrollSnapshot({
     required this.pixels,
@@ -1242,6 +1286,18 @@ class _ChatViewState extends State<ChatView> {
   Timer? _linkedMessageHighlightClearTimer;
   int? _scrollTargetId;
   int _scrollTargetGeneration = 0;
+
+  /// See [_ChatJumpOrigin]. Live from the moment a reply/View in Chat jump
+  /// starts until the arrow consumes it, the user drags the transcript away
+  /// from the jump target, or the session ends.
+  _ChatJumpOrigin? _jumpOrigin;
+  // Unlike the target generation, this survives a successful target clear so
+  // post-layout corrections can still be cancelled by a newer user intent.
+  int _jumpOriginReturnGeneration = 0;
+
+  /// Scroll offset when the drag that may abandon [_jumpOrigin] began. Null
+  /// outside such a drag, so programmatic scrolls cannot measure against it.
+  double? _jumpOriginDragBaseline;
   int _transcriptGestureGeneration = 0;
   int? _lastNewestMessageId;
   int? _lastOldestMessageId;
@@ -1337,6 +1393,7 @@ class _ChatViewState extends State<ChatView> {
   final Set<int> _autoTranslatedMessageIds = <int>{};
   bool _sendFailureDialogVisible = false;
   VoidCallback? _detachExitController;
+  VoidCallback? _detachRevealLatestController;
   VoidCallback? _detachPaneBackHandler;
   final ChatSessionCacheWriteGate _sessionCacheWriteGate =
       ChatSessionCacheWriteGate();
@@ -1382,6 +1439,9 @@ class _ChatViewState extends State<ChatView> {
   void initState() {
     super.initState();
     _detachExitController = widget.exitController?.register(_prepareExitState);
+    _detachRevealLatestController = widget.revealLatestController?.register(
+      _onRevealLatestRequested,
+    );
     _wallpaperController.addListener(_onWallpaperChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -1558,9 +1618,27 @@ class _ChatViewState extends State<ChatView> {
   @override
   void didUpdateWidget(covariant ChatView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (identical(oldWidget.exitController, widget.exitController)) return;
-    _detachExitController?.call();
-    _detachExitController = widget.exitController?.register(_prepareExitState);
+    if (oldWidget.chatId != widget.chatId ||
+        oldWidget.forumTopicId != widget.forumTopicId) {
+      // A switch to another conversation or topic invalidates every recorded
+      // reading position, this one included.
+      _forgetJumpOrigin();
+    }
+    if (!identical(oldWidget.exitController, widget.exitController)) {
+      _detachExitController?.call();
+      _detachExitController = widget.exitController?.register(
+        _prepareExitState,
+      );
+    }
+    if (!identical(
+      oldWidget.revealLatestController,
+      widget.revealLatestController,
+    )) {
+      _detachRevealLatestController?.call();
+      _detachRevealLatestController = widget.revealLatestController?.register(
+        _onRevealLatestRequested,
+      );
+    }
   }
 
   /// Whether this chat's topics are known — resolved live or seeded from the
@@ -1644,8 +1722,12 @@ class _ChatViewState extends State<ChatView> {
     selectedTopicId: widget.forumTopicId,
     onSelect: _openTopicTranscript,
     onCreateTopic: _vm.canCreateForumTopics ? _openCreateTopicDialog : null,
+    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
     onTopicMenu: _showTopicRowMenu,
   );
+
+  bool get _hasUnreadTopics =>
+      _vm.forumTopics.any((topic) => topic.unreadCount > 0);
 
   /// The rows handed to the shell. A pane rebuilt for another topic seeds
   /// from the shared index first, which knows identities and counters but
@@ -1672,7 +1754,9 @@ class _ChatViewState extends State<ChatView> {
     iconColor: topic.iconColor,
     unreadCount: topic.unreadCount,
     isMuted: topic.isMuted,
-    isPinned: topic.isPinned || (prior?.isPinned ?? false),
+    // A fresh model page can explicitly unpin a topic; the previously
+    // published marker must not turn that false back into true.
+    isPinned: topic.isPinned,
     isGeneral: topic.isGeneral || (prior?.isGeneral ?? false),
     isClosed: topic.isClosed || (prior?.isClosed ?? false),
     lastPreview: topic.lastPreview.isNotEmpty
@@ -1845,6 +1929,7 @@ class _ChatViewState extends State<ChatView> {
       _lastTranscriptUserScrollDirection = ScrollDirection.idle;
       final protectedRestoredPosition = _restoredPositionGuard
           .finishUserScroll();
+      _releaseJumpOriginAfterDrag();
       _returnToLatestCoordinator.userDragEnded();
       if (endedTowardLatest && !protectedRestoredPosition) {
         unawaited(_continueHistoryIfNearLatest());
@@ -1861,6 +1946,9 @@ class _ChatViewState extends State<ChatView> {
       _lastTranscriptUserScrollDirection = notification.direction;
       _restoredPositionGuard.noteUserScroll();
       _claimTranscriptViewport();
+      // A real drag is the only thing that can carry the reader away from the
+      // jump target; measure how far it went when it ends.
+      _noteJumpOriginDragStart();
     }
     return false;
   }
@@ -1989,6 +2077,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _claimTranscriptViewport() {
+    ++_jumpOriginReturnGeneration;
     ++_transcriptGestureGeneration;
     if (_scrollTargetId != null) {
       setState(_invalidateScrollNavigation);
@@ -2078,6 +2167,7 @@ class _ChatViewState extends State<ChatView> {
   void _prepareExitState() {
     if (_exitStatePrepared) return;
     _exitStatePrepared = true;
+    _forgetJumpOrigin();
     final sessionReopenPending = _sessionReopenPending;
     _cancelSessionReopenNavigation();
     if (!sessionReopenPending && !_maintainSessionScrollAnchor) {
@@ -2487,7 +2577,86 @@ class _ChatViewState extends State<ChatView> {
   bool get _showReturnToLatestProgress =>
       _returnToLatestCoordinator.showProgress;
 
+  /// Records where the reader is standing before an in-transcript jump. A
+  /// chain of jumps keeps the FIRST origin: that is the place the reader
+  /// actually left, and every later jump is only a detour away from it.
+  void _captureJumpOrigin() {
+    if (_jumpOrigin != null || _scrollTargetId != null) return;
+    if (!mounted || !_initialTranscriptReady || !_scroll.hasClients) return;
+    // Already at the newest edge: the arrow's existing meaning is still the
+    // right one, so there is nothing to remember.
+    if (_isAtLoadedBottom(80)) return;
+    final anchor = _captureSessionScrollAnchor();
+    if (anchor == null) return;
+    _jumpOrigin = _ChatJumpOrigin(
+      messageId: anchor.messageId,
+      viewportOffset: anchor.viewportOffset,
+    );
+  }
+
+  void _forgetJumpOrigin() {
+    ++_jumpOriginReturnGeneration;
+    _jumpOrigin = null;
+    _jumpOriginDragBaseline = null;
+  }
+
+  /// Remembers where the viewport stood when a real drag began. A tap (reply
+  /// quote, timestamp) produces no scroll notification, so it can never be
+  /// mistaken for the drag that abandons the origin.
+  void _noteJumpOriginDragStart() {
+    if (_jumpOrigin == null || !_hasTranscriptPointerDown) return;
+    _jumpOriginDragBaseline ??= _scroll.hasClients
+        ? _scroll.position.pixels
+        : null;
+  }
+
+  /// Drops the origin once a drag has carried the viewport a meaningful
+  /// distance away from the jump target. A small nudge to read the quoted
+  /// neighbourhood keeps the arrow pointing back at where the reader left.
+  void _releaseJumpOriginAfterDrag() {
+    final baseline = _jumpOriginDragBaseline;
+    _jumpOriginDragBaseline = null;
+    if (baseline == null || _jumpOrigin == null || !_scroll.hasClients) return;
+    final viewport = _transcriptViewportKey.currentContext?.findRenderObject();
+    final viewportHeight = viewport is RenderBox && viewport.attached
+        ? viewport.size.height
+        : 0.0;
+    final threshold = math.max(120.0, viewportHeight * 0.35);
+    if ((_scroll.position.pixels - baseline).abs() >= threshold) {
+      _forgetJumpOrigin();
+    }
+  }
+
+  /// The floating arrow: returns to the message the reader left while a jump
+  /// origin is live, and to the newest message otherwise.
   void _onReturnToLatestTapped() {
+    final origin = _jumpOrigin;
+    if (origin != null) {
+      // A tap always consumes the origin, even when its row can no longer be
+      // reached: a stale origin must never outlive the tap that asked for it.
+      _jumpOrigin = null;
+      unawaited(_returnToJumpOrigin(origin));
+      return;
+    }
+    _requestReturnToLatest(userInitiated: true);
+  }
+
+  /// The shell asked for the newest message — because the reader tapped the
+  /// conversation that is already open, or re-opened it from a link. This is
+  /// the same intent as tapping the return-to-latest arrow, so it goes through
+  /// the same coordinator: an anchored history window loads the latest page
+  /// first, and a plain scroll-up just animates back to the edge.
+  void _onRevealLatestRequested() {
+    if (!mounted) return;
+    if (!_scroll.hasClients) {
+      // The pane is still laying out (a fresh selection being built), so there
+      // is no viewport to move yet. Re-ask once the frame is done instead of
+      // leaving a pending intent that would fire on some later scroll.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _requestReturnToLatest(userInitiated: true);
+      });
+      return;
+    }
     _requestReturnToLatest(userInitiated: true);
   }
 
@@ -2524,9 +2693,60 @@ class _ChatViewState extends State<ChatView> {
     _markReadAtBottomIfNeeded();
   }
 
+  Future<void> _returnToJumpOrigin(_ChatJumpOrigin origin) async {
+    final restoration = _restoreJumpOrigin(origin);
+    final generation = _jumpOriginReturnGeneration;
+    final restored = await restoration;
+    // The origin's row can vanish between the tap and the layout (a paged
+    // window replaced under it); keep the arrow's old contract as the fallback
+    // rather than swallowing the tap.
+    if (!restored && mounted && generation == _jumpOriginReturnGeneration) {
+      _requestReturnToLatest(userInitiated: true);
+    }
+  }
+
+  Future<bool> _restoreJumpOrigin(_ChatJumpOrigin origin) async {
+    if (!mounted || !_scroll.hasClients) return false;
+    if (!_vm.messages.any((message) => message.id == origin.messageId)) {
+      return false;
+    }
+    _cancelSessionScrollAnchorMaintenance();
+    _maintainRestoredBottom = false;
+    _restoredPositionGuard.cancel();
+    _cancelBottomFollow();
+    _stopActiveTranscriptScroll();
+    // A re-pivot makes raw pixels meaningless, so approach the origin with the
+    // alignment fraction it had and then correct by measurement.
+    final viewport = _transcriptViewportKey.currentContext?.findRenderObject();
+    final viewportHeight = viewport is RenderBox && viewport.attached
+        ? viewport.size.height
+        : null;
+    final alignment = viewportHeight == null || viewportHeight <= 0
+        ? 0.0
+        : (origin.viewportOffset / viewportHeight).clamp(0.0, 1.0);
+    final navigation = _scrollToMessageAndReport(
+      origin.messageId,
+      alignment: alignment,
+      forceAlignment: true,
+    );
+    final generation = _jumpOriginReturnGeneration;
+    final reached = await navigation;
+    if (!reached || !mounted || generation != _jumpOriginReturnGeneration) {
+      return false;
+    }
+    _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || generation != _jumpOriginReturnGeneration) return false;
+    _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
+    _saveSessionScrollSnapshot();
+    return true;
+  }
+
   void _requestReturnToLatest({bool userInitiated = false}) {
     if (!userInitiated && _hasTranscriptPointerDown) return;
     if (userInitiated) {
+      // Returning to the newest message abandons the jump origin by design.
+      _forgetJumpOrigin();
       _transcriptViewportClaimedByUser = false;
       _cancelSessionReopenNavigation(userClaimedViewport: true);
       _restoredPositionGuard.cancel();
@@ -2671,6 +2891,8 @@ class _ChatViewState extends State<ChatView> {
   /// boundary may already point at the newest message after the chat is marked
   /// read, so it cannot be used to resolve this button later.
   Future<void> _jumpToFirstUnread() async {
+    // Choosing a different destination drops the recorded jump origin.
+    _forgetJumpOrigin();
     _claimTranscriptViewport();
     await _jumpToFirstUnreadImpl();
   }
@@ -3228,6 +3450,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _setScrollTarget(int? messageId, {bool forceNavigation = false}) {
+    if (forceNavigation) ++_jumpOriginReturnGeneration;
     if (forceNavigation || _scrollTargetId != messageId) {
       ++_scrollTargetGeneration;
     }
@@ -3330,6 +3553,9 @@ class _ChatViewState extends State<ChatView> {
   /// deterministic estimate immediately and then do one zero-duration correction
   /// after layout, without waiting to reveal the UI.
   Future<void> _completeInitialScroll() async {
+    // Opening (or reopening) the session establishes a fresh reading position;
+    // an origin from a previous visit of this state must not survive it.
+    _forgetJumpOrigin();
     if (_shouldRestoreSessionScroll) {
       await _restoreSessionScrollPosition();
     } else {
@@ -3472,9 +3698,15 @@ class _ChatViewState extends State<ChatView> {
   bool _restoreSessionScrollAnchor(_ChatScrollSnapshot snapshot) {
     final messageId = snapshot.anchorMessageId;
     final desiredOffset = snapshot.anchorViewportOffset;
-    if (messageId == null || desiredOffset == null || !_scroll.hasClients) {
-      return false;
-    }
+    if (messageId == null || desiredOffset == null) return false;
+    return _restoreMessageViewportOffset(messageId, desiredOffset);
+  }
+
+  /// Puts [messageId] back at [desiredOffset] pixels below the transcript
+  /// viewport top, measured rather than replayed as raw pixels: the row may sit
+  /// in a different sliver window than it did when the offset was recorded.
+  bool _restoreMessageViewportOffset(int messageId, double desiredOffset) {
+    if (!_scroll.hasClients) return false;
     final viewportContext = _transcriptViewportKey.currentContext;
     final itemContext = _entryVisibilityKeys[messageId]?.currentContext;
     final viewportRenderObject = viewportContext?.findRenderObject();
@@ -4267,6 +4499,7 @@ class _ChatViewState extends State<ChatView> {
     _prepareExitState();
     _detachPaneBackHandler?.call();
     _detachExitController?.call();
+    _detachRevealLatestController?.call();
     NotificationController.shared.unregisterVisibleChat(this);
     ActiveConversation.shared.unregister(this);
     _wallpaperController.removeListener(_onWallpaperChanged);
@@ -4532,6 +4765,7 @@ class _ChatViewState extends State<ChatView> {
       },
       onOpenReply: _openReplyMessage,
       onOpenForwarded: _openForwardedMessage,
+      onTapViaBot: (m) => unawaited(_activateMessageViaBot(m)),
       onOpenComments: _openMessageComments,
       showCommentAttachment: chatTranscriptAllowsCommentAttachment(
         isChannel: _vm.isChannel,
@@ -5077,6 +5311,7 @@ class _ChatViewState extends State<ChatView> {
 
   Future<void> _jumpToMessage(int messageId, {bool reply = false}) async {
     if (!mounted) return;
+    _captureJumpOrigin();
     setState(() => _setScrollTarget(messageId, forceNavigation: true));
     if (!reply) return;
     final target = _vm.messages.where((m) => m.id == messageId).firstOrNull;
@@ -5185,6 +5420,7 @@ class _ChatViewState extends State<ChatView> {
     MessageRepliesViewTarget target,
   ) async {
     if (target.chatId == widget.chatId) {
+      _captureJumpOrigin();
       await _scrollToMessage(target.messageId);
       return;
     }
@@ -5283,11 +5519,95 @@ class _ChatViewState extends State<ChatView> {
       _sendKeyboardButtonText(button.text);
       return;
     }
-    if (button.switchInlineQuery != null) {
-      showToast(context, AppStringKeys.chatInlineSwitchButtonUnsupported);
+    if (button.isSwitchInline) {
+      await _activateSwitchInlineButton(message, button);
       return;
     }
     showToast(context, AppStringKeys.chatButtonUnsupported);
+  }
+
+  Future<void> _activateMessageViaBot(ChatMessage message) async {
+    final username = await _vm.resolveInlineBotUsername(message);
+    if (!mounted) return;
+    if (username == null || username.isEmpty) return;
+    if (_vm.canSendMessages) {
+      _vm.activateInlineQuery(username);
+      return;
+    }
+    await openLink(context, 'https://t.me/$username');
+  }
+
+  Future<void> _activateSwitchInlineButton(
+    ChatMessage message,
+    MessageButton button,
+  ) async {
+    final query = button.switchInlineQuery ?? '';
+    final target =
+        button.switchInlineTarget ?? const SwitchInlineTarget.chooseChat();
+    if (target.kind == SwitchInlineTargetKind.internalLink &&
+        target.internalLink != null) {
+      final resolvedUsername = await _vm.resolveInlineBotUsername(message);
+      if (!mounted) return;
+      final link = Map<String, dynamic>.from(target.internalLink!);
+      if (resolvedUsername != null &&
+          resolvedUsername.isNotEmpty &&
+          link.type == 'internalLinkTypePublicChat' &&
+          (link.str('draft_text') ?? '').trim().isEmpty) {
+        link['draft_text'] = '@$resolvedUsername $query';
+      }
+      await openInternalLinkType(context, link);
+      return;
+    }
+    final username = await _vm.resolveInlineBotUsername(message);
+    if (!mounted) return;
+    if (username == null || username.isEmpty) {
+      showToast(context, AppStringKeys.topicPostContentActionFailed);
+      return;
+    }
+    if (target.isCurrentChat && _vm.canSendMessages) {
+      _vm.activateInlineQuery(username, query);
+      return;
+    }
+    final allowedKinds = target.isCurrentChat
+        ? const {
+            ChatKind.privateChat,
+            ChatKind.bot,
+            ChatKind.group,
+            ChatKind.channel,
+          }
+        : target.allowedChatKinds;
+    final picked = await Navigator.of(context).push<ChatSummary>(
+      MaterialPageRoute(
+        builder: (_) => ChatPickerView(
+          allowedKinds: allowedKinds,
+          allowChannels: allowedKinds.contains(ChatKind.channel),
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    if (picked.id == _vm.chatId && _vm.canSendMessages) {
+      _vm.activateInlineQuery(username, query);
+      return;
+    }
+    try {
+      await TdClient.shared.query(
+        setTextChatDraftRequest(
+          chatId: picked.id,
+          date: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          formattedText: {
+            '@type': 'formattedText',
+            'text': '@$username $query',
+            'entities': const <Map<String, dynamic>>[],
+          },
+        ),
+      );
+    } catch (_) {}
+    if (!mounted) return;
+    await openChatFromCurrentWindow(
+      context,
+      chatId: picked.id,
+      title: picked.title,
+    );
   }
 
   Future<void> _perform(MessageAction action, ChatMessage message) async {
@@ -5783,14 +6103,74 @@ class _ChatViewState extends State<ChatView> {
     MessageReaction reaction,
   ) async {
     if (!mounted || message.reactions.isEmpty) return;
+    // `can_report_reactions` is a messageProperties field, not a field of the
+    // message. Start the hydrated permission alongside the sheet so the report
+    // action appears only after TDLib granted it, and fails closed otherwise.
+    final reportPermission = _vm.canReportMessageReactions(message.id);
     await showReactionUsersModal<void>(
       context,
       builder: (dialogContext) => _ReactionUsersSheet(
         viewModel: _vm,
         message: message,
         initialReaction: reaction,
+        reportPermission: reportPermission,
+        onOpenSender: _openReactionSender,
+        onReportSender: (user) => _reportReactionSender(message, user),
       ),
     );
+  }
+
+  /// Opens the profile of a user who reacted, or the chat when the reaction
+  /// was sent by a chat. A deleted account has neither.
+  void _openReactionSender(MessageReactionUser user) {
+    final senderId = user.senderId;
+    if (user.isDeleted || senderId == 0) return;
+    // The list is left either way: it belongs to the message behind it, and
+    // keeping it alive under a pushed profile leaves a stale sheet to come
+    // back to.
+    Navigator.of(context).pop();
+    if (senderId > 0) {
+      _openUserProfile(senderId, user.title);
+      return;
+    }
+    if (senderId == widget.chatId) {
+      unawaited(_openChatInfo(title: user.title, useAppPageRoute: true));
+      return;
+    }
+    unawaited(
+      openChatFromCurrentWindow(context, chatId: senderId, title: user.title),
+    );
+  }
+
+  Future<void> _reportReactionSender(
+    ChatMessage message,
+    MessageReactionUser user,
+  ) async {
+    if (user.isDeleted) return;
+    if (user.senderId == _vm.meId) return;
+    final confirmed = await showAppConfirmDialog(
+      context,
+      title: AppStrings.t(AppStringKeys.chatReactionReportTitle),
+      message: AppStrings.t(AppStringKeys.chatReactionReportMessage, {
+        'value1': user.title,
+      }),
+      confirmText: AppStrings.t(AppStringKeys.chatReportConfirm),
+      destructive: true,
+    );
+    // The permission and the write belong to the pane's own account: a switch
+    // while the dialog was open must drop the report entirely.
+    if (!mounted || !confirmed || !_vm.isAccountCurrent) return;
+    try {
+      await _vm.reportReaction(message, user.senderId);
+      if (!mounted) return;
+      showToast(context, AppStringKeys.chatReactionReportSent);
+    } catch (e) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.chatReactionReportFailed, {'value1': e}),
+      );
+    }
   }
 
   Future<bool> _translateMessage(
@@ -6814,6 +7194,7 @@ class _ChatViewState extends State<ChatView> {
       hasForumTabs: _vm.hasForumTabs,
       onSelected: _openTopicTranscript,
       onCreateTopic: _vm.canCreateForumTopics ? _openCreateTopicDialog : null,
+      onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
       onTopicMenu: _showTopicRowMenu,
       generalAvatarTitle: _vm.peerTitle.isEmpty ? widget.title : _vm.peerTitle,
       generalAvatarPhoto: _vm.peerPhoto,
@@ -7234,7 +7615,9 @@ class _ChatViewState extends State<ChatView> {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: pointsDown
-          ? _onReturnToLatestTapped
+          // The unread pill always means "go to the newest message", even
+          // while the arrow would return to a jump origin.
+          ? () => _requestReturnToLatest(userInitiated: true)
           : () => unawaited(_jumpToFirstUnread()),
       child: Container(
         padding: EdgeInsetsDirectional.fromSTEB(
@@ -8511,6 +8894,29 @@ class _ChatViewState extends State<ChatView> {
   Future<void> _markTopicRead(ForumTopicOption topic) =>
       _vm.markForumTopicRead(topic);
 
+  /// Clears every topic in the list at once: one scoped read per topic, with
+  /// the unread counters cleared optimistically and restored if a read fails.
+  Future<void> _markAllTopicsRead() async {
+    try {
+      await _vm.markForumTopicsRead(_vm.forumTopics.map((topic) => topic.id));
+    } catch (_) {
+      // Every read failed: the rows were rolled back; say so once.
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+      return;
+    }
+    if (!mounted) return;
+    if (_vm.takeBulkReadFailure()) {
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+    }
+  }
+
   /// The topic row's context menu (iOS swipe action / long press). Destructive
   /// and management items only appear while the account holds the right;
   /// mute and mark-read stay available to everyone.
@@ -8938,6 +9344,9 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Future<void> _openReplyMessage(int messageId) async {
+    // Capture before the viewport is claimed: the claim marks a navigation in
+    // progress and the recorded origin is the frame the reader just left.
+    _captureJumpOrigin();
     _claimTranscriptViewport();
     final didReachTarget = await _scrollToMessageAndReport(messageId);
     if (!didReachTarget || !mounted) return;
@@ -9091,7 +9500,17 @@ class _ChatViewState extends State<ChatView> {
     showDivider: widget.showHeaderDivider,
     showSteppers: showSteppers,
     onClose: _closeSearch,
+    onJumpToMessage: _jumpToDateMessage,
   );
+
+  /// Lands the transcript on the message a calendar date resolved to.
+  ///
+  /// Unlike a search hit nothing is marked — the jump reads as navigation, not
+  /// as a match — and the search session stays open for the next step.
+  Future<void> _jumpToDateMessage(ChatMessage message) async {
+    _search.focusNode.unfocus();
+    await _scrollToMessage(message.id, alignment: 0.38, forceAlignment: true);
+  }
 
   Widget _searchResultsPane() => ChatSearchResultsPane(
     controller: _search,
@@ -10413,6 +10832,7 @@ class _ChatViewState extends State<ChatView> {
           }
         },
         onOpenForwarded: _openForwardedMessage,
+        onTapViaBot: (message) => unawaited(_activateMessageViaBot(message)),
         onOpenImage: _openImage,
         onPlayVideo: _playVideo,
         onEditCaption: (message) => unawaited(_editMessageText(message)),
@@ -10992,19 +11412,31 @@ class _ReactionUsersSheet extends StatefulWidget {
     required this.viewModel,
     required this.message,
     required this.initialReaction,
+    required this.reportPermission,
+    required this.onOpenSender,
+    required this.onReportSender,
   });
 
   final ChatViewModel viewModel;
   final ChatMessage message;
   final MessageReaction initialReaction;
 
+  /// `messageProperties.can_report_reactions` for [message], resolved when the
+  /// sheet opens. Hidden until true and never resurrected by a late answer.
+  final Future<bool> reportPermission;
+  final ValueChanged<MessageReactionUser> onOpenSender;
+  final ValueChanged<MessageReactionUser> onReportSender;
+
   @override
   State<_ReactionUsersSheet> createState() => _ReactionUsersSheetState();
 }
 
+enum _ReactionUserAction { report }
+
 class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   late MessageReaction _selected;
   final Map<String, Future<List<MessageReactionUser>>> _loads = {};
+  bool _allowReport = false;
 
   @override
   void initState() {
@@ -11014,6 +11446,13 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
       (reaction) => _reactionKey(reaction) == initialKey,
       orElse: () => widget.message.reactions.first,
     );
+    unawaited(_loadReportPermission());
+  }
+
+  Future<void> _loadReportPermission() async {
+    final allowed = await widget.reportPermission;
+    if (!mounted || !allowed) return;
+    setState(() => _allowReport = true);
   }
 
   Future<List<MessageReactionUser>> _load(MessageReaction reaction) {
@@ -11027,6 +11466,14 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   String _reactionKey(MessageReaction reaction) => reaction.customEmojiId != 0
       ? 'custom:${reaction.customEmojiId}'
       : 'emoji:${reaction.emoji ?? ''}';
+
+  bool _canReport(MessageReactionUser user) =>
+      _allowReport && !user.isDeleted && user.senderId != widget.viewModel.meId;
+
+  void _retrySelected() {
+    _loads.remove(_reactionKey(_selected));
+    setState(() {});
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -11107,6 +11554,43 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             ),
           );
         }
+        if (snapshot.hasError) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    AppStrings.t(AppStringKeys.chatReactionUsersLoadFailed),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 14, color: c.textSecondary),
+                  ),
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    key: const ValueKey('reaction-users-retry'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _retrySelected,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: c.searchFill,
+                        borderRadius: BorderRadius.circular(AppRadius.control),
+                      ),
+                      child: Text(
+                        AppStrings.t(AppStringKeys.chatReactionUsersRetry),
+                        style: TextStyle(fontSize: 14, color: c.textPrimary),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
         final users = snapshot.data ?? const <MessageReactionUser>[];
         if (users.isEmpty) {
           return Center(
@@ -11127,8 +11611,9 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
 
   Widget _reactionUserRow(AppColors c, MessageReactionUser user) {
     final time = DateText.listLabel(user.date);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+    final reportable = _canReport(user);
+    final row = Padding(
+      padding: EdgeInsets.fromLTRB(18, 9, reportable ? 6 : 18, 9),
       child: Row(
         children: [
           PhotoAvatar(title: user.title, photo: user.photo, size: 44),
@@ -11145,9 +11630,56 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             const SizedBox(width: 10),
             Text(time, style: TextStyle(fontSize: 12, color: c.textTertiary)),
           ],
+          if (reportable)
+            GestureDetector(
+              key: ValueKey('reactionUserReport-${user.senderId}'),
+              behavior: HitTestBehavior.opaque,
+              onTap: () => unawaited(_showUserActions(user)),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
+                child: AppIcon(
+                  HeroAppIcons.ellipsisVertical,
+                  size: 18,
+                  color: c.textTertiary,
+                ),
+              ),
+            ),
         ],
       ),
     );
+    if (user.isDeleted) return row;
+    return GestureDetector(
+      key: ValueKey('reactionUser-${user.senderId}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.onOpenSender(user),
+      child: row,
+    );
+  }
+
+  Future<void> _showUserActions(MessageReactionUser user) async {
+    final action = await showAppModalSheet<_ReactionUserAction>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: SettingsCard(
+          margin: const EdgeInsets.all(10),
+          children: [
+            SettingsRow(
+              key: const ValueKey('reaction-user-report-action'),
+              leading: const AppIcon(HeroAppIcons.triangleExclamation),
+              title: AppStrings.t(AppStringKeys.chatReactionReportAction),
+              titleColor: AppTheme.tagRed,
+              showChevron: false,
+              onTap: () =>
+                  Navigator.of(sheetContext).pop(_ReactionUserAction.report),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action != _ReactionUserAction.report) return;
+    widget.onReportSender(user);
   }
 
   Widget _reactionGlyph(MessageReaction reaction, Color color) {

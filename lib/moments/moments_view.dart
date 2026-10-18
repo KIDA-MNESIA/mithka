@@ -170,7 +170,9 @@ class ChannelPostComment {
     this.entities = const [],
     this.senderPhoto,
     this.date = 0,
+    this.replyToChatId,
     this.replyToMessageId,
+    this.replyToSenderName,
     this.reactionCount = 0,
   });
 
@@ -181,7 +183,9 @@ class ChannelPostComment {
   final List<MessageTextEntity> entities;
   final TdFileRef? senderPhoto;
   final int date;
+  final int? replyToChatId;
   final int? replyToMessageId;
+  final String? replyToSenderName;
   final int reactionCount;
 }
 
@@ -1525,18 +1529,20 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       return;
     }
     try {
-      final raw = await TdClient.shared.query({
+      final raw = await TdClient.shared.queryForSlot({
         '@type': 'getMessage',
         'chat_id': post.channel.id,
         'message_id': replyToMessageId,
-      });
+      }, post.accountSlot);
       final quoted = TDParse.message(raw);
       if (quoted == null) return;
       message.replyToPreview = _replyPreview(quoted);
       message.replyToImage = quoted.previewImage;
       message.replyToImageWidth = quoted.imageWidth;
       message.replyToImageHeight = quoted.imageHeight;
-      message.replyToSender = await _senderName(quoted) ?? post.channel.title;
+      message.replyToSender =
+          await _senderName(quoted, accountSlot: post.accountSlot) ??
+          post.channel.title;
     } catch (_) {
       message.replyToPreview ??= '';
       message.replyToSender ??= post.channel.title;
@@ -1575,11 +1581,11 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     var shouldNotify = false;
     try {
       try {
-        final properties = await TdClient.shared.query({
+        final properties = await TdClient.shared.queryForSlot({
           '@type': 'getMessageProperties',
           'chat_id': post.channel.id,
           'message_id': post.message.id,
-        });
+        }, post.accountSlot);
         if (properties.boolean('can_get_message_thread') == false) return null;
       } catch (_) {}
       final target = await _fetchChannelPostThreadTarget(post);
@@ -1598,14 +1604,14 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
   Future<void> _loadCommentsForPost(ChannelPost post, String key) async {
     try {
       final target = await _resolveThreadTarget(post);
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageThreadHistory',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'from_message_id': 0,
         'offset': 0,
         'limit': 5,
-      });
+      }, post.accountSlot);
       final rawMessages =
           response.objects('messages') ?? const <Map<String, dynamic>>[];
       final entries = <_LoadedPostComment>[];
@@ -1629,7 +1635,10 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       final comments = <ChannelPostComment>[];
       for (final entry in entries.take(4)) {
         final message = entry.message;
-        final senderName = await _senderName(message);
+        final senderName = await _senderName(
+          message,
+          accountSlot: post.accountSlot,
+        );
         comments.add(
           ChannelPostComment(
             chatId: entry.chatId,
@@ -1703,11 +1712,19 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           post.authorName = previous.authorName;
           post.authorPhoto = previous.authorPhoto;
         }
-        post.message.replyToSender = previous.message.replyToSender;
-        post.message.replyToPreview = previous.message.replyToPreview;
-        post.message.replyToImage = previous.message.replyToImage;
-        post.message.replyToImageWidth = previous.message.replyToImageWidth;
-        post.message.replyToImageHeight = previous.message.replyToImageHeight;
+        if (post.message.replyToMessageId ==
+                previous.message.replyToMessageId &&
+            post.message.replyToChatId == previous.message.replyToChatId) {
+          post.message.replyToSender ??= previous.message.replyToSender;
+          if (!post.message.isContentRestricted) {
+            post.message.replyToPreview ??= previous.message.replyToPreview;
+            post.message.replyToImage ??= previous.message.replyToImage;
+            post.message.replyToImageWidth ??=
+                previous.message.replyToImageWidth;
+            post.message.replyToImageHeight ??=
+                previous.message.replyToImageHeight;
+          }
+        }
         final likesChanged =
             _reactionCount(previous.message) != _reactionCount(post.message);
         final commentsChanged =
@@ -1763,18 +1780,18 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     final previousPhoto = post.authorPhoto;
     try {
       if (senderId != null && senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, post.accountSlot);
         final name = TDParse.userName(user).trim();
         if (name.isNotEmpty) post.authorName = name;
         post.authorPhoto = TDParse.smallPhoto(user.obj('profile_photo'));
       } else if (senderId != null && senderId < 0) {
-        final chat = await TdClient.shared.query({
+        final chat = await TdClient.shared.queryForSlot({
           '@type': 'getChat',
           'chat_id': senderId,
-        });
+        }, post.accountSlot);
         final name = chat.str('title')?.trim();
         if (name != null && name.isNotEmpty) post.authorName = name;
         post.authorPhoto = TDParse.smallPhoto(chat.obj('photo'));
@@ -1794,21 +1811,24 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
 
   Future<void> _loadLikeNamesForPost(ChannelPost post, String key) async {
     try {
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageAddedReactions',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'reaction_type': {'@type': 'reactionTypeEmoji', 'emoji': '👍'},
         'offset': '',
         'limit': 4,
-      });
+      }, post.accountSlot);
       final raw =
           response.objects('added_reactions') ??
           response.objects('reactions') ??
           const <Map<String, dynamic>>[];
       final names = <String>[];
       for (final item in raw) {
-        final name = await _reactionSenderName(item.obj('sender_id'));
+        final name = await _reactionSenderName(
+          item.obj('sender_id'),
+          accountSlot: post.accountSlot,
+        );
         if (name != null && !names.contains(name)) names.add(name);
       }
       post.likeNames = names;
@@ -1820,25 +1840,29 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     }
   }
 
-  Future<String?> _reactionSenderName(Map<String, dynamic>? sender) async {
+  Future<String?> _reactionSenderName(
+    Map<String, dynamic>? sender, {
+    int? accountSlot,
+  }) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     try {
       switch (sender?.type) {
         case 'messageSenderUser':
           final userId = sender?.int64('user_id');
           if (userId == null) return null;
-          final user = await TdClient.shared.query({
+          final user = await TdClient.shared.queryForSlot({
             '@type': 'getUser',
             'user_id': userId,
-          });
+          }, slot);
           final name = TDParse.userName(user).trim();
           return name.isEmpty ? null : name;
         case 'messageSenderChat':
           final chatId = sender?.int64('chat_id');
           if (chatId == null) return null;
-          final chat = await TdClient.shared.query({
+          final chat = await TdClient.shared.queryForSlot({
             '@type': 'getChat',
             'chat_id': chatId,
-          });
+          }, slot);
           final name = chat.str('title')?.trim();
           return name == null || name.isEmpty ? null : name;
       }
@@ -1846,7 +1870,8 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     return null;
   }
 
-  Future<String?> _senderName(ChatMessage message) async {
+  Future<String?> _senderName(ChatMessage message, {int? accountSlot}) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     final senderId = message.senderId;
     if (senderId == null) {
       final title = message.senderTitle?.trim();
@@ -1854,17 +1879,17 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     }
     try {
       if (senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, slot);
         final name = TDParse.userName(user).trim();
         return name.isEmpty ? null : name;
       }
-      final chat = await TdClient.shared.query({
+      final chat = await TdClient.shared.queryForSlot({
         '@type': 'getChat',
         'chat_id': senderId,
-      });
+      }, slot);
       final name = chat.str('title')?.trim();
       return name == null || name.isEmpty ? null : name;
     } catch (_) {
@@ -1930,7 +1955,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
         }
         return;
       }
-      await _sendThreadReply(target, text);
+      await _sendThreadReply(target, text, accountSlot: post.accountSlot);
       _replyController.clear();
       if (mounted) showToast(context, AppStringKeys.momentsReplied);
     } catch (e) {
@@ -1945,14 +1970,16 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
 
   Future<void> _sendThreadReply(
     ChannelPostThreadTarget target,
-    String text,
-  ) async {
+    String text, {
+    int? accountSlot,
+  }) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     final content = {
       '@type': 'inputMessageText',
       'text': {'@type': 'formattedText', 'text': text},
     };
     try {
-      await TdClient.shared.query({
+      await TdClient.shared.queryForSlot({
         '@type': 'sendMessage',
         'chat_id': target.chatId,
         'topic_id': {
@@ -1960,9 +1987,9 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           'message_thread_id': target.messageThreadId,
         },
         'input_message_content': content,
-      });
+      }, slot);
     } catch (_) {
-      await TdClient.shared.query({
+      await TdClient.shared.queryForSlot({
         '@type': 'sendMessage',
         'chat_id': target.chatId,
         'reply_to': {
@@ -1970,7 +1997,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           'message_id': target.messageThreadId,
         },
         'input_message_content': content,
-      });
+      }, slot);
     }
   }
 
@@ -2939,7 +2966,9 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
 
   Future<void> _loadMe() async {
     try {
-      final me = await TdClient.shared.query({'@type': 'getMe'});
+      final me = await TdClient.shared.queryForSlot({
+        '@type': 'getMe',
+      }, post.accountSlot);
       if (!mounted) return;
       final name = TDParse.userName(me).trim();
       setState(() {
@@ -2989,14 +3018,14 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
         if (mounted) setState(() => _loading = false);
         return;
       }
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageThreadHistory',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'from_message_id': 0,
         'offset': 0,
         'limit': 120,
-      });
+      }, post.accountSlot);
       final rawMessages =
           response.objects('messages') ?? const <Map<String, dynamic>>[];
       final kept = <_LoadedPostComment>[];
@@ -3016,6 +3045,45 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
           ),
         );
       }
+      final keptByChatAndId =
+          <({int chatId, int messageId}), _LoadedPostComment>{
+            for (final entry in kept)
+              (chatId: entry.chatId, messageId: entry.message.id): entry,
+          };
+      final missingRepliesByChat = <int, Set<int>>{};
+      for (final entry in kept) {
+        final rid = entry.message.replyToMessageId;
+        final rChatId = entry.message.replyToChatId ?? entry.chatId;
+        final isPostRoot =
+            (rChatId == post.channel.id && rid == post.message.id) ||
+            (rChatId == target.chatId && rid == target.messageThreadId);
+        if (rid == null ||
+            isPostRoot ||
+            keptByChatAndId.containsKey((chatId: rChatId, messageId: rid))) {
+          continue;
+        }
+        missingRepliesByChat.putIfAbsent(rChatId, () => <int>{}).add(rid);
+      }
+      final externalReplyTargets =
+          <({int chatId, int messageId}), ChatMessage>{};
+      for (final batch in missingRepliesByChat.entries) {
+        try {
+          final res = await TdClient.shared.queryForSlot({
+            '@type': 'getMessages',
+            'chat_id': batch.key,
+            'message_ids': batch.value.toList(),
+          }, post.accountSlot);
+          for (final raw
+              in res.objects('messages') ?? const <Map<String, dynamic>>[]) {
+            final quoted = TDParse.message(raw);
+            if (quoted != null) {
+              final qChatId = quoted.chatId ?? batch.key;
+              externalReplyTargets[(chatId: qChatId, messageId: quoted.id)] =
+                  quoted;
+            }
+          }
+        } catch (_) {}
+      }
       // One query per distinct sender, in parallel. Resolving inline below
       // serialized up to 120 getUser/getChat round-trips, mostly repeats.
       final firstBySender = <int, ChatMessage>{};
@@ -3025,18 +3093,34 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
           firstBySender.putIfAbsent(senderId, () => entry.message);
         }
       }
+      for (final quoted in externalReplyTargets.values) {
+        final senderId = quoted.senderId;
+        if (senderId != null) {
+          firstBySender.putIfAbsent(senderId, () => quoted);
+        }
+      }
       final senders = <int, _CommentSender>{};
       await Future.wait(
         firstBySender.entries.map((entry) async {
           senders[entry.key] = await _commentSender(entry.value);
         }),
       );
+      final externalReplySenders = <({int chatId, int messageId}), String>{};
+      for (final entry in externalReplyTargets.entries) {
+        final quoted = entry.value;
+        final senderId = quoted.senderId;
+        final cached = senderId == null ? null : senders[senderId];
+        final sender = cached ?? await _commentSender(quoted);
+        externalReplySenders[entry.key] = sender.name;
+      }
       final comments = <ChannelPostComment>[];
       for (final entry in kept) {
         final message = entry.message;
         final senderId = message.senderId;
         final cached = senderId == null ? null : senders[senderId];
         final sender = cached ?? await _commentSender(message);
+        final rid = message.replyToMessageId;
+        final rChatId = message.replyToChatId ?? entry.chatId;
         comments.add(
           ChannelPostComment(
             chatId: entry.chatId,
@@ -3046,7 +3130,11 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
             text: _commentText(message),
             entities: _commentEntities(message),
             date: message.date,
-            replyToMessageId: message.replyToMessageId,
+            replyToChatId: rid == null ? null : rChatId,
+            replyToMessageId: rid,
+            replyToSenderName: rid == null
+                ? null
+                : externalReplySenders[(chatId: rChatId, messageId: rid)],
             reactionCount: _reactionCount(message),
           ),
         );
@@ -3080,10 +3168,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
     final senderId = message.senderId;
     try {
       if (senderId != null && senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, post.accountSlot);
         final name = TDParse.userName(user).trim();
         return _CommentSender(
           name: name.isNotEmpty
@@ -3093,10 +3181,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
         );
       }
       if (senderId != null && senderId < 0) {
-        final chat = await TdClient.shared.query({
+        final chat = await TdClient.shared.queryForSlot({
           '@type': 'getChat',
           'chat_id': senderId,
-        });
+        }, post.accountSlot);
         final name = chat.str('title')?.trim();
         return _CommentSender(
           name: name == null || name.isEmpty
@@ -3131,7 +3219,7 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
     try {
       final replyMessageId = replyTo?.messageId;
       if (replyMessageId == null) {
-        await TdClient.shared.query({
+        await TdClient.shared.queryForSlot({
           '@type': 'sendMessage',
           'chat_id': target.chatId,
           'topic_id': {
@@ -3139,10 +3227,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
             'message_thread_id': target.messageThreadId,
           },
           'input_message_content': content,
-        });
+        }, post.accountSlot);
       } else {
         try {
-          await TdClient.shared.query({
+          await TdClient.shared.queryForSlot({
             '@type': 'sendMessage',
             'chat_id': target.chatId,
             'topic_id': {
@@ -3154,9 +3242,9 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
               'message_id': replyMessageId,
             },
             'input_message_content': content,
-          });
+          }, post.accountSlot);
         } catch (_) {
-          await TdClient.shared.query({
+          await TdClient.shared.queryForSlot({
             '@type': 'sendMessage',
             'chat_id': target.chatId,
             'reply_to': {
@@ -3164,7 +3252,7 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
               'message_id': replyMessageId,
             },
             'input_message_content': content,
-          });
+          }, post.accountSlot);
         }
       }
       _replyController.clear();
@@ -3407,12 +3495,17 @@ class _CommentThreadList extends StatelessWidget {
         ),
       );
     }
-    final byId = {for (final comment in comments) comment.messageId: comment};
-    final roots = comments.where((comment) => _isRoot(comment, byId)).toList();
+    final byChatAndId = <({int chatId, int messageId}), ChannelPostComment>{
+      for (final comment in comments)
+        (chatId: comment.chatId, messageId: comment.messageId): comment,
+    };
+    final roots = comments
+        .where((comment) => _isRoot(comment, byChatAndId))
+        .toList();
     final childrenByRoot = <int, List<ChannelPostComment>>{};
     for (final comment in comments) {
-      if (_isRoot(comment, byId)) continue;
-      final rootId = _rootId(comment, byId);
+      if (_isRoot(comment, byChatAndId)) continue;
+      final rootId = _rootId(comment, byChatAndId);
       childrenByRoot.putIfAbsent(rootId, () => []).add(comment);
     }
     // Flattened once per build so the tiles themselves can be built lazily.
@@ -3420,12 +3513,18 @@ class _CommentThreadList extends StatelessWidget {
     for (final root in roots) {
       final children =
           childrenByRoot[root.messageId] ?? const <ChannelPostComment>[];
-      entries.add(_ThreadEntry(comment: root, endsGroup: children.isEmpty));
+      entries.add(
+        _ThreadEntry(
+          comment: root,
+          prefix: _rootReplyPrefix(root),
+          endsGroup: children.isEmpty,
+        ),
+      );
       for (var i = 0; i < children.length; i++) {
         entries.add(
           _ThreadEntry(
             comment: children[i],
-            prefix: _replyPrefix(children[i], root, byId),
+            prefix: _replyPrefix(children[i], root, byChatAndId),
             nested: true,
             endsGroup: i == children.length - 1,
           ),
@@ -3456,38 +3555,76 @@ class _CommentThreadList extends StatelessWidget {
     );
   }
 
-  bool _isRoot(ChannelPostComment comment, Map<int, ChannelPostComment> byId) {
-    final replyTo = comment.replyToMessageId;
-    return replyTo == null ||
-        replyTo == post.message.id ||
-        replyTo == post.threadTarget?.messageThreadId ||
-        !byId.containsKey(replyTo);
+  ({int chatId, int messageId})? _replyKey(ChannelPostComment comment) {
+    final rid = comment.replyToMessageId;
+    if (rid == null) return null;
+    return (chatId: comment.replyToChatId ?? comment.chatId, messageId: rid);
   }
 
-  int _rootId(ChannelPostComment comment, Map<int, ChannelPostComment> byId) {
+  bool _isPostRootReply(ChannelPostComment comment) {
+    final rid = comment.replyToMessageId;
+    if (rid == null) return true;
+    final rChatId = comment.replyToChatId ?? comment.chatId;
+    if (rChatId == post.channel.id && rid == post.message.id) return true;
+    final target = post.threadTarget;
+    if (target != null &&
+        rChatId == target.chatId &&
+        rid == target.messageThreadId) {
+      return true;
+    }
+    return false;
+  }
+
+  bool _isRoot(
+    ChannelPostComment comment,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
+  ) {
+    if (_isPostRootReply(comment)) return true;
+    final key = _replyKey(comment);
+    return key == null || !byChatAndId.containsKey(key);
+  }
+
+  int _rootId(
+    ChannelPostComment comment,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
+  ) {
     var current = comment;
-    final seen = <int>{};
-    while (current.replyToMessageId != null &&
-        byId.containsKey(current.replyToMessageId) &&
-        seen.add(current.messageId)) {
-      final parent = byId[current.replyToMessageId]!;
-      if (_isRoot(parent, byId)) return parent.messageId;
+    final seen = <({int chatId, int messageId})>{};
+    while (seen.add((chatId: current.chatId, messageId: current.messageId))) {
+      final key = _replyKey(current);
+      if (key == null) break;
+      final parent = byChatAndId[key];
+      if (parent == null) break;
+      if (_isRoot(parent, byChatAndId)) return parent.messageId;
       current = parent;
     }
     return current.messageId;
   }
 
+  String? _rootReplyPrefix(ChannelPostComment comment) {
+    if (_isPostRootReply(comment)) return null;
+    final parentName = comment.replyToSenderName?.trim();
+    if (parentName == null || parentName.isEmpty) return null;
+    return AppStrings.t(AppStringKeys.momentsReplyPrefix, {
+      'value1': parentName,
+    });
+  }
+
   String? _replyPrefix(
     ChannelPostComment comment,
     ChannelPostComment root,
-    Map<int, ChannelPostComment> byId,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
   ) {
-    final replyTo = comment.replyToMessageId;
-    if (replyTo == null || replyTo == root.messageId) return null;
-    final parent = byId[replyTo];
-    if (parent == null) return null;
+    final key = _replyKey(comment);
+    if (key == null ||
+        (key.chatId == root.chatId && key.messageId == root.messageId)) {
+      return null;
+    }
+    final parent = byChatAndId[key];
+    final parentName = parent?.senderName ?? comment.replyToSenderName;
+    if (parentName == null || parentName.trim().isEmpty) return null;
     return AppStrings.t(AppStringKeys.momentsReplyPrefix, {
-      'value1': parent.senderName,
+      'value1': parentName,
     });
   }
 }
@@ -6519,11 +6656,11 @@ class MomentsViewModel extends ChangeNotifier {
 Future<ChannelPostThreadTarget?> _fetchChannelPostThreadTarget(
   ChannelPost post,
 ) async {
-  final thread = await TdClient.shared.query({
+  final thread = await TdClient.shared.queryForSlot({
     '@type': 'getMessageThread',
     'chat_id': post.channel.id,
     'message_id': post.message.id,
-  });
+  }, post.accountSlot);
   final chatId = thread.int64('chat_id');
   final threadId = thread.int64('message_thread_id');
   if (chatId == null || threadId == null || threadId == 0) return null;

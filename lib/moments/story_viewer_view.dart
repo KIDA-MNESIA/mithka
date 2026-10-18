@@ -31,10 +31,12 @@ import '../components/app_interactive_surface.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../media/video_playback_reporting.dart';
 import '../media/video_view_compatibility.dart';
 import '../platform/adaptive_platform.dart';
 import '../platform/keyboard_modifiers.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_image_loader.dart';
@@ -275,12 +277,17 @@ class _StoryViewerViewState extends State<StoryViewerView>
       _volumePanelVisible = false;
     });
 
-    // Mark the story as viewed (best-effort).
-    TdClient.shared.send({
-      '@type': 'openStory',
-      'story_poster_chat_id': widget.chatId,
-      'story_id': sid,
-    });
+    // Mark the story as viewed (best-effort). Ghost mode skips the report;
+    // the local seen markers then stay unupdated, the same trade-off
+    // AyuGram accepts.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockStories(widget.chatId).isBlock)) {
+      TdClient.shared.send({
+        '@type': 'openStory',
+        'story_poster_chat_id': widget.chatId,
+        'story_id': sid,
+      });
+    }
 
     try {
       final story = await TdClient.shared

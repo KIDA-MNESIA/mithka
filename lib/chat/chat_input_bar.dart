@@ -651,6 +651,7 @@ class _ChatInputBarState extends State<ChatInputBar>
   Timer? _inlineBotTimer;
   int _inlineBotGeneration = 0;
   bool _inlineBotLoading = false;
+  bool _inlineBotLoadingMore = false;
   BotPlatformCapabilities? _inlineBot;
   BotInlineResultsPage? _inlineBotResults;
   bool _quickRepliesLoaded = false;
@@ -688,7 +689,13 @@ class _ChatInputBarState extends State<ChatInputBar>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _syncedVmState = _renderedVmState;
-    _botPlatform = widget.botPlatformForTesting ?? BotPlatformService();
+    _botPlatform =
+        widget.botPlatformForTesting ??
+        // The composer belongs to one transcript, and every inline query it
+        // sends is scoped to that chat's account: a foreground switch while a
+        // result page or an inline send is in flight must not retarget the
+        // request at the replacement account's chat id.
+        BotPlatformService(queryForSlot: vm.accountSlot);
     DesktopChatComposerActions._register(
       _desktopActionOwner,
       captureScreenshot: _captureDesktopScreenshot,
@@ -751,6 +758,12 @@ class _ChatInputBarState extends State<ChatInputBar>
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _requestInitialFocusIfReady();
+      if (mounted &&
+          !_controller.startsWithIdBackedMention &&
+          BotInlineInvocation.fromText(_controller.text) != null) {
+        _focus.requestFocus();
+        _queueInlineBotResults();
+      }
       unawaited(_restoreDesktopComposerHeight());
       if (mounted && _canUseQuickReplies) {
         unawaited(_loadQuickReplies(userInitiated: false));
@@ -873,6 +886,7 @@ class _ChatInputBarState extends State<ChatInputBar>
       _botCommandQuery = null;
       _botCommandCandidates = const [];
       _inlineBotLoading = false;
+      _inlineBotLoadingMore = false;
       _inlineBotResults = null;
       if (hadSuggestions && mounted) setState(() {});
       return;
@@ -890,7 +904,11 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   void _updateMentionSuggestions() {
     final query = activeMentionQuery(_controller.text, _controller.selection);
-    if (!_focus.hasFocus || query == null || !vm.isGroup) {
+    final includeInlineBots =
+        query != null && query.start == 0 && !vm.isSecretChat;
+    if (!_focus.hasFocus ||
+        query == null ||
+        (!vm.isGroup && !includeInlineBots)) {
       _mentionSearchTimer?.cancel();
       _mentionSearchGeneration++;
       if (_mentionQuery != null || _mentionCandidates.isNotEmpty) {
@@ -911,7 +929,12 @@ class _ChatInputBarState extends State<ChatInputBar>
     _mentionSearchTimer?.cancel();
     final generation = ++_mentionSearchGeneration;
     _mentionSearchTimer = Timer(const Duration(milliseconds: 120), () async {
-      final candidates = await vm.searchMentionCandidates(query.query);
+      final candidates = includeInlineBots
+          ? await vm.searchMentionCandidates(
+              query.query,
+              includeInlineBots: true,
+            )
+          : await vm.searchMentionCandidates(query.query);
       if (!mounted || generation != _mentionSearchGeneration) return;
       final active = activeMentionQuery(
         _controller.text,
@@ -942,6 +965,33 @@ class _ChatInputBarState extends State<ChatInputBar>
     _mentionSearchGeneration++;
     _mentionQuery = null;
     _mentionCandidates = const [];
+    if (candidate.isInlineBot &&
+        query.start == 0 &&
+        candidate.username.trim().isNotEmpty) {
+      final cleanUsername = candidate.username.trim().replaceFirst(
+        RegExp(r'^@+'),
+        '',
+      );
+      final replacement = '@$cleanUsername ';
+      final replaceEnd =
+          query.end < _controller.text.length &&
+              _controller.text[query.end].trim().isEmpty
+          ? query.end + 1
+          : query.end;
+      final newText = _controller.text.replaceRange(
+        query.start,
+        replaceEnd,
+        replacement,
+      );
+      _controller.value = TextEditingValue(
+        text: newText,
+        selection: TextSelection.collapsed(
+          offset: query.start + replacement.length,
+        ),
+      );
+      _focus.requestFocus();
+      return;
+    }
     _controller.insertTextMention(
       start: query.start,
       end: query.end,
@@ -1024,17 +1074,22 @@ class _ChatInputBarState extends State<ChatInputBar>
     final generation = ++_inlineBotGeneration;
     if (invocation == null) {
       if (_inlineBotLoading ||
+          _inlineBotLoadingMore ||
           _inlineBotResults != null ||
           _inlineBot != null) {
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
         _inlineBotResults = null;
         _inlineBot = null;
         if (mounted) setState(() {});
       }
       return;
     }
-    if (!_inlineBotLoading || _inlineBotResults != null) {
+    if (!_inlineBotLoading ||
+        _inlineBotLoadingMore ||
+        _inlineBotResults != null) {
       _inlineBotLoading = true;
+      _inlineBotLoadingMore = false;
       _inlineBotResults = null;
       if (mounted) setState(() {});
     }
@@ -1071,13 +1126,85 @@ class _ChatInputBarState extends State<ChatInputBar>
         _inlineBot = bot;
         _inlineBotResults = page;
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
       });
     } catch (_) {
       if (!mounted || generation != _inlineBotGeneration) return;
       setState(() {
         _inlineBotResults = null;
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
       });
+    }
+  }
+
+  Future<void> _loadMoreInlineBotResults() async {
+    final page = _inlineBotResults;
+    final bot = _inlineBot;
+    if (page == null ||
+        bot == null ||
+        !page.hasMore ||
+        _inlineBotLoading ||
+        _inlineBotLoadingMore) {
+      return;
+    }
+    final invocation = _controller.startsWithIdBackedMention
+        ? null
+        : BotInlineInvocation.fromText(_controller.text);
+    if (invocation == null ||
+        invocation.username.toLowerCase() != bot.username.toLowerCase()) {
+      return;
+    }
+    final generation = _inlineBotGeneration;
+    setState(() => _inlineBotLoadingMore = true);
+    try {
+      final location = bot.needsLocation ? await _inlineBotLocation() : null;
+      final response = await _botPlatform.inlineResults(
+        botUserId: bot.userId,
+        chatId: vm.chatId,
+        query: invocation.query,
+        offset: page.nextOffset,
+        location: location,
+      );
+      final nextPage = BotInlineResultsPage.fromJson(response);
+      if (!mounted || generation != _inlineBotGeneration) return;
+      final current = _inlineBotResults;
+      if (current == null) return;
+      setState(() {
+        _inlineBotResults = current.mergeNextPage(nextPage);
+        _inlineBotLoadingMore = false;
+      });
+    } catch (_) {
+      if (!mounted || generation != _inlineBotGeneration) return;
+      setState(() => _inlineBotLoadingMore = false);
+    }
+  }
+
+  Future<void> _activateInlineResultsButton(
+    BotInlineResultsButton button,
+  ) async {
+    final bot = _inlineBot;
+    if (bot == null) return;
+    if (button.isWebApp && button.webAppUrl.isNotEmpty) {
+      final opened = await openTelegramMiniApp(
+        context,
+        chatId: vm.chatId,
+        botUserId: bot.userId,
+        url: button.webAppUrl,
+        title: button.text,
+      );
+      if (!mounted) return;
+      if (!opened) {
+        showToast(context, AppStrings.t(AppStringKeys.miniAppCannotStart));
+      }
+      return;
+    }
+    final parameter = button.startParameter;
+    if (parameter.isNotEmpty) {
+      final link = 'https://t.me/${bot.username}?start=$parameter';
+      await openLink(context, link);
+    } else {
+      await openLink(context, 'https://t.me/${bot.username}');
     }
   }
 
@@ -1123,7 +1250,8 @@ class _ChatInputBarState extends State<ChatInputBar>
     final revisionChanged = revision != _syncedComposerRevision;
     _syncedComposerRevision = revision;
     final focusTick = vm.composerFocusTick;
-    if (focusTick != _syncedComposerFocusTick) {
+    final focusRequested = focusTick != _syncedComposerFocusTick;
+    if (focusRequested) {
       _syncedComposerFocusTick = focusTick;
       _focusComposerForTranscriptReply();
     }
@@ -1189,7 +1317,8 @@ class _ChatInputBarState extends State<ChatInputBar>
     } else {
       final composing = _controller.value.composing;
       final composingLocally = _focus.hasFocus || composing.isValid;
-      if (!composingLocally && vm.draft != _controller.text) {
+      if ((!composingLocally || focusRequested) &&
+          vm.draft != _controller.text) {
         _controller.value = TextEditingValue(
           text: vm.draft,
           selection: TextSelection.collapsed(offset: vm.draft.length),
@@ -1565,6 +1694,20 @@ class _ChatInputBarState extends State<ChatInputBar>
     };
   }
 
+  /// The sticker tab to show: an explicit pick while it still names a tab in
+  /// the loaded list, otherwise the first installed set, and recents when no
+  /// set is installed at all.
+  int get _activeStickerTab {
+    final selected = _stickerPack;
+    if (selected == _stickerSearchTabId) return _stickerSearchTabId;
+    if (selected != null) {
+      for (final pack in StickerStore.shared.packs) {
+        if (pack.id == selected) return selected;
+      }
+    }
+    return StickerStore.shared.defaultPackId;
+  }
+
   void _setPanel(_Panel next) {
     if (_panel == next && !_quickReplyContextVisible) return;
     if (_panel == _Panel.voice && next != _Panel.voice) {
@@ -1604,12 +1747,9 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (_mediaKind == kind) return;
     var stickerPack = _stickerPack;
     if (kind == _MediaKind.sticker && _stickerPack == _gifTabId) {
-      // The saved-GIFs tab belongs to the GIF segment; hand the sticker
-      // segment a real sticker tab when it resumes.
-      final packs = StickerStore.shared.packs;
-      stickerPack = packs.isNotEmpty
-          ? packs.first.id
-          : StickerStore.recentPackId;
+      // The saved-GIFs tab belongs to the GIF segment; dropping it lets the
+      // sticker segment resolve its own default tab.
+      stickerPack = null;
     }
     setState(() {
       _mediaKind = kind;
@@ -1620,11 +1760,7 @@ class _ChatInputBarState extends State<ChatInputBar>
         EmojiStore.shared.loadIfNeeded();
         EmojiRecentsStore.shared.loadIfNeeded();
       case _MediaKind.sticker:
-        final activeId =
-            _stickerPack ??
-            (StickerStore.shared.packs.isNotEmpty
-                ? StickerStore.shared.packs.first.id
-                : StickerStore.recentPackId);
+        final activeId = _activeStickerTab;
         if (activeId == StickerStore.recentPackId ||
             activeId == _stickerSearchTabId) {
           StickerStore.shared.loadIfNeeded();
@@ -2395,7 +2531,21 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (lengthTier == TelegramMessageLengthTier.rich) {
       final sendAsRichText = await _confirmLongMessageAsRichText();
       if (!mounted || !sendAsRichText) return;
-      if (await _richTextSendMode() == null || !mounted) return;
+      if (await _richTextSendMode() == null) {
+        if (!mounted) return;
+        // This length cannot travel as a plain message, so a declined or
+        // failed relay setup keeps the draft and says why instead of dropping
+        // the text silently.
+        final configured = await _configureRichMessageRelay();
+        if (!mounted) return;
+        if (!configured) {
+          showToast(
+            context,
+            AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+          );
+          return;
+        }
+      }
       if (vm.requiresPaidMessage) {
         final ok = await _confirmPaidMessageSend();
         if (!mounted || !ok) return;
@@ -3029,7 +3179,9 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<void> _openRichTextComposer() async {
-    if (await _richTextSendMode() == null) return;
+    // Every account can compose rich text; whether it can be delivered as a
+    // rich message is resolved at send time, so the editor itself is never
+    // gated behind the relay bot.
     if (!mounted) return;
     if (_usesNativeDesktopComposer(context)) {
       try {
@@ -3243,10 +3395,13 @@ class _ChatInputBarState extends State<ChatInputBar>
         _replyKeyboardVisible &&
         !_hasText &&
         _pendingClipboardAttachments.isEmpty;
+    final bottomSafeArea = MediaQuery.paddingOf(context).bottom;
+    final mediaPanelVisible =
+        _panel == _Panel.emoji || _panel == _Panel.sticker;
     final panelSurfaceVisible =
         editingMessage == null &&
+        !mediaPanelVisible &&
         (_panel != _Panel.none || replyKeyboardPanelVisible);
-    final bottomSafeArea = MediaQuery.paddingOf(context).bottom;
     final bar = ColoredBox(
       key: const ValueKey('chat-input-safe-area-background'),
       color: c.inputBarBackground,
@@ -3317,10 +3472,10 @@ class _ChatInputBarState extends State<ChatInputBar>
               child: _desktopResizeHandle(),
             ),
           // The base input surface is painted exactly once across the complete
-          // composer. When a media/reply panel is open, extend that panel's
-          // surface through the system inset with the same single overlay used
-          // by the visible panel. This keeps translucent cloud-theme colors
-          // identical above and below the home indicator.
+          // composer. The media panel uses that same surface, so it needs no
+          // inset layer; the panels that paint their own surface extend it
+          // through the system inset with one overlay. This keeps translucent
+          // cloud-theme colors identical above and below the home indicator.
           if (panelSurfaceVisible && bottomSafeArea > 0)
             Positioned(
               left: 0,
@@ -3351,10 +3506,19 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   Widget _inlineBotResultMenu() {
     final c = context.colors;
-    final results = _inlineBotResults?.results ?? const <BotInlineResult>[];
-    Widget child;
-    if (results.isEmpty) {
-      child = SizedBox(
+    final page = _inlineBotResults;
+    final results = page?.results ?? const <BotInlineResult>[];
+    final headerButton = page?.button;
+    final headerText = _inlineBot?.inlinePlaceholder.trim() ?? '';
+    Widget body;
+    if (_inlineBotLoading && page == null) {
+      body = const SizedBox(
+        key: ValueKey('inlineBotLoadingIndicator'),
+        height: 58,
+        child: Center(child: AppActivityIndicator(size: 20)),
+      );
+    } else if (results.isEmpty) {
+      body = SizedBox(
         height: 54,
         child: Center(
           child: Text(
@@ -3363,84 +3527,232 @@ class _ChatInputBarState extends State<ChatInputBar>
           ),
         ),
       );
+    } else if (page != null && page.rendersAsGallery) {
+      body = GridView.builder(
+        key: const ValueKey('inlineBotGalleryGrid'),
+        shrinkWrap: true,
+        padding: const EdgeInsets.all(6),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 4,
+          mainAxisSpacing: 6,
+          crossAxisSpacing: 6,
+        ),
+        itemCount: results.length,
+        itemBuilder: (_, index) => _inlineGalleryTile(results[index]),
+      );
     } else {
-      child = ListView.separated(
+      body = ListView.separated(
         shrinkWrap: true,
         padding: EdgeInsets.zero,
         itemCount: results.length,
-        separatorBuilder: (_, _) => const InsetDivider(leadingInset: 54),
-        itemBuilder: (_, index) {
-          final result = results[index];
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => unawaited(_sendInlineBotResult(result)),
-            child: SizedBox(
-              height: 58,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(
-                  children: [
-                    AppIcon(
-                      _inlineResultIcon(result.type),
-                      size: 23,
-                      color: AppTheme.brand,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            result.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: c.textPrimary,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          if (result.description.isNotEmpty)
-                            Text(
-                              result.description,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: c.textSecondary,
-                                fontSize: 12,
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        },
+        separatorBuilder: (_, _) => const InsetDivider(leadingInset: 60),
+        itemBuilder: (_, index) => _inlineListRow(results[index]),
       );
     }
 
-    return Container(
-      key: const ValueKey('inlineBotResultMenu'),
-      constraints: const BoxConstraints(maxHeight: 260),
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      decoration: BoxDecoration(
-        color: c.card,
-        borderRadius: BorderRadius.circular(AppRadius.control),
-        border: Border.all(color: c.divider, width: 0.5),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.12),
-            blurRadius: 14,
-            offset: const Offset(0, -4),
-          ),
-        ],
+    return NotificationListener<ScrollNotification>(
+      onNotification: (notification) {
+        if (notification.metrics.extentAfter < 120) {
+          unawaited(_loadMoreInlineBotResults());
+        }
+        return false;
+      },
+      child: Container(
+        key: const ValueKey('inlineBotResultMenu'),
+        constraints: const BoxConstraints(maxHeight: 280),
+        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        decoration: BoxDecoration(
+          color: c.card,
+          borderRadius: BorderRadius.circular(AppRadius.control),
+          border: Border.all(color: c.divider, width: 0.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.12),
+              blurRadius: 14,
+              offset: const Offset(0, -4),
+            ),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (headerButton != null)
+              GestureDetector(
+                key: const ValueKey('inlineBotResultsHeaderButton'),
+                behavior: HitTestBehavior.opaque,
+                onTap: () =>
+                    unawaited(_activateInlineResultsButton(headerButton)),
+                child: Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(color: c.divider, width: 0.5),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          headerButton.text,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: AppTheme.brand,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      AppIcon(
+                        headerButton.isWebApp
+                            ? HeroAppIcons.globe
+                            : HeroAppIcons.arrowTopRight,
+                        size: 13,
+                        color: AppTheme.brand,
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else if (headerText.isNotEmpty && results.isNotEmpty)
+              Container(
+                key: const ValueKey('inlineBotPlaceholderHeader'),
+                padding: const EdgeInsets.fromLTRB(12, 7, 12, 6),
+                decoration: BoxDecoration(
+                  border: Border(
+                    bottom: BorderSide(color: c.divider, width: 0.5),
+                  ),
+                ),
+                child: Text(
+                  '@${_inlineBot!.username} · $headerText',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textSecondary, fontSize: 12),
+                ),
+              ),
+            Flexible(child: body),
+            if (_inlineBotLoadingMore)
+              const SizedBox(
+                key: ValueKey('inlineBotLoadingMoreIndicator'),
+                height: 36,
+                child: Center(child: AppActivityIndicator(size: 16)),
+              ),
+          ],
+        ),
       ),
-      clipBehavior: Clip.antiAlias,
-      child: child,
+    );
+  }
+
+  Widget _inlineListRow(BotInlineResult result) {
+    final c = context.colors;
+    return GestureDetector(
+      key: ValueKey('inlineBotResult-${result.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => unawaited(_sendInlineBotResult(result)),
+      onLongPress: () => unawaited(_sendInlineBotResultWithOptions(result)),
+      child: SizedBox(
+        height: 58,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(
+            children: [
+              _inlineResultLeading(result),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      result.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: c.textPrimary,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (result.description.isNotEmpty)
+                      Text(
+                        result.description,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: c.textSecondary, fontSize: 12),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _inlineGalleryTile(BotInlineResult result) {
+    final c = context.colors;
+    final thumb = result.thumbnail;
+    return GestureDetector(
+      key: ValueKey('inlineBotResult-${result.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => unawaited(_sendInlineBotResult(result)),
+      onLongPress: () => unawaited(_sendInlineBotResultWithOptions(result)),
+      child: Container(
+        decoration: BoxDecoration(
+          color: c.searchFill,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: thumb != null
+            ? TDImage(
+                photo: thumb,
+                fit: result.type == 'inlineQueryResultSticker'
+                    ? BoxFit.contain
+                    : BoxFit.cover,
+              )
+            : Center(
+                child: result.emoji.isNotEmpty
+                    ? Text(result.emoji, style: const TextStyle(fontSize: 28))
+                    : AppIcon(
+                        _inlineResultIcon(result.type),
+                        size: 26,
+                        color: AppTheme.brand,
+                      ),
+              ),
+      ),
+    );
+  }
+
+  Widget _inlineResultLeading(BotInlineResult result) {
+    final c = context.colors;
+    final thumb = result.thumbnail;
+    if (thumb != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+        child: SizedBox(width: 40, height: 40, child: TDImage(photo: thumb)),
+      );
+    }
+    return Container(
+      width: 40,
+      height: 40,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: c.searchFill,
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: result.emoji.isNotEmpty
+          ? Text(result.emoji, style: const TextStyle(fontSize: 20))
+          : AppIcon(
+              _inlineResultIcon(result.type),
+              size: 21,
+              color: AppTheme.brand,
+            ),
     );
   }
 
@@ -3459,16 +3771,27 @@ class _ChatInputBarState extends State<ChatInputBar>
     _ => HeroAppIcons.font,
   };
 
-  Future<void> _sendInlineBotResult(BotInlineResult result) async {
-    final page = _inlineBotResults;
-    if (page == null || page.queryId == 0 || result.id.isEmpty) return;
+  Future<void> _sendInlineBotResult(
+    BotInlineResult result, {
+    int? queryId,
+    MessageSendConfiguration? configuration,
+  }) async {
+    final resolvedQueryId =
+        queryId ??
+        (result.queryId != 0
+            ? result.queryId
+            : (_inlineBotResults?.queryId ?? 0));
+    if (resolvedQueryId == 0 || result.id.isEmpty) return;
     try {
       await _botPlatform.sendInlineResult(
         chatId: vm.chatId,
-        queryId: page.queryId,
+        queryId: resolvedQueryId,
         resultId: result.id,
         topicId: vm.forumTopicSendRef,
         replyTo: vm.replyToInput,
+        options: configuration?.messageSendOptions(
+          paidStarCount: vm.paidMessageStarCount,
+        ),
       );
       if (!mounted) return;
       vm.setReply(null);
@@ -3478,6 +3801,25 @@ class _ChatInputBarState extends State<ChatInputBar>
     } catch (error) {
       _showBotPlatformFailure(error);
     }
+  }
+
+  Future<void> _sendInlineBotResultWithOptions(BotInlineResult result) async {
+    final capturedQueryId = result.queryId != 0
+        ? result.queryId
+        : (_inlineBotResults?.queryId ?? 0);
+    if (capturedQueryId == 0 || result.id.isEmpty) return;
+    final configuration = await showMessageSendOptionsSheet(
+      context,
+      allowWhenOnline: vm.canSendWhenOnline,
+      effects: vm.availableMessageEffects,
+      onOpenScheduledMessages: _openScheduledMessages,
+    );
+    if (!mounted || configuration == null) return;
+    await _sendInlineBotResult(
+      result,
+      queryId: capturedQueryId,
+      configuration: configuration,
+    );
   }
 
   Widget _botCommandMenu() {
@@ -3614,6 +3956,7 @@ class _ChatInputBarState extends State<ChatInputBar>
                           title: candidate.name,
                           photo: candidate.photo,
                           size: 34,
+                          isDeleted: candidate.isDeleted,
                         ),
                         const SizedBox(width: 10),
                         Expanded(
@@ -4059,7 +4402,7 @@ class _ChatInputBarState extends State<ChatInputBar>
       surfaceKey: const ValueKey('desktopMediaPopover'),
       width: width,
       onDismiss: _hideDesktopPopovers,
-      child: _mediaPanel(height: height, popover: true),
+      child: _mediaPanel(height: height),
     );
   }
 
@@ -5272,7 +5615,7 @@ class _ChatInputBarState extends State<ChatInputBar>
                                             label:
                                                 originalPaste?.label ??
                                                 AppStringKeys
-                                                    .accountBackupLoadPyrogramPaste
+                                                    .accountBackupLoadSessionPaste
                                                     .l10n(context),
                                             onPressed: () => unawaited(
                                               _handlePaste(originalPaste),
@@ -6843,9 +7186,28 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<void> _sendRichTextResult(RichTextComposerResult result) async {
-    final mode = await _richTextSendMode();
-    if (mode == null) return;
+    var mode = await _richTextSendMode();
     if (!mounted) return;
+    if (mode == null && result.hasRichBlocks) {
+      // The document needs a capability this account does not have. Offer the
+      // relay once; declining or a failed setup falls through to a plain
+      // formatted message.
+      var configured = false;
+      try {
+        configured = await _configureRichMessageRelay();
+      } catch (error) {
+        debugPrint('Rich text relay setup failed: $error');
+      }
+      if (!mounted) return;
+      if (configured) mode = _RichTextSendMode.botRelay;
+    }
+    if (mode == null) {
+      await _sendRichTextFormattedOnly(
+        result,
+        droppedRichBlocks: result.hasRichBlocks,
+      );
+      return;
+    }
     try {
       var sentAny = false;
       if (mode == _RichTextSendMode.direct) {
@@ -6901,6 +7263,41 @@ class _ChatInputBarState extends State<ChatInputBar>
         showToast(context, message);
         await _reopenFailedRichTextComposer(result);
       }
+    }
+  }
+
+  /// Delivers the composer's text as an ordinary formatted message when the
+  /// account has no rich send path. Block structure has no representation in
+  /// `inputMessageText`, so it is dropped with one toast; when nothing at all
+  /// can be sent (a document containing media, or a rejected send) the draft
+  /// is reopened instead of silently sending only its caption and losing media.
+  Future<void> _sendRichTextFormattedOnly(
+    RichTextComposerResult result, {
+    required bool droppedRichBlocks,
+  }) async {
+    if (result.text.trim().isEmpty || result.attachments.isNotEmpty) {
+      showToast(
+        context,
+        AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    final sent = await widget.vm.sendFormatted(result.text, result.entities);
+    if (!mounted) return;
+    if (!sent) {
+      showToast(
+        context,
+        AppStringKeys.composerRichTextSendFailed.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    widget.onMessageSent();
+    _controller.clear();
+    _focus.requestFocus();
+    if (droppedRichBlocks) {
+      showToast(context, AppStringKeys.richTextSentFormattedOnly.l10n(context));
     }
   }
 
@@ -7035,6 +7432,10 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (entry?.mounted ?? false) entry!.remove();
   }
 
+  /// Resolves how this account can deliver a rich message, without asking the
+  /// user for anything. A null result means the account has no rich send path;
+  /// callers may then offer [RichMessageRelayConfig] setup once and fall back
+  /// to a plain formatted message.
   Future<_RichTextSendMode?> _richTextSendMode() async {
     try {
       if (await TdClient.shared.activeAccountUsesBotApi()) {
@@ -7046,17 +7447,10 @@ class _ChatInputBarState extends State<ChatInputBar>
       if (await RichMessageRelayConfig.isConfigured()) {
         return _RichTextSendMode.botRelay;
       }
-      if (mounted && await _configureRichMessageRelay()) {
-        return _RichTextSendMode.botRelay;
-      }
-    } catch (error) {
-      if (mounted) {
-        final message = switch (error) {
-          TdError(:final message) when message.trim().isNotEmpty => message,
-          _ => error.toString(),
-        };
-        showToast(context, message);
-      }
+    } catch (_) {
+      // Capability probing is advisory here: a failure leaves the caller on the
+      // plain formatted-message path rather than replacing the message with a
+      // probe error.
     }
     return null;
   }
@@ -7402,15 +7796,16 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   // MARK: - Unified media panel (emoji / stickers / GIF)
 
-  /// Telegram-iOS style unified picker: one panel with a top segmented
-  /// selector (Emoji | Stickers | GIF) above each kind's own tab strip and
-  /// content. Rendered for both `_Panel.emoji` and `_Panel.sticker`.
-  Widget _mediaPanel({double height = 376, bool popover = false}) {
+  /// One picker with a segmented selector (Emoji | Stickers | GIF) above each
+  /// kind's own tab strip and content, painted on the composer's own surface
+  /// so it continues the input bar instead of reading as a separate block.
+  /// Rendered for both `_Panel.emoji` and `_Panel.sticker`.
+  Widget _mediaPanel({double height = 376}) {
     final c = context.colors;
     return Container(
-      key: popover ? const ValueKey('desktopMediaPopoverContent') : null,
+      key: const ValueKey('composerMediaPanel'),
       height: height,
-      color: c.panelBackground,
+      color: c.inputBarBackground,
       child: Column(
         children: [
           _mediaKindSegmentControl(),
@@ -8342,11 +8737,8 @@ class _ChatInputBarState extends State<ChatInputBar>
   Widget _stickerContent() {
     final store = StickerStore.shared;
     final packs = store.packs;
-    final activeId =
-        _stickerPack ??
-        (packs.isNotEmpty ? packs.first.id : StickerStore.recentPackId);
+    final activeId = _activeStickerTab;
     if (activeId == _stickerSearchTabId) return _stickerSearchContent();
-    if (activeId == _gifTabId) return _gifContent();
     if (packs.isEmpty) {
       return Center(
         child: Text(
@@ -8506,9 +8898,7 @@ class _ChatInputBarState extends State<ChatInputBar>
   Widget _stickerTabStrip() {
     final c = context.colors;
     final packs = StickerStore.shared.packs;
-    final activeId =
-        _stickerPack ??
-        (packs.isNotEmpty ? packs.first.id : StickerStore.recentPackId);
+    final activeId = _activeStickerTab;
     final installed = packs.where((p) => p.id != StickerStore.recentPackId);
     return Container(
       key: const ValueKey('stickerPanelTabs'),
@@ -8535,6 +8925,7 @@ class _ChatInputBarState extends State<ChatInputBar>
               ),
             ),
             _emojiTabButton(
+              key: const ValueKey('stickerRecentsTab'),
               selected: activeId == StickerStore.recentPackId,
               onTap: () => _selectStickerTab(StickerStore.recentPackId),
               child: AppIcon(
@@ -8545,17 +8936,9 @@ class _ChatInputBarState extends State<ChatInputBar>
                     : c.textSecondary,
               ),
             ),
-            _emojiTabButton(
-              selected: activeId == _gifTabId,
-              onTap: () => _selectStickerTab(_gifTabId),
-              child: AppIcon(
-                HeroAppIcons.gif,
-                size: 22,
-                color: activeId == _gifTabId ? AppTheme.brand : c.textSecondary,
-              ),
-            ),
             for (final pack in installed)
               _emojiTabButton(
+                key: ValueKey('stickerPackTab-${pack.id}'),
                 selected: pack.id == activeId,
                 onTap: () => _selectStickerTab(pack.id),
                 child: pack.cover != null

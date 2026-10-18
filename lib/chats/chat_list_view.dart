@@ -446,6 +446,18 @@ class ChatListSelection {
     composerFocusRequestId: composerFocusRequestId,
   );
 
+  /// Whether [other] would land on the transcript this selection already
+  /// shows — same conversation, same topic, same jump target, and no fresh
+  /// composer-focus request that needs its own build.
+  ///
+  /// A caller uses this to decide that tapping the row means "go to the newest
+  /// message" rather than "open something else".
+  bool showsSameTranscript(ChatListSelection other) =>
+      chatId == other.chatId &&
+      forumTopicId == other.forumTopicId &&
+      initialMessageId == other.initialMessageId &&
+      composerFocusRequestId == other.composerFocusRequestId;
+
   ChatListSelection withForumTopic(int? topicId) => ChatListSelection(
     chatId: chatId,
     title: title,

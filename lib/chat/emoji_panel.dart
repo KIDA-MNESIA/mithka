@@ -79,11 +79,9 @@ class StandardEmojiPaneState extends State<StandardEmojiPane> {
 
   /// Analytic scroll offset of every section header, so a tap can jump to a
   /// section whose header is far off-screen and has no built box to measure.
-  /// Headers have a fixed extent and grid cells are square, so this is exact —
-  /// only the header label wraps, and it renders inside that fixed extent.
-  void _computeSectionOffsets(double paneWidth, int columns) {
-    final gridWidth = math.max(0, paneWidth - 20); // 10dp horizontal padding
-    final cell = gridWidth / math.max(1, columns);
+  /// Headers and grid rows both have a fixed extent, so this is exact — only
+  /// the header label wraps, and it renders inside that fixed extent.
+  void _computeSectionOffsets(int columns) {
     final counts = <int>[
       if (_hasRecents) EmojiRecentsStore.shared.renderableEntries.length,
       for (final category in EmojiCatalog.categories) category.emojis.length,
@@ -93,7 +91,8 @@ class StandardEmojiPaneState extends State<StandardEmojiPane> {
     for (final count in counts) {
       offsets.add(offset);
       offset +=
-          _emojiSectionHeaderExtent + (count / columns).ceilToDouble() * cell;
+          _emojiSectionHeaderExtent +
+          (count / columns).ceilToDouble() * emojiPanelCellExtent;
     }
     _sectionOffsets = offsets;
   }
@@ -173,7 +172,7 @@ class StandardEmojiPaneState extends State<StandardEmojiPane> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final columns = emojiPanelColumnCount(constraints.maxWidth);
-        _computeSectionOffsets(constraints.maxWidth, columns);
+        _computeSectionOffsets(columns);
         _clampHighlight(_sectionOffsets.length);
         return Column(
           children: [
@@ -250,6 +249,7 @@ class StandardEmojiPaneState extends State<StandardEmojiPane> {
       sliver: SliverGrid(
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: columns,
+          mainAxisExtent: emojiPanelCellExtent,
         ),
         delegate: SliverChildBuilderDelegate((context, index) {
           final entry = entries[index];
@@ -281,6 +281,7 @@ class StandardEmojiPaneState extends State<StandardEmojiPane> {
       sliver: SliverGrid(
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: columns,
+          mainAxisExtent: emojiPanelCellExtent,
         ),
         delegate: SliverChildBuilderDelegate((context, index) {
           final emoji = category.emojis[index];

@@ -71,13 +71,27 @@ void main() {
 
   test('desktop split replacements prepare chat geometry before setState', () {
     final source = File('lib/app/main_tab_view.dart').readAsStringSync();
-    final selectionStart = source.indexOf('onChatSelected: (chat) {');
+    // Every entry point that changes the pane goes through _showMessageChat, and
+    // that helper must prepare the exit geometry before it replaces the pane.
+    final showStart = source.indexOf('void _showMessageChat(');
+    final showEnd = source.indexOf(
+      'void _prepareMessageChatReplacement(',
+      showStart,
+    );
+    expect(showStart, greaterThanOrEqualTo(0));
+    expect(showEnd, greaterThan(showStart));
+    final show = source.substring(showStart, showEnd);
+    expect(
+      show.indexOf('_prepareMessageChatReplacement(next);'),
+      lessThan(show.indexOf('setState(() {')),
+    );
+    // The chat list must not bypass it: a direct selection assignment would skip
+    // the geometry snapshot and lose the reader's place.
+    final selectionStart = source.indexOf('onChatSelected: _showMessageChat');
+    expect(selectionStart, greaterThanOrEqualTo(0));
     final selectionEnd = source.indexOf('onCommunitySelected:', selectionStart);
     final selection = source.substring(selectionStart, selectionEnd);
-    expect(
-      selection.indexOf('_prepareMessageChatReplacement(chat);'),
-      lessThan(selection.indexOf('setState(() {')),
-    );
+    expect(selection, isNot(contains('setState(')));
 
     final replacementStart = source.indexOf(
       'void _prepareMessageChatReplacement(',

@@ -14,6 +14,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../chat/custom_emoji.dart';
 import '../chat/emoji_store.dart';
+import '../config/build_flags.dart';
+import '../history/message_history_store.dart';
 import '../notifications/notification_preferences.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
@@ -570,6 +572,9 @@ class AccountStore extends ChangeNotifier {
       if (userId != null) {
         await AccountBackupService.shared.deleteAccountId('$userId');
         await NotificationPreferences.shared.removeAccount(userId);
+        if (allowTelegramTosViolations) {
+          MessageHistoryStore.shared.removeAccount(userId);
+        }
       }
       notifyListeners();
       auth.reloadAuthState();
@@ -592,6 +597,9 @@ class AccountStore extends ChangeNotifier {
     if (userId != null) {
       await AccountBackupService.shared.deleteAccountId('$userId');
       await NotificationPreferences.shared.removeAccount(userId);
+      if (allowTelegramTosViolations) {
+        MessageHistoryStore.shared.removeAccount(userId);
+      }
     }
     notifyListeners();
     await refresh();
@@ -650,6 +658,9 @@ class AccountStore extends ChangeNotifier {
     if (userId != null) {
       await AccountBackupService.shared.deleteAccountId('$userId');
       await NotificationPreferences.shared.removeAccount(userId);
+      if (allowTelegramTosViolations) {
+        MessageHistoryStore.shared.removeAccount(userId);
+      }
     }
     await refresh();
   }
