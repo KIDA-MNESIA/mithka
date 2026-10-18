@@ -27,6 +27,35 @@ const _dividerWidth = 0.5;
 const _rowHeight = 62.0;
 
 void main() {
+  testWidgets('Android compact labels clear the whole system navigation bar', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      final probe = await _pumpBar(
+        tester,
+        const Size(390, 844),
+        48,
+        platform: TargetPlatform.android,
+      );
+      expect(
+        probe.bar.height,
+        moreOrLessEquals(_rowHeight + 48 + _dividerWidth),
+      );
+      for (final tab in probe.tabs) {
+        expect(tab.rect.bottom, probe.window.bottom);
+        expect(
+          tab.labelRect.bottom,
+          lessThanOrEqualTo(probe.window.bottom - 48),
+        );
+      }
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 6));
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   for (final cell in const [
     (name: 'iPad landscape 1366x1024', size: Size(1366, 1024), inset: 20.0),
     (name: 'iPad landscape 1194x834', size: Size(1194, 834), inset: 20.0),
@@ -281,9 +310,10 @@ List<bool?> _selected(WidgetTester tester, List<_TabProbe> tabs) => [
 Future<_BarProbe> _pumpBar(
   WidgetTester tester,
   Size size,
-  double bottomInset,
-) async {
-  debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+  double bottomInset, {
+  TargetPlatform platform = TargetPlatform.iOS,
+}) async {
+  debugDefaultTargetPlatformOverride = platform;
   tester.view.devicePixelRatio = 1;
   tester.view.physicalSize = size;
   tester.view.padding = FakeViewPadding(bottom: bottomInset);

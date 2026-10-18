@@ -2182,18 +2182,18 @@ class _TabNavigatorState extends State<_TabNavigator> {
 /// ~13pt above the edge, plus 1pt of breathing room.
 const double kHomeIndicatorClearance = 14;
 
-/// The bottom clearance the bar must keep for the system home indicator.
+/// The bottom clearance the bar must keep for system UI.
 ///
-/// Non-zero only on full-screen devices: iOS reports a bottom safe area
-/// exactly when a home indicator is drawn over the app, and reports none on
-/// devices with a home button, on the desktop, and in windowed layouts. The
+/// On iOS, use the reported bottom inset to detect a home indicator. The
 /// indicator itself is a ~5pt pill sitting ~8pt above the edge, so its top
 /// edge is ~13pt up; that — not the platform's whole safe area, which also
 /// covers the gesture band the bar does not use — is what the bar's content
-/// must clear, plus 1pt of breathing room.
+/// must clear, plus 1pt of breathing room. Other platforms retain the full
+/// reported safe area: Android's navigation buttons can occupy that space.
 double homeIndicatorBarClearance(BuildContext context) {
   final reported = MediaQuery.paddingOf(context).bottom;
   if (reported <= 0) return 0;
+  if (kIsWeb || defaultTargetPlatform != TargetPlatform.iOS) return reported;
   return math.min(reported, kHomeIndicatorClearance);
 }
 
@@ -2356,85 +2356,96 @@ class _MainBottomBar extends StatelessWidget {
                 semanticLabel: items[i].label.l10n(context),
                 selected: selection == i,
                 onTap: () => onSelect(i),
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.xxs,
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        SizedBox(
-                          width: 36,
-                          height: 28,
-                          child: Stack(
-                            clipBehavior: Clip.none,
-                            alignment: Alignment.center,
-                            children: [
-                              TweenAnimationBuilder<double>(
-                                duration: AppMotion.duration(
-                                  context,
-                                  AppMotion.responsive,
-                                ),
-                                curve: AppMotion.standard,
-                                tween: Tween<double>(
-                                  end: selection == i ? 1 : 0,
-                                ),
-                                builder: (context, value, child) =>
-                                    Transform.translate(
-                                      offset: Offset(0, -value),
-                                      child: Transform.scale(
-                                        scale: 1 + value * 0.08,
-                                        child: AppIcon(
-                                          items[i].icon,
-                                          size: 24,
-                                          color: Color.lerp(
-                                            c.textTertiary,
-                                            AppTheme.brand,
-                                            value,
+                child: Padding(
+                  // iOS centres content above its compact indicator clearance.
+                  // Android system buttons occupy the whole reported inset;
+                  // retain the prior content padding while tabs still fill it.
+                  padding: EdgeInsets.only(
+                    bottom:
+                        !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS
+                        ? 0
+                        : inset,
+                  ),
+                  child: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: AppSpacing.xxs,
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 36,
+                            height: 28,
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              alignment: Alignment.center,
+                              children: [
+                                TweenAnimationBuilder<double>(
+                                  duration: AppMotion.duration(
+                                    context,
+                                    AppMotion.responsive,
+                                  ),
+                                  curve: AppMotion.standard,
+                                  tween: Tween<double>(
+                                    end: selection == i ? 1 : 0,
+                                  ),
+                                  builder: (context, value, child) =>
+                                      Transform.translate(
+                                        offset: Offset(0, -value),
+                                        child: Transform.scale(
+                                          scale: 1 + value * 0.08,
+                                          child: AppIcon(
+                                            items[i].icon,
+                                            size: 24,
+                                            color: Color.lerp(
+                                              c.textTertiary,
+                                              AppTheme.brand,
+                                              value,
+                                            ),
                                           ),
                                         ),
                                       ),
-                                    ),
-                              ),
-                              if (i == 0 && unread > 0)
-                                Positioned(
-                                  right: -14,
-                                  top: -2,
-                                  child: UnreadBadge(
-                                    count: unread,
-                                    onClear: onClearUnread,
-                                  ),
                                 ),
-                            ],
+                                if (i == 0 && unread > 0)
+                                  Positioned(
+                                    right: -14,
+                                    top: -2,
+                                    child: UnreadBadge(
+                                      count: unread,
+                                      onClear: onClearUnread,
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        AnimatedDefaultTextStyle(
-                          duration: AppMotion.duration(
-                            context,
-                            AppMotion.responsive,
+                          const SizedBox(height: 2),
+                          AnimatedDefaultTextStyle(
+                            duration: AppMotion.duration(
+                              context,
+                              AppMotion.responsive,
+                            ),
+                            curve: AppMotion.standard,
+                            style: TextStyle(
+                              fontSize: _labelSize,
+                              fontWeight: selection == i
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: selection == i
+                                  ? AppTheme.brand
+                                  : c.textTertiary,
+                            ),
+                            // A wrapped label would outgrow the bar; the tab
+                            // is identified by its icon either way.
+                            child: Text(
+                              items[i].label.l10n(context),
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
-                          curve: AppMotion.standard,
-                          style: TextStyle(
-                            fontSize: _labelSize,
-                            fontWeight: selection == i
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                            color: selection == i
-                                ? AppTheme.brand
-                                : c.textTertiary,
-                          ),
-                          // A wrapped label would outgrow the bar; the tab
-                          // is identified by its icon either way.
-                          child: Text(
-                            items[i].label.l10n(context),
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
