@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/chat/chat_message_search_controller.dart';
 import 'package:mithka/tdlib/td_client.dart';
@@ -114,6 +116,25 @@ void main() {
       requests.where((request) => request['@type'] == 'searchChatMessages'),
       isEmpty,
     );
+  });
+
+  test('clearing the sender drops its already pending response', () async {
+    final pending = Completer<Map<String, dynamic>>();
+    handler = (request) async {
+      if (request['@type'] == 'searchChatMessages') return pending.future;
+      return _response(request);
+    };
+    final controller = ChatMessageSearchController(chatId: _chatId);
+    addTearDown(controller.dispose);
+    await commitAlice(controller);
+    expect(requests.any((r) => r['@type'] == 'searchChatMessages'), isTrue);
+    controller.clearSender();
+    pending.complete(
+      _response({'@type': 'searchChatMessages', 'from_message_id': 0}),
+    );
+    await pumpEventQueue();
+    expect(controller.hasSearch, isFalse);
+    expect(controller.results, isEmpty);
   });
 
   test('words typed after a commit keep the same sender scope', () async {

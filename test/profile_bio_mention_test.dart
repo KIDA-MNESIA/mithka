@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -212,5 +214,34 @@ void main() {
 
     await tester.pump(const Duration(seconds: 2));
     await tester.pumpAndSettle();
+  });
+
+  testWidgets('a closed profile drops a late username lookup', (tester) async {
+    final release = Completer<void>();
+    final arrived = Completer<void>();
+    final previous = handler;
+    handler = (request) async {
+      final response = await previous(request);
+      if (request['@type'] == 'searchPublicChat') {
+        arrived.complete();
+        await release.future;
+      }
+      return response;
+    };
+    await pumpProfile(tester, id: otherId);
+    await tapMention(tester);
+    await tester.pump();
+    expect(arrived.isCompleted, isTrue);
+    await tester.pumpWidget(const SizedBox.shrink());
+    release.complete();
+    await tester.pump();
+    await tester.pumpAndSettle();
+    expect(
+      requests.where(
+        (r) => r['@type'] == 'getUser' && r['user_id'] == mentionedId,
+      ),
+      isEmpty,
+    );
+    expect(tester.takeException(), isNull);
   });
 }
