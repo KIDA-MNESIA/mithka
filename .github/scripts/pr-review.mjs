@@ -187,12 +187,18 @@ export function combinedReady(decisions, classification, complete) {
     CHECKS.every(check => result.checks[check]) && result.findings.length === 0);
 }
 
-export function openRouterRequest(messages) {
+export function openRouterRequest(messages, challenge = false) {
   return {
-    model: 'openrouter/free',
+    // Explicit free-capacity models, verified in the public model catalogue.
+    // Prefer a different family for the challenge. Availability fallback stays
+    // free-only; zero provider prices also apply if the catalogue changes.
+    models: challenge
+      ? ['google/gemma-4-31b-it:free', 'google/gemma-4-26b-a4b-it:free', 'openrouter/free']
+      : ['nvidia/nemotron-3-super-120b-a12b:free', 'nvidia/nemotron-3.5-super-vl:free', 'openrouter/free'],
     messages,
     temperature: 0.1,
-    max_tokens: 4096,
+    max_tokens: 8192,
+    reasoning: { effort: 'low', exclude: true },
     // Never substitute paid models, plugins, web search, or model tools.
     provider: { max_price: { prompt: 0, completion: 0, request: 0, image: 0 }, data_collection: 'deny', require_parameters: true },
     response_format: { type: 'json_object' },
@@ -373,7 +379,7 @@ export async function askModel(context, previous = null, { key, fetcher = fetch 
     method: 'POST', redirect: 'error', signal: AbortSignal.timeout(150_000),
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json',
       'HTTP-Referer': 'https://github.com/iebb/mithka', 'X-OpenRouter-Title': 'Mithka PR Review' },
-    body: JSON.stringify(openRouterRequest(messages)),
+    body: JSON.stringify(openRouterRequest(messages, previous !== null)),
   });
   if (!response.ok) throw new Error(`Free OpenRouter review unavailable (HTTP ${response.status}); no paid fallback and no merge.`);
   const text = await response.text();
@@ -381,7 +387,10 @@ export async function askModel(context, previous = null, { key, fetcher = fetch 
   const data = JSON.parse(text);
   if (data.error) throw new Error('OpenRouter returned an inference error; manual review required.');
   const choice = data.choices?.[0];
-  if (choice?.finish_reason !== 'stop' || typeof choice.message?.content !== 'string') throw new Error('Incomplete model answer; manual review required.');
+  if (choice?.finish_reason !== 'stop' || typeof choice.message?.content !== 'string') {
+    const reason = ['length', 'content_filter', 'tool_calls', 'error', 'stop'].includes(choice?.finish_reason) ? choice.finish_reason : 'missing';
+    throw new Error(`Incomplete model answer (${reason}); manual review required.`);
+  }
   const result = validateDecision(JSON.parse(choice.message.content), context.files.map(file => file.path));
   groundFindings(result, context);
   result.summary = redact(result.summary, [key, process.env.GH_TOKEN]);

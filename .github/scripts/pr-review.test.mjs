@@ -223,12 +223,15 @@ test('full-head source citations need the exact line and contiguous current code
 
 test('the API request is free-only with zero prices, no tools, plugins or paid fallback', () => {
   const request = openRouterRequest([]);
-  assert.equal(request.model, 'openrouter/free');
+  assert.equal(request.models.at(-1), 'openrouter/free');
+  assert.ok(request.models.every(model => model === 'openrouter/free' || model.endsWith(':free')));
+  assert.notEqual(request.models[0].split('/')[0], openRouterRequest([], true).models[0].split('/')[0]);
   assert.deepEqual(request.provider.max_price, { prompt: 0, completion: 0, request: 0, image: 0 });
   assert.equal(request.provider.data_collection, 'deny');
   assert.equal(request.response_format.type, 'json_object');
-  assert.equal(request.max_tokens, 4096);
-  for (const field of ['models', 'tools', 'plugins', 'transforms']) assert.equal(field in request, false);
+  assert.equal(request.max_tokens, 8192);
+  assert.deepEqual(request.reasoning, { effort: 'low', exclude: true });
+  for (const field of ['model', 'tools', 'plugins', 'transforms']) assert.equal(field in request, false);
 });
 
 test('GitHub API rejects redirects/foreign URLs and never exposes raw failure bodies', async () => {

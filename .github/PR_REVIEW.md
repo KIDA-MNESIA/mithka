@@ -103,10 +103,16 @@ the trusted inference step. Set/rotate it in GitHub Settings → Secrets and
 variables → Actions, or with an interactive `gh secret set OPENROUTER_API_KEY
 --repo iebb/mithka`. Never put keys in source, PRs, prompts, comments or logs.
 
-Requests use only `openrouter/free`, with maximum prompt, completion, request and
-image prices all zero. There are no paid fallbacks, paid plugins, web search,
-model tools or automatic top-ups. Each fresh PR uses one call, or two if the
-first recommends ready. In-progress Quality waits without consuming inference
+The review prefers NVIDIA Nemotron free variants, and the challenge prefers
+Google Gemma free variants (to avoid simply repeating one model family).
+Availability fallbacks are exclusively `:free` models and `openrouter/free`,
+with maximum prompt, completion, request and image prices all zero. There are
+no paid fallbacks, paid plugins, web search, model tools or automatic top-ups.
+Each fresh PR uses one API call, or two for a ready/grounded-change decision;
+provider fallbacks may count additional quota attempts. The output budget is
+8,192 tokens with low reasoning effort so reasoning does not consume the entire
+answer before producing JSON. Cut-off answers still fail closed.
+In-progress Quality waits without consuming inference
 quota. Non-collecting providers are required (`data_collection: deny`); if no
 eligible free provider is available, the PR stays open.
 
