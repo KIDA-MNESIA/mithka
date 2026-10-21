@@ -65,7 +65,14 @@ bool profileFeaturedPhotosUseDesktopWindow(
   TargetPlatform platform, {
   bool isWeb = kIsWeb,
   bool hasProfileActions = false,
-}) => !isWeb && !hasProfileActions && isDesktopTargetPlatform(platform);
+  bool hasAnimation = false,
+}) =>
+    !isWeb &&
+    !hasProfileActions &&
+    // The preview window renders still files only, so a gallery that carries a
+    // motion variant opens in the in-app viewer instead, where it can play.
+    !hasAnimation &&
+    isDesktopTargetPlatform(platform);
 
 class ProfileDetailView extends StatefulWidget {
   const ProfileDetailView({
@@ -221,7 +228,15 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
               (a.integer('width') ?? 0) >= (b.integer('width') ?? 0) ? a : b,
         );
         final ref = TDParse.fileRef(best.obj('photo'));
-        if (ref != null) photos.add(_FeaturedProfilePhoto(id: id, file: ref));
+        if (ref != null) {
+          photos.add(
+            _FeaturedProfilePhoto(
+              id: id,
+              file: ref,
+              animation: _featuredPhotoAnimationFile(p),
+            ),
+          );
+        }
       }
       if (mounted) setState(() => _photos = photos);
     } catch (_) {}
@@ -1647,13 +1662,46 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
 
   Widget _photoTile(int i) {
     const s = 78.0;
+    final photo = _photos[i];
     return GestureDetector(
+      key: ValueKey('featured-photo-tile-$i'),
       behavior: HitTestBehavior.opaque,
       onTap: () => unawaited(_openFeaturedPhoto(i)),
       child: SizedBox(
         width: s,
         height: s,
-        child: TDImage(photo: _photos[i].file, cornerRadius: 10),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            TDImage(photo: photo.file, cornerRadius: 10),
+            // Tiles keep the still frame — a strip of looping decoders would
+            // be a real cost — so a corner badge advertises that the full
+            // viewer will play this photo.
+            if (photo.animation != null)
+              Positioned(
+                right: 5,
+                bottom: 5,
+                child: Semantics(
+                  label: AppStrings.t(AppStringKeys.appearanceStatusAnimated),
+                  child: Container(
+                    key: const ValueKey('featured-photo-animation-badge'),
+                    width: 18,
+                    height: 18,
+                    alignment: Alignment.center,
+                    decoration: const BoxDecoration(
+                      color: Color(0x99000000),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const AppIcon(
+                      HeroAppIcons.play,
+                      size: 10,
+                      color: Color(0xFFFFFFFF),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1667,6 +1715,7 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
     if (profileFeaturedPhotosUseDesktopWindow(
       Theme.of(context).platform,
       hasProfileActions: _isMe,
+      hasAnimation: photos.any((photo) => photo.animation != null),
     )) {
       final opened = await DesktopImagePreviewWindowService.instance.open(
         items,
@@ -1680,6 +1729,9 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
       AppPageRoute<void>(
         pageBuilder: (previewContext, _, _) => FullImageViewer(
           items: items,
+          animations: photos
+              .map((photo) => photo.animation)
+              .toList(growable: false),
           startIndex: startIndex,
           primaryActionLabel: _isMe
               ? AppStrings.t(AppStringKeys.profilePhotoSetAsAvatar)
@@ -1898,10 +1950,32 @@ class _ProfileDetailViewState extends State<ProfileDetailView> {
 }
 
 class _FeaturedProfilePhoto {
-  const _FeaturedProfilePhoto({required this.id, required this.file});
+  const _FeaturedProfilePhoto({
+    required this.id,
+    required this.file,
+    this.animation,
+  });
 
   final int id;
+
+  /// The still frame: the tile image, the poster while [animation] plays, and
+  /// the file the save action writes to the photo library.
   final TdFileRef file;
+
+  /// Muted motion variant of this photo, when TDLib reports one.
+  final TdFileRef? animation;
+}
+
+/// The best motion variant TDLib offers for a `chatPhoto`: the full-size
+/// animation, falling back to the small one. Null when neither has a file.
+TdFileRef? _featuredPhotoAnimationFile(Map<String, dynamic> photo) {
+  for (final key in const ['animation', 'small_animation']) {
+    final ref = TDParse.fileRef(photo.obj(key)?.obj('file'));
+    // `fileRef` accepts any object carrying an id, including an id TDLib has
+    // not assigned yet; a player fed that id can never fetch anything.
+    if (ref != null && ref.id > 0) return ref;
+  }
+  return null;
 }
 
 enum _FeaturedPhotoAction { save, delete }

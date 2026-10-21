@@ -12,7 +12,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_sound/flutter_sound.dart';
@@ -464,6 +464,18 @@ bool shouldRebuildComposerForVmUpdate({
   required bool hasFocus,
 }) => localChanged || (revisionChanged && !hasFocus);
 
+/// Whether the attachment strip offers the camera entry beside the image one.
+///
+/// The camera entry (which opens the in-app camera, and whose capture is sent
+/// as a photo) is rendered on Android and iOS only; a desktop or web composer
+/// shows the screenshot entry instead. Exposed as a pure predicate so a widget
+/// test can pin the strip order on any host without overriding the target
+/// platform.
+bool composerShowsCameraIcon([TargetPlatform? platform]) {
+  final target = platform ?? defaultTargetPlatform;
+  return target == TargetPlatform.android || target == TargetPlatform.iOS;
+}
+
 class ChatInputBar extends StatefulWidget {
   const ChatInputBar({
     super.key,
@@ -494,6 +506,7 @@ class ChatInputBar extends StatefulWidget {
     this.desktopComposerHeightLoader,
     this.desktopComposerHeightSaver,
     this.botPlatformForTesting,
+    this.phoneStripForTesting = false,
   });
   final ChatViewModel vm;
   final FutureOr<void> Function(bool isVideo) onStartCall;
@@ -539,6 +552,12 @@ class ChatInputBar extends StatefulWidget {
   final DesktopComposerHeightSaver? desktopComposerHeightSaver;
   @visibleForTesting
   final BotPlatformService? botPlatformForTesting;
+
+  /// Renders the phone attachment strip (which includes the camera entry)
+  /// even when the widget test runs on a desktop host. Defaults to the
+  /// [defaultTargetPlatform] behaviour.
+  @visibleForTesting
+  final bool phoneStripForTesting;
 
   @override
   State<ChatInputBar> createState() => _ChatInputBarState();
@@ -683,6 +702,13 @@ class _ChatInputBarState extends State<ChatInputBar>
       vm.peerUserId != vm.meId;
 
   bool get _canSendVoiceNotes => vm.canSendMessages && vm.canSendVoiceNotes;
+
+  /// The one surface colour every panel docked to the composer bar paints, so
+  /// a panel reads as a continuation of the bar instead of a recessed block.
+  /// The bar itself paints `AppColors.inputBarBackground`; the darker
+  /// `AppColors.panelBackground` is for surfaces that sit on an opaque pane
+  /// (settings lists, desk panes), not for anything attached to the composer.
+  Color get _composerDockedSurfaceColor => context.colors.inputBarBackground;
 
   @override
   void initState() {
@@ -3476,6 +3502,8 @@ class _ChatInputBarState extends State<ChatInputBar>
           // inset layer; the panels that paint their own surface extend it
           // through the system inset with one overlay. This keeps translucent
           // cloud-theme colors identical above and below the home indicator.
+          // The overlay extends a docked panel through the home indicator, so
+          // it paints that panel's surface, not a second, recessed colour.
           if (panelSurfaceVisible && bottomSafeArea > 0)
             Positioned(
               left: 0,
@@ -3485,7 +3513,7 @@ class _ChatInputBarState extends State<ChatInputBar>
               child: IgnorePointer(
                 child: ColoredBox(
                   key: const ValueKey('chat-input-panel-safe-area-background'),
-                  color: c.panelBackground,
+                  color: _composerDockedSurfaceColor,
                 ),
               ),
             ),
@@ -4338,6 +4366,10 @@ class _ChatInputBarState extends State<ChatInputBar>
                   width: width,
                   clipBehavior: Clip.antiAlias,
                   decoration: BoxDecoration(
+                    // A floating popover anchored above the composer, not a
+                    // docked panel: it carries its own 0.7pt outline and 24pt
+                    // drop shadow, so it keeps the recessed surface to read as
+                    // a separate card over the composer bar it hangs from.
                     color: c.panelBackground,
                     borderRadius: BorderRadius.circular(cornerRadius),
                     border: Border.all(color: c.divider, width: 0.7),
@@ -6318,11 +6350,12 @@ class _ChatInputBarState extends State<ChatInputBar>
   Widget _replyKeyboardPanel(_ReplyKeyboard keyboard) {
     final c = context.colors;
     return Container(
+      key: const ValueKey('composerReplyKeyboardPanel'),
       constraints: const BoxConstraints(maxHeight: 330),
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
-        color: c.panelBackground,
+        color: _composerDockedSurfaceColor,
         border: Border(top: BorderSide(color: c.divider, width: 0.5)),
       ),
       child: SingleChildScrollView(
@@ -6702,19 +6735,19 @@ class _ChatInputBarState extends State<ChatInputBar>
               _panel == _Panel.voice,
               _toggleVoice,
             ),
-          _icon(
-            HeroAppIcons.image,
-            AppStrings.t(AppStringKeys.composerImage),
-            false,
-            _pickPhotos,
-          ),
-          if (Platform.isAndroid || Platform.isIOS)
+          if (widget.phoneStripForTesting || composerShowsCameraIcon())
             _icon(
               HeroAppIcons.camera,
               AppStrings.t(AppStringKeys.composerCamera),
               false,
               _takePhoto,
             ),
+          _icon(
+            HeroAppIcons.image,
+            AppStrings.t(AppStringKeys.composerImage),
+            false,
+            _pickPhotos,
+          ),
           _icon(
             HeroAppIcons.solidFaceSmile,
             AppStrings.t(AppStringKeys.composerMediaPicker),
@@ -7755,7 +7788,7 @@ class _ChatInputBarState extends State<ChatInputBar>
     return Container(
       key: const ValueKey('composerFunctionPanel'),
       width: double.infinity,
-      color: c.panelBackground,
+      color: _composerDockedSurfaceColor,
       padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
       child: IconGrid(
         perRow: 5,
@@ -7801,11 +7834,10 @@ class _ChatInputBarState extends State<ChatInputBar>
   /// so it continues the input bar instead of reading as a separate block.
   /// Rendered for both `_Panel.emoji` and `_Panel.sticker`.
   Widget _mediaPanel({double height = 376}) {
-    final c = context.colors;
     return Container(
       key: const ValueKey('composerMediaPanel'),
       height: height,
-      color: c.inputBarBackground,
+      color: _composerDockedSurfaceColor,
       child: Column(
         children: [
           _mediaKindSegmentControl(),
@@ -8279,7 +8311,7 @@ class _ChatInputBarState extends State<ChatInputBar>
       child: Container(
         key: const ValueKey('desktopVoiceMessagePanel'),
         width: double.infinity,
-        color: c.panelBackground,
+        color: _composerDockedSurfaceColor,
         padding: const EdgeInsets.fromLTRB(20, 8, 16, 14),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -8469,9 +8501,10 @@ class _ChatInputBarState extends State<ChatInputBar>
               ? AppStrings.t(AppStringKeys.composerReleaseFingerToCancel)
               : AppStrings.t(AppStringKeys.composerRecordingReleasePreview));
     return Container(
+      key: const ValueKey('composerMobileVoicePanel'),
       height: 318,
       width: double.infinity,
-      color: c.panelBackground,
+      color: _composerDockedSurfaceColor,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
