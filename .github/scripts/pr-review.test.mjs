@@ -567,6 +567,10 @@ test('publication verifies exact parents and current approval, uses only a norma
   assert.ok(g.calls.every(args => !args.some(arg => arg.includes('--force'))));
   assert.deepEqual(api.calls.filter(call => call.path.endsWith('/dispatches')).map(call => [call.path, call.body]),
     [[`/repos/${REPOSITORY}/actions/workflows/quality.yml/dispatches`, { ref: 'master' }]]);
+  const notice = api.calls.find(call => call.method === 'POST' && call.path.endsWith('/issues/7/comments')).body.body;
+  assert.match(notice, /Quality run 11.*actions\/runs\/11/);
+  assert.ok(!notice.includes('Quality passed in this Actions run'));
+  assert.match(notice, /did not execute PR code/);
 });
 
 test('publication never starts Git writes without current exact-head owner approval', async () => {
