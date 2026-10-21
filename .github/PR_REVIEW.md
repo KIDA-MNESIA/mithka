@@ -74,6 +74,30 @@ or the maintainer's ability to merge manually. A human can inspect the findings,
 fix a PR and approve its updated head; an old request for changes is not a
 permanent rejection. Larger/uncertain changes remain open for human revision.
 
+### Explicit owner-reviewed publication
+
+The maintainer may delegate source review and recording of exact-head approvals
+to an assistant. This is not an approval inferred from a model answer or PR text:
+the actual authenticated `iebb` account must still submit the `APPROVED` review.
+After independently verifying a genuine improvement, dispatch **PR Review** on
+`master` with both `pr_number` and `reviewed_head` set to the reviewed current SHA.
+Only an initial `iebb` actor ID and an `iebb` triggering actor on `master` can
+select this explicit manual-review path. It does not invoke OpenRouter or claim
+two model reviews completed. Every deterministic gate, exact tested merge,
+fresh validation/publication recheck and post-merge Quality requirement remains.
+Missing approval, unresolved findings, incomplete checklist, protected-path edits,
+failed tests and changed heads/bases still block publication. A new head needs
+a new approval and dispatch; this does not preapprove future incoming PRs.
+
+The review workflow's own orchestration checks are excluded from head CI only
+after checking the real GitHub Actions app, repository, workflow ID/path, event,
+check suite, run and job ID through GitHub's API. Its conditional jobs are
+intentionally skipped before eligibility, and its review job is itself running
+while checking readiness. Matching names alone cannot exempt another check.
+Quality and every other check/status still must succeed; skipped/neutral external
+checks are not substitutes. These internal transitions are also excluded from
+the evidence fingerprint to prevent circular re-reviews.
+
 ## Events, deduplication and re-runs
 
 PR open/synchronize/reopen/ready/description events, human PR comments, review
