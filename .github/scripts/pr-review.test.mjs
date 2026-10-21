@@ -677,6 +677,14 @@ test('privileged workflow uses master only, hosted runners, no schedule and no i
   assert.ok(!ownerStep.includes('OPENROUTER_API_KEY'));
 });
 
+test('automatic signals cannot replace the owner queue and both lanes serialize publication', () => {
+  const workflow = readFileSync(new URL('../workflows/pr-review.yml', import.meta.url), 'utf8');
+  assert.ok(workflow.includes("group: mithka-pr-review-${{ github.event_name == 'workflow_dispatch' && inputs.reviewed_head != '' && github.actor_id == '2127498' && github.triggering_actor == 'iebb' && github.ref == 'refs/heads/master' && 'owner' || 'automatic' }}"));
+  const mergeJob = workflow.split('\n  merge:\n')[1];
+  assert.match(mergeJob, /concurrency:\n      group: mithka-pr-publication\n      cancel-in-progress: false/);
+  assert.equal([...workflow.matchAll(/group: mithka-pr-publication/g)].length, 1);
+});
+
 test('missing or forged/non-unique Actions job identities never attest Quality', async () => {
   for (const identities of [[], ['Fake snapshot'], [
     `Merge snapshot ${MERGE} base ${BASE} head ${HEAD}`, `Merge snapshot ${MERGE} base ${BASE} head ${HEAD}`,

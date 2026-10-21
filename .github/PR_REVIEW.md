@@ -106,7 +106,13 @@ wake the controller. `PR Review Signal` carries review events from forks without
 secrets, code checkout or artifacts; the privileged controller always re-reads
 live GitHub data rather than trusting signal outputs.
 
-The controller serializes runs and inspects up to five most recently updated
+Automatic review and explicit owner dispatches have separate serialized queues,
+so a new review signal cannot discard an already queued owner-reviewed
+publication. Only a real `iebb` dispatch from `master` can enter the owner queue.
+Both queues share one publication-job lock; a waiting publisher still rechecks
+the live head, base, approvals and Quality and refuses a stale result. Each queue
+retains GitHub's usual single-pending behavior within that queue.
+The controller inspects up to five most recently updated
 open PRs per general event; PR/comment events target their specific PR. A fingerprint includes current head/master, policy,
 description, human feedback, approval/thread state and CI results. Identical
 evidence produces no repeated model request or comment. A cached comment can
