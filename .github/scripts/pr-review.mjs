@@ -329,7 +329,7 @@ function humanFeedback(items) {
 }
 
 export function fingerprint(snapshot, policy) {
-  const { pr, base, quality, checks, statuses, threads } = snapshot;
+  const { pr, base, quality, statuses, threads } = snapshot;
   return createHash('sha256').update(JSON.stringify({
     version: 2, policy, head: pr.head.sha, base, body: pr.body, title: pr.title, draft: pr.draft, mergeable: pr.mergeable,
     reviews: humanFeedback(snapshot.reviews), comments: humanFeedback(snapshot.comments), inline: humanFeedback(snapshot.inline),
@@ -569,7 +569,7 @@ export async function publishMerge(api, { number, head, base, merge }, runGit = 
   await api.request(`/repos/${REPOSITORY}/actions/workflows/quality.yml/dispatches`, { method: 'POST', body: { ref: 'master' } });
   if (!merged) throw new Error('Remote master is published and post-merge Quality requested, but GitHub MERGED state is not yet confirmed. Do not retry the push.');
   await api.request(`/repos/${REPOSITORY}/issues/${number}/comments`, { method: 'POST', body: {
-    body: `Merged the exact validated result \`${merge}\` into master after rechecking iebb's current-head approval. Head \`${head}\`, prior master \`${base}\`. Local-PC review was not used. Full merged-result Quality passed in this Actions run. Post-merge Quality has been requested separately; this comment does not claim it has passed.`,
+    body: `Merged the exact validated result \`${merge}\` into master after rechecking iebb's current-head approval. Head \`${head}\`, prior master \`${base}\`. Full merged-result [Quality run ${final.quality.id}](https://github.com/${REPOSITORY}/actions/runs/${final.quality.id}) passed before publication; this job verified its attestation and did not execute PR code. Post-merge Quality has been requested separately; this comment does not claim it has passed.`,
   } });
   return merge;
 }
