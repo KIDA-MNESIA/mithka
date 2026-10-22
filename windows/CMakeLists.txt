@@ -49,6 +49,16 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+# TDLib is a reproducible, manifest-pinned local input that is intentionally
+# excluded from git. Refuse to produce a runnable-looking bundle without it,
+# then copy it beside the executable for both Visual Studio and Flutter builds.
+set(TDJSON_LIBRARY "${CMAKE_CURRENT_SOURCE_DIR}/../native-libs/tdjson.dll")
+if(NOT EXISTS "${TDJSON_LIBRARY}")
+  message(FATAL_ERROR
+    "Missing native-libs/tdjson.dll. Install it with "
+    "scripts/build-tdjson-desktop.sh windows native-libs/tdjson.dll")
+endif()
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
@@ -56,6 +66,9 @@ add_subdirectory("runner")
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/winrt_coroutine_compat.cmake")
+mithka_apply_legacy_winrt_coroutine_compat()
 
 
 # === Installation ===
@@ -79,6 +92,9 @@ install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)
+
+install(FILES "${TDJSON_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 if(PLUGIN_BUNDLED_LIBRARIES)

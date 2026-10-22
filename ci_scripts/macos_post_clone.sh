@@ -17,6 +17,7 @@
 set -eu
 
 FLUTTER_VERSION="3.44.2"
+COCOAPODS_VERSION="1.17.0"
 
 retry() {
   attempts="$1"
@@ -37,6 +38,21 @@ retry() {
   done
 }
 
+ensure_cocoapods() {
+  installed_version="$(pod --version 2>/dev/null || true)"
+  if [ "$installed_version" != "$COCOAPODS_VERSION" ]; then
+    echo "Installing CocoaPods $COCOAPODS_VERSION"
+    retry 3 10 sudo gem install cocoapods -v "$COCOAPODS_VERSION" --no-document
+    hash -r
+    installed_version="$(pod --version 2>/dev/null || true)"
+  fi
+  if [ "$installed_version" != "$COCOAPODS_VERSION" ]; then
+    echo "error: expected CocoaPods $COCOAPODS_VERSION, found ${installed_version:-missing}" >&2
+    exit 1
+  fi
+  echo "Using CocoaPods $installed_version"
+}
+
 REPO="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$REPO"
 
@@ -47,12 +63,12 @@ fi
 
 RAW_VERSION="$(awk '/^version:/ { print $2; exit }' pubspec.yaml)"
 SOURCE_VERSION="${RAW_VERSION%%+*}"
-# Keep the major/minor from pubspec.yaml but force the patch component to zero.
-# Nightly patch increments can therefore advance Android and desktop release
-# artifacts without creating a new TestFlight marketing-version train. iOS
-# derives the same value; the macOS project reads the generated xcconfig, so
+# A nightly collapses onto the X.Y.0 marketing train so its patch increments do
+# not open a review train per night; a release keeps the exact patch it ships.
+# iOS derives the same value; the macOS project reads the generated xcconfig, so
 # passing --build-name below is the whole fix, with no project file to rewrite.
-APP_VERSION="$(sh "$REPO/scripts/apple_marketing_version.sh" "$RAW_VERSION")"
+APP_VERSION="$(sh "$REPO/scripts/apple_marketing_version.sh" \
+  "$RAW_VERSION" "${CI_BRANCH:-${GITHUB_REF_NAME:-}}")"
 
 # Xcode Cloud replaces distributed products' build number with its own
 # monotonically increasing CI build number. Use the same value in the archive
@@ -70,10 +86,7 @@ if ! command -v flutter >/dev/null 2>&1; then
   export PATH="$HOME/flutter/bin:$PATH"
 fi
 flutter --version
-
-if ! command -v pod >/dev/null 2>&1; then
-  retry 3 10 brew install cocoapods
-fi
+ensure_cocoapods
 
 : "${TELEGRAM_API_ID:?set TELEGRAM_API_ID as a secret Xcode Cloud environment variable}"
 : "${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH as a secret Xcode Cloud environment variable}"
@@ -105,6 +118,7 @@ flutter config --enable-swift-package-manager
 flutter precache --macos
 flutter pub get
 flutter build macos --release --config-only \
+  --dart-define="I_DONT_FUCKING_CARE_ABOUT_TOS=false" \
   --build-name="$APP_VERSION" \
   --build-number="$APP_BUILD_NUMBER" \
   --dart-define="GIT_COMMIT=$GIT_COMMIT" \

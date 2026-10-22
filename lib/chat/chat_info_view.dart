@@ -18,6 +18,7 @@ import 'package:provider/provider.dart';
 import '../app/primary_chat_launcher.dart';
 import '../chats/chat_delete_dialog.dart';
 import '../chats/chat_delete_policy.dart';
+import '../chats/chat_removal_actions.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/icon_grid.dart';
@@ -29,6 +30,8 @@ import '../notifications/notification_settings_payload.dart';
 import '../profile/qr_code_view.dart';
 import '../settings/chat_folder_service.dart';
 import '../settings/edit_field_view.dart';
+import '../settings/hidden_sender_store.dart';
+import '../settings/hidden_senders_view.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -40,6 +43,7 @@ import 'add_members_view.dart';
 import 'chat_members_cache.dart';
 import 'chat_members_view.dart';
 import 'chat_search_view.dart';
+import 'chat_sticker_packs_view.dart';
 import 'chat_theme_view.dart';
 import 'chat_wallpaper_view.dart';
 import 'group_management_view.dart';
@@ -819,6 +823,39 @@ class _ChatInfoViewState extends State<ChatInfoView> {
             AppStrings.t(AppStringKeys.chatInfoChatFolders),
             _openChatFolders,
           ),
+          if (_vm.isGroup && !_vm.isChannel)
+            ListenableBuilder(
+              listenable: HiddenSenderStore.shared,
+              builder: (context, _) {
+                final hidden = HiddenSenderStore.shared
+                    .entriesFor(widget.chatId)
+                    .length;
+                if (hidden == 0) return const SizedBox.shrink();
+                return Column(
+                  children: [
+                    const InsetDivider(leadingInset: 14),
+                    _infoRow(
+                      '${AppStrings.t(AppStringKeys.hiddenSendersTitle)} ($hidden)',
+                      () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) =>
+                              HiddenSendersView(chatId: widget.chatId),
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          const InsetDivider(leadingInset: 14),
+          _infoRow(
+            AppStrings.t(AppStringKeys.chatStickerPacksTitle),
+            () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => ChatStickerPacksView(chatId: widget.chatId),
+              ),
+            ),
+          ),
           if (_vm.canOpenDirectMessages) ...[
             const InsetDivider(leadingInset: 14),
             _infoRow(
@@ -877,15 +914,34 @@ class _ChatInfoViewState extends State<ChatInfoView> {
           if (_vm.isGroup && _vm.canManageGroup) ...[
             const InsetDivider(leadingInset: 14),
             _infoRow(
-              AppStrings.t(AppStringKeys.chatInfoManageGroup),
-              () => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => GroupManagementView(
-                    chatId: widget.chatId,
-                    title: _vm.title,
-                  ),
-                ),
+              AppStrings.t(
+                _vm.isChannel
+                    ? AppStringKeys.chatInfoManageChannel
+                    : AppStringKeys.chatInfoManageGroup,
               ),
+              () async {
+                final upgradedChatId = await Navigator.of(context).push<int>(
+                  MaterialPageRoute(
+                    builder: (_) => GroupManagementView(
+                      chatId: widget.chatId,
+                      title: _vm.title,
+                      isChannel: _vm.isChannel,
+                    ),
+                  ),
+                );
+                // A basic group upgraded to a supergroup pops the new
+                // chat id: TDLib has already deactivated the old chat,
+                // so the shell must open the new one or it would sit on
+                // a dead conversation.
+                if (upgradedChatId != null && mounted) {
+                  await openChatFromCurrentWindow(
+                    context,
+                    chatId: upgradedChatId,
+                    title: _vm.title,
+                    replaceCurrent: true,
+                  );
+                }
+              },
             ),
           ],
         ],
@@ -1123,18 +1179,21 @@ class _ChatInfoViewState extends State<ChatInfoView> {
   }
 
   Widget _destructiveCard() {
+    final canLeave = _vm.isGroup && _vm.isMember;
+    if (!_vm.canClearHistory && !canLeave) return const SizedBox.shrink();
     return Container(
       decoration: _card,
       clipBehavior: Clip.antiAlias,
       child: Column(
         children: [
-          _destructiveRow(
-            AppStrings.t(AppStringKeys.chatInfoClearHistory),
-            _clearHistory,
-          ),
+          if (_vm.canClearHistory)
+            _destructiveRow(
+              AppStrings.t(AppStringKeys.chatInfoClearHistory),
+              _clearHistory,
+            ),
           // Only a confirmed member can quit — hide 退出 for non-joined groups/channels.
-          if (_vm.isGroup && _vm.isMember) ...[
-            const InsetDivider(leadingInset: 0),
+          if (canLeave) ...[
+            if (_vm.canClearHistory) const InsetDivider(leadingInset: 0),
             _destructiveRow(
               AppStrings.t(
                 _vm.isChannel
@@ -2009,6 +2068,7 @@ class ChatInfoViewModel extends ChangeNotifier {
       isAdministeredDirectMessagesGroup || canManageDirectMessages;
   bool canChangeAutoDelete = false;
   bool isMember = false; // confirmed member → may quit; false hides 退出
+  bool canClearHistory = false;
   bool _loaded = false;
   String? _notice;
   // Group / channel description (plain text) with link entities parsed
@@ -2107,6 +2167,7 @@ class ChatInfoViewModel extends ChangeNotifier {
     final kind = TDParse.chatKind(chat);
     isChannel = kind == ChatKind.channel;
     isGroup = kind == ChatKind.group || kind == ChatKind.channel;
+    canClearHistory = chatDeleteCapabilities(chat).canDeleteForSelf;
     canChangeAutoDelete = !isGroup;
     isMuted = ScopeNotificationSettings.shared.isMuted(chat);
     autoDeleteTime =
@@ -2434,12 +2495,16 @@ class ChatInfoViewModel extends ChangeNotifier {
   }
 
   Future<void> clearHistory() async {
-    await TdClient.shared.query({
-      '@type': 'deleteChatHistory',
-      'chat_id': chatId,
-      'remove_from_chat_list': false,
-      'revoke': false,
-    });
+    try {
+      await clearChatHistoryForSelf(
+        chatId: chatId,
+        query: TdClient.shared.query,
+      );
+    } on ChatRemovalUnavailable {
+      canClearHistory = false;
+      notifyListeners();
+      rethrow;
+    }
     TdClient.shared.emitLocalUpdate({
       '@type': 'mithkaChatHistoryCleared',
       'chat_id': chatId,
@@ -2447,19 +2512,25 @@ class ChatInfoViewModel extends ChangeNotifier {
   }
 
   Future<void> leaveChat() async {
-    await TdClient.shared.query({'@type': 'leaveChat', 'chat_id': chatId});
-    await TdClient.shared.query(
-      deleteChatHistoryRequest(chatId: chatId, scope: ChatDeleteScope.self),
+    await leaveChatAndRemoveFromList(
+      chatId: chatId,
+      query: TdClient.shared.query,
+      onLeft: () {
+        isMember = false;
+        canClearHistory = false;
+        notifyListeners();
+        TdClient.shared.emitLocalUpdate(chatLeftLocalUpdate(chatId));
+      },
     );
-    isMember = false;
-    notifyListeners();
-    TdClient.shared.emitLocalUpdate({
-      '@type': 'mithkaChatLeft',
-      'chat_id': chatId,
-    });
   }
 
   String actionErrorNotice(Object error) {
+    if (error is ChatRemovalUnavailable) {
+      return AppStrings.t(AppStringKeys.chatDeleteUnavailable);
+    }
+    if (error is ChatLeaveHistoryCleanupFailed) {
+      return AppStrings.t(AppStringKeys.chatLeaveHistoryCleanupFailed);
+    }
     final message = error is TdError ? error.message : error.toString();
     final text = message.trim();
     return text.isEmpty

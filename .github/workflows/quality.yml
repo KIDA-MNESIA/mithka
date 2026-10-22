@@ -1,0 +1,100 @@
+name: Quality
+
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  # Reusable calls share the caller's github context. Keep simultaneous
+  # release, Play, TestFlight, and nightly gates from cancelling each other.
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  merge-identity:
+    # The workflow engine, not PR code or an uploaded artifact, supplies this
+    # immutable job name. PR Review verifies it through the Actions jobs API.
+    name: Merge snapshot ${{ github.sha }} base ${{ github.event.pull_request.base.sha }} head ${{ github.event.pull_request.head.sha }}
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - run: 'true'
+
+  flutter:
+    name: Analyze and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify the event's exact merge snapshot before executing PR code
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_MERGE: ${{ github.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          [[ "$EXPECTED_MERGE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EXPECTED_HEAD" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EXPECTED_BASE" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_MERGE"
+          test "$(git rev-parse HEAD^1)" = "$EXPECTED_BASE"
+          test "$(git rev-parse HEAD^2)" = "$EXPECTED_HEAD"
+
+      - name: Test the trusted PR review controller
+        # This ordinary read-only workflow is the only PR-code execution path.
+        run: node --test .github/scripts/pr-review.test.mjs
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+          cache: true
+
+      - name: Configure credential-free test build
+        run: cp lib/config/secrets_example.dart lib/config/secrets.dart
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Verify generated localization catalogues
+        run: |
+          python3 translations/tools/check.py
+          python3 translations/tools/gen_assets.py --check
+          python3 tool/check_l10n_strings.py
+
+      - name: Verify the registration anchors match their pinned dataset
+        run: python3 tool/gen_registration_anchors.py --check
+
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed lib test integration_test test_driver
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Run unit and widget tests
+        run: flutter test --concurrency=4
+
+      - name: Verify guarded self-build features against every define state
+        run: |
+          flutter test test/message_history_gate_test.dart test/ghost_mode_default_test.dart test/ghost_mode_story_viewer_default_test.dart test/guarded_feature_entry_points_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=false
+          flutter test test/message_history_gate_test.dart test/message_history_store_test.dart test/message_history_view_test.dart test/ghost_mode_enabled_test.dart test/ghost_mode_settings_enabled_test.dart test/ghost_mode_story_viewer_enabled_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=true --dart-define=EXPECT_TOS_VIOLATIONS=true
+          flutter test test/message_history_gate_test.dart test/ghost_mode_default_test.dart test/ghost_mode_story_viewer_default_test.dart test/guarded_feature_entry_points_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=invalid
+
+      - name: Verify Telegram API Terms compile-time gate
+        run: |
+          flutter test test/build_flags_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=false
+          flutter test test/build_flags_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=true --dart-define=EXPECT_TOS_VIOLATIONS=true
+          flutter test test/build_flags_test.dart --dart-define=I_DONT_FUCKING_CARE_ABOUT_TOS=invalid

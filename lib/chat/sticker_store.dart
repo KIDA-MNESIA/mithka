@@ -41,6 +41,15 @@ class StickerStore extends ChangeNotifier {
   bool loading = false;
   bool _loaded = false;
 
+  /// The tab the panel opens on: the first installed set in the order TDLib
+  /// returned, falling back to recents when no set is installed.
+  int get defaultPackId {
+    for (final pack in packs) {
+      if (pack.id != recentPackId) return pack.id;
+    }
+    return recentPackId;
+  }
+
   @visibleForTesting
   void replacePacksForTest(List<StickerPack> value) {
     packs = List<StickerPack>.from(value);
@@ -54,6 +63,14 @@ class StickerStore extends ChangeNotifier {
     loading = false;
     _loaded = false;
     notifyListeners();
+  }
+
+  /// Reloads after the installed sets changed elsewhere; a store nobody has
+  /// opened yet stays lazy.
+  void invalidate() {
+    if (!_loaded) return;
+    _loaded = false;
+    loadIfNeeded();
   }
 
   void loadIfNeeded() {
@@ -112,8 +129,12 @@ class StickerStore extends ChangeNotifier {
     loading = false;
     notifyListeners();
 
-    if (packs.isNotEmpty && !packs.first.loaded) {
-      await loadPack(packs.first.id);
+    final initialPack = packs.firstWhere(
+      (pack) => pack.id != recentPackId,
+      orElse: () => packs.first,
+    );
+    if (!initialPack.loaded) {
+      await loadPack(initialPack.id);
     }
   }
 

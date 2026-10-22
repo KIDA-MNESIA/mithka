@@ -13,7 +13,9 @@ import 'package:flutter/material.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:provider/provider.dart';
 
+import '../app/ipad_window_chrome.dart';
 import '../app/primary_chat_launcher.dart';
+import '../chat/telegram_link.dart';
 import '../components/app_icons.dart';
 import '../components/icon_grid.dart';
 import '../components/photo_avatar.dart';
@@ -95,6 +97,9 @@ class _AddPeopleViewState extends State<AddPeopleView> {
     if (mounted) setState(() => _loading = false);
   }
 
+  bool _peopleSearchIsCurrent(String q) =>
+      mounted && _mode == 0 && q == _query.trim();
+
   Future<void> _searchPeople(String q) async {
     final byId = <int, Contact>{};
     try {
@@ -103,20 +108,24 @@ class _AddPeopleViewState extends State<AddPeopleView> {
         'query': q,
         'limit': 30,
       });
+      if (!_peopleSearchIsCurrent(q)) return;
       for (final id in res.int64Array('user_ids') ?? const <int>[]) {
         final c = await _contact(id);
+        if (!_peopleSearchIsCurrent(q)) return;
         if (c != null) byId[id] = c;
       }
     } catch (_) {}
+    if (!_peopleSearchIsCurrent(q)) return;
     // searchContacts only covers saved contacts; if the input is an exact public
     // username (or t.me link), resolve it so any user shows up as a candidate.
-    final handle = _usernameOf(q);
+    final handle = telegramUsernameFromQuery(q);
     if (handle != null) {
       try {
         final chat = await _client.query({
           '@type': 'searchPublicChat',
           'username': handle,
         });
+        if (!_peopleSearchIsCurrent(q)) return;
         final uid = chat.obj('type')?.int64('user_id');
         if (uid != null && !byId.containsKey(uid)) {
           final c = await _contact(uid);
@@ -124,7 +133,13 @@ class _AddPeopleViewState extends State<AddPeopleView> {
         }
       } catch (_) {}
     }
-    if (q != _query.trim() || _mode != 0) return;
+    if (!_peopleSearchIsCurrent(q)) return;
+    final lookupUserId = telegramUserIdFromQuery(q);
+    if (lookupUserId != null && !byId.containsKey(lookupUserId)) {
+      final c = await _contact(lookupUserId);
+      if (c != null) byId[lookupUserId] = c;
+    }
+    if (!_peopleSearchIsCurrent(q)) return;
     _people = byId.values.toList();
   }
 
@@ -156,7 +171,7 @@ class _AddPeopleViewState extends State<AddPeopleView> {
     } catch (_) {}
     // searchPublicChats won't always surface an exact, lesser-known channel; if
     // the input is a valid public username/link, resolve it directly.
-    final handle = _usernameOf(q);
+    final handle = telegramUsernameFromQuery(q);
     if (handle != null) {
       try {
         final chat = await _client.query({
@@ -186,28 +201,21 @@ class _AddPeopleViewState extends State<AddPeopleView> {
     _groups = hits;
   }
 
-  /// Extracts a Telegram public username from raw input — bare handle, `@handle`,
-  /// or a t.me / telegram.me link — or null if it isn't a valid username shape.
-  String? _usernameOf(String q) {
-    var s = q.trim();
-    final link = RegExp(
-      r'(?:https?://)?(?:t\.me|telegram\.me)/(@?[A-Za-z0-9_]+)',
-      caseSensitive: false,
-    ).firstMatch(s);
-    if (link != null) s = link.group(1)!;
-    if (s.startsWith('@')) s = s.substring(1);
-    return RegExp(r'^[A-Za-z0-9_]{3,32}$').hasMatch(s) ? s : null;
-  }
-
   Future<Contact?> _contact(int id) async {
     try {
       final user = await _client.query({'@type': 'getUser', 'user_id': id});
+      if (user.obj('type')?.type == 'userTypeDeleted') return null;
+      final usernames = TDParse.activeUsernames(user);
       return Contact(
         id: id,
         name: TDParse.userName(user),
-        username: user.obj('usernames')?.str('editable_username'),
+        username:
+            user.obj('usernames')?.str('editable_username') ??
+            usernames.firstOrNull,
+        usernames: usernames,
         statusText: TDParse.userStatus(user),
         photo: TDParse.smallPhoto(user.obj('profile_photo')),
+        isOnline: TDParse.isUserOnline(user),
       );
     } catch (_) {
       return null;
@@ -279,7 +287,7 @@ class _AddPeopleViewState extends State<AddPeopleView> {
   Widget _header() {
     final c = context.colors;
     return Container(
-      padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
+      padding: EdgeInsets.only(top: topChromeInsetOf(context)),
       decoration: BoxDecoration(
         color: c.navBar,
         border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),

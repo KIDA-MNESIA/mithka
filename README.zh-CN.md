@@ -1,11 +1,18 @@
 # Mithka
 
+![Mithka — 独立开发的 Telegram 客户端](docs/images/mithka-github-banner.png)
+
 [English](README.md) | 简体中文
 
 Mithka 是一款独立开发的 Telegram 跨平台客户端，支持 Android、iOS、Windows、
 macOS 和 Linux。它以 Flutter 构建界面，通过 Dart FFI 接入
 [TDLib](https://core.telegram.org/tdlib)，在手机和桌面设备上提供紧凑且贴近原生体验的
 即时通信界面。
+
+![Mithka 桌面、iPad 和 iPhone Duo 布局示意图](docs/images/mithka-github-devices.png)
+
+*以上为基于 Mithka 布局制作的示意图，聊天内容为虚构，并非真实设备截图；
+iPhone Duo 展示的是布局预览。*
 
 > [!IMPORTANT]
 > Mithka 是独立开发的非官方项目，与 Telegram 不存在任何隶属、认可或其他关联。
@@ -27,6 +34,20 @@ macOS 和 Linux。它以 Flutter 构建界面，通过 Dart FFI 接入
 | Windows | [GitHub 预发布版](https://github.com/iebb/mithka/releases?q=prerelease%3Atrue) | [最新 GitHub 正式版](https://github.com/iebb/mithka/releases/latest) |
 | macOS | [GitHub 预发布版](https://github.com/iebb/mithka/releases?q=prerelease%3Atrue) | [最新 GitHub 正式版](https://github.com/iebb/mithka/releases/latest) |
 | Linux | [GitHub 预发布版](https://github.com/iebb/mithka/releases?q=prerelease%3Atrue) | [最新 GitHub 正式版](https://github.com/iebb/mithka/releases/latest) |
+
+Windows 版本同时提供各架构的 `setup.exe` 安装程序与便携 ZIP。安装程序按当前
+用户安装，无需管理员权限，会创建开始菜单快捷方式、可选的桌面快捷方式，并在
+“已安装的应用”中注册 Mithka。
+
+Linux 版本同时提供 x64 和 arm64 AppImage 与便携 tar 包。为 AppImage 添加执行权限
+（`chmod +x Mithka.AppImage`），然后从当前用户可写的目录运行。CI 会在 Ubuntu 24.04
+上验证每个 AppImage 能否启动；不保证支持更早的发行版。
+
+Windows 和 Linux 包支持应用内更新：前往**设置 → 关于 → 检查更新**，应用会下载
+对应架构的发布包，使用 GitHub 发布的 SHA-256 校验值验证文件，并在重新启动前原子
+替换安装目录。AppImage 更新会替换原文件并保留文件名。更新检查使用 GitHub 最新正式版，
+每夜构建也使用此更新源。由包管理器、Flatpak 或 Snap 管理的安装不会被应用直接
+替换，而会跳转到发布页面。
 
 ## 为什么叫“Mithka”？
 

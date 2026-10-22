@@ -20,16 +20,23 @@ import 'package:mithka/l10n/app_localizations.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
 
+import '../app/ipad_window_chrome.dart';
 import '../app/primary_chat_launcher.dart';
 import '../chat/chat_picker_view.dart';
 import '../chat/custom_emoji.dart';
+import '../chat/link_handler.dart';
 import '../components/app_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
+import '../media/video_playback_reporting.dart';
+import '../media/video_view_compatibility.dart';
 import '../platform/adaptive_platform.dart';
+import '../platform/keyboard_modifiers.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_image_loader.dart';
@@ -57,7 +64,9 @@ bool storyViewerUsesDesktopControls(
 StoryViewerDesktopCommand? storyViewerDesktopCommandForKey(
   LogicalKeyboardKey key, {
   required bool replyHasFocus,
+  bool hasModifiers = false,
 }) {
+  if (hasModifiers) return null;
   if (key == LogicalKeyboardKey.escape) {
     return StoryViewerDesktopCommand.close;
   }
@@ -268,12 +277,17 @@ class _StoryViewerViewState extends State<StoryViewerView>
       _volumePanelVisible = false;
     });
 
-    // Mark the story as viewed (best-effort).
-    TdClient.shared.send({
-      '@type': 'openStory',
-      'story_poster_chat_id': widget.chatId,
-      'story_id': sid,
-    });
+    // Mark the story as viewed (best-effort). Ghost mode skips the report;
+    // the local seen markers then stay unupdated, the same trade-off
+    // AyuGram accepts.
+    if (!(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockStories(widget.chatId).isBlock)) {
+      TdClient.shared.send({
+        '@type': 'openStory',
+        'story_poster_chat_id': widget.chatId,
+        'story_id': sid,
+      });
+    }
 
     try {
       final story = await TdClient.shared
@@ -385,9 +399,17 @@ class _StoryViewerViewState extends State<StoryViewerView>
       }
       return;
     }
-    final c = VideoPlayerController.file(File(path));
+    final c = VideoPlayerController.file(
+      File(path),
+      viewType: preferredCompatibleVideoViewType,
+    );
+    final diagnostics = VideoPlaybackDiagnostics(
+      location: VideoPlaybackLocation.story,
+      mimeType: m.videoFile?.mimeType,
+    )..beginAttempt(source: VideoPlaybackSource.file, viewType: c.viewType);
     try {
       await c.initialize();
+      diagnostics.initialized(value: c.value);
       await c.setLooping(false);
       try {
         await c.setVolume(_videoVolume);
@@ -396,7 +418,14 @@ class _StoryViewerViewState extends State<StoryViewerView>
         // backend that cannot change gain must not make the story unplayable.
       }
       if (!_holding && !_replyFocus.hasFocus) await c.play();
-    } catch (_) {
+    } catch (error) {
+      if (mounted && _current == m) {
+        diagnostics.recordFailure(
+          error,
+          stage: VideoFailureStage.initialization,
+        );
+        diagnostics.reportTerminal();
+      }
       await c.dispose();
       _videoStarting = false;
       if (mounted && _current == m) {
@@ -410,6 +439,19 @@ class _StoryViewerViewState extends State<StoryViewerView>
       _videoStarting = false;
       return;
     }
+    c.addListener(() {
+      if (!mounted ||
+          _current != m ||
+          !identical(_videoController, c) ||
+          !c.value.hasError) {
+        return;
+      }
+      diagnostics.recordFailure(
+        c.value.errorDescription,
+        stage: VideoFailureStage.playback,
+      );
+      diagnostics.reportTerminal();
+    });
     setState(() {
       _videoController = c;
       _videoStarting = false;
@@ -517,6 +559,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
     final command = storyViewerDesktopCommandForKey(
       event.logicalKey,
       replyHasFocus: _replyFocus.hasFocus,
+      hasModifiers: keyboardModifiersPressed(),
     );
     switch (command) {
       case StoryViewerDesktopCommand.close:
@@ -543,7 +586,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
 
   @override
   Widget build(BuildContext context) {
-    final top = MediaQuery.of(context).padding.top;
+    final top = topChromeInsetOf(context);
     final desktop = storyViewerUsesDesktopControls(Theme.of(context).platform);
     final viewer = Scaffold(
       backgroundColor: Colors.black,
@@ -702,7 +745,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
                 ),
               SizedBox(
                 height:
-                    MediaQuery.of(context).padding.bottom +
+                    MediaQuery.paddingOf(context).bottom +
                     (_current?.canBeReplied ?? false ? 68 : 58),
               ),
             ],
@@ -756,7 +799,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
             Positioned(
               left: 18,
               top: top + 96,
-              bottom: MediaQuery.of(context).padding.bottom + 72,
+              bottom: MediaQuery.paddingOf(context).bottom + 72,
               child: Center(
                 child: _desktopNavigationButton(
                   key: const ValueKey('storyDesktopPrevious'),
@@ -769,7 +812,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
             Positioned(
               right: 18,
               top: top + 96,
-              bottom: MediaQuery.of(context).padding.bottom + 72,
+              bottom: MediaQuery.paddingOf(context).bottom + 72,
               child: Center(
                 child: _desktopNavigationButton(
                   key: const ValueKey('storyDesktopNext'),
@@ -783,7 +826,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
           if (_current?.areas.isNotEmpty ?? false)
             Positioned.fill(
               top: top + 96,
-              bottom: MediaQuery.of(context).padding.bottom + 88,
+              bottom: MediaQuery.paddingOf(context).bottom + 88,
               child: _storyAreas(),
             ),
           if ((_current?.isVideo ?? false) && _volumePanelVisible)
@@ -792,7 +835,7 @@ class _StoryViewerViewState extends State<StoryViewerView>
             Positioned(
               left: 12,
               right: 12,
-              bottom: MediaQuery.of(context).padding.bottom + 8,
+              bottom: MediaQuery.paddingOf(context).bottom + 8,
               child: _actionBar(),
             ),
         ],
@@ -1082,9 +1125,9 @@ class _StoryViewerViewState extends State<StoryViewerView>
           );
         }
       case 'storyAreaTypeLink':
-        final uri = Uri.tryParse(type.str('url') ?? '');
-        if (uri != null) {
-          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        final url = type.str('url')?.trim() ?? '';
+        if (url.isNotEmpty && mounted) {
+          await openLink(context, url);
         }
       case 'storyAreaTypeLocation':
         await _openMap(type.obj('location'));

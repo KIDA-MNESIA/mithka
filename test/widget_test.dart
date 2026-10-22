@@ -29,6 +29,7 @@ import 'package:mithka/chat/sticker_item.dart';
 import 'package:mithka/chat/sticker_store.dart';
 import 'package:mithka/chat/telegram_ai_service.dart';
 import 'package:mithka/components/app_icons.dart';
+import 'package:mithka/components/app_interactive_surface.dart';
 import 'package:mithka/components/keyboard_dismiss_on_tap.dart';
 import 'package:mithka/components/photo_avatar.dart';
 import 'package:mithka/components/ui_components.dart';
@@ -1472,11 +1473,11 @@ void main() {
         );
         expect(
           tester
-              .widget<GestureDetector>(
+              .widget<AppInteractiveSurface>(
                 find.byKey(const ValueKey('composerSendButton')),
               )
-              .onTap,
-          isNull,
+              .enabled,
+          isFalse,
         );
 
         await tester.pumpAndSettle();
@@ -1494,11 +1495,11 @@ void main() {
         );
         expect(
           tester
-              .widget<GestureDetector>(
+              .widget<AppInteractiveSurface>(
                 find.byKey(const ValueKey('composerSendButton')),
               )
-              .onTap,
-          isNotNull,
+              .enabled,
+          isTrue,
         );
       },
     );
@@ -2604,80 +2605,117 @@ void main() {
       });
     });
 
-    testWidgets('uses top tabs and dedicated search for stickers and emoji', (
-      tester,
-    ) async {
-      final vm = ChatViewModel(
-        chatId: 1,
-        title: 'Test chat',
-        markReadOnOpen: false,
-      );
-      addTearDown(vm.dispose);
-      var panelGeometryChanges = 0;
+    testWidgets(
+      'the unified media panel hosts sticker and emoji tabs plus search',
+      (tester) async {
+        final vm = ChatViewModel(
+          chatId: 1,
+          title: 'Test chat',
+          markReadOnOpen: false,
+        );
+        addTearDown(vm.dispose);
+        var panelGeometryChanges = 0;
 
-      await tester.pumpWidget(
-        MaterialApp(
-          locale: const Locale('en'),
-          localizationsDelegates: const [
-            GlobalMaterialLocalizations.delegate,
-            GlobalWidgetsLocalizations.delegate,
-            GlobalCupertinoLocalizations.delegate,
-          ],
-          supportedLocales: AppLocalizations.supportedLocales,
-          home: Scaffold(
-            body: Align(
-              alignment: Alignment.bottomCenter,
-              child: ChatInputBar(
-                vm: vm,
-                onStartCall: (_) {},
-                onMessageSent: () {},
-                onPanelGeometryChanged: () => panelGeometryChanges++,
+        await tester.pumpWidget(
+          MaterialApp(
+            locale: const Locale('en'),
+            localizationsDelegates: const [
+              GlobalMaterialLocalizations.delegate,
+              GlobalWidgetsLocalizations.delegate,
+              GlobalCupertinoLocalizations.delegate,
+            ],
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: Align(
+                alignment: Alignment.bottomCenter,
+                child: ChatInputBar(
+                  vm: vm,
+                  onStartCall: (_) {},
+                  onMessageSent: () {},
+                  onPanelGeometryChanged: () => panelGeometryChanges++,
+                ),
               ),
             ),
           ),
-        ),
-      );
+        );
 
-      await tester.tap(find.byIcon(HeroAppIcons.grip.data));
-      await tester.pump();
+        // One unified media button replaces the former emoji + sticker pair.
+        expect(find.byIcon(HeroAppIcons.solidFaceSmile.data), findsOneWidget);
+        expect(find.byIcon(HeroAppIcons.grip.data), findsNothing);
 
-      final stickerTabs = find.byKey(const ValueKey('stickerPanelTabs'));
-      final search = find.byKey(const ValueKey('composerMediaSearch'));
-      expect(stickerTabs, findsOneWidget);
-      expect(search, findsNothing);
-      expect(panelGeometryChanges, 1);
-      expect(find.byIcon(HeroAppIcons.palette.data), findsNothing);
+        await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data));
+        await tester.pump();
 
-      await tester.tap(find.byKey(const ValueKey('stickerSearchTab')));
-      await tester.pump();
+        final segments = find.byKey(const ValueKey('mediaKindSegments'));
+        final emojiTabs = find.byKey(const ValueKey('emojiPanelTabs'));
+        final search = find.byKey(const ValueKey('composerMediaSearch'));
+        expect(segments, findsOneWidget);
+        expect(emojiTabs, findsOneWidget);
+        expect(search, findsNothing);
+        expect(panelGeometryChanges, 1);
+        expect(find.byIcon(HeroAppIcons.palette.data), findsNothing);
 
-      expect(search, findsOneWidget);
-      expect(
-        tester.getTopLeft(stickerTabs).dy,
-        lessThan(tester.getTopLeft(search).dy),
-      );
+        // The emoji segment's search tab surfaces the shared search field.
+        await tester.tap(find.byKey(const ValueKey('emojiSearchTab')));
+        await tester.pump();
+        expect(search, findsOneWidget);
+        expect(
+          tester.getTopLeft(emojiTabs).dy,
+          lessThan(tester.getTopLeft(search).dy),
+        );
 
-      await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data).first);
-      await tester.pump();
+        // Switching to the sticker segment swaps the secondary strip.
+        await tester.tap(find.byKey(const ValueKey('mediaSegment-sticker')));
+        await tester.pump();
+        final stickerTabs = find.byKey(const ValueKey('stickerPanelTabs'));
+        expect(stickerTabs, findsOneWidget);
+        expect(emojiTabs, findsNothing);
+        expect(search, findsNothing);
 
-      final emojiTabs = find.byKey(const ValueKey('emojiPanelTabs'));
-      expect(emojiTabs, findsOneWidget);
-      expect(search, findsNothing);
-      expect(panelGeometryChanges, 2);
+        await tester.tap(find.byKey(const ValueKey('stickerSearchTab')));
+        await tester.pump();
+        expect(search, findsOneWidget);
+        expect(
+          tester.getTopLeft(stickerTabs).dy,
+          lessThan(tester.getTopLeft(search).dy),
+        );
 
-      await tester.tap(find.byKey(const ValueKey('emojiSearchTab')));
-      await tester.pump();
+        // The GIF segment has its own saved-GIFs strip and search. The
+        // sticker and GIF regions share one search selection, so the field
+        // that was showing for sticker search stays up here.
+        await tester.tap(find.byKey(const ValueKey('mediaSegment-gif')));
+        await tester.pump();
+        final gifTabs = find.byKey(const ValueKey('gifPanelTabs'));
+        expect(gifTabs, findsOneWidget);
+        expect(stickerTabs, findsNothing);
+        expect(search, findsOneWidget);
+        expect(
+          tester.getTopLeft(gifTabs).dy,
+          lessThan(tester.getTopLeft(search).dy),
+        );
 
-      expect(search, findsOneWidget);
-      expect(
-        tester.getTopLeft(emojiTabs).dy,
-        lessThan(tester.getTopLeft(search).dy),
-      );
+        // Picking the saved-GIFs tab hides the shared search field again.
+        await tester.tap(find.byKey(const ValueKey('gifSavedTab')));
+        await tester.pump();
+        expect(search, findsNothing);
 
-      await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data).first);
-      await tester.pump();
-      expect(panelGeometryChanges, 3);
-    });
+        await tester.tap(find.byKey(const ValueKey('gifSearchTab')));
+        await tester.pump();
+        expect(search, findsOneWidget);
+        expect(
+          tester.getTopLeft(gifTabs).dy,
+          lessThan(tester.getTopLeft(search).dy),
+        );
+
+        // Tapping the media button closes the panel again. The open panel's
+        // emoji segment carries the same smiley glyph, so take the toolbar
+        // icon (built first in the column).
+        await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data).first);
+        await tester.pump();
+        expect(segments, findsNothing);
+        expect(panelGeometryChanges, 2);
+      },
+    );
 
     testWidgets('media taps request bottom scroll before send completion', (
       tester,
@@ -2745,7 +2783,9 @@ void main() {
         ),
       );
 
-      await tester.tap(find.byIcon(HeroAppIcons.grip.data));
+      await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data));
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('mediaSegment-sticker')));
       await tester.pump();
       expect(find.byKey(const ValueKey('sticker-100')), findsOneWidget);
 
@@ -2762,9 +2802,9 @@ void main() {
       expect(messageSentCallbacks, 1);
       expect(everySentCallbackSawClosedPanel, isTrue);
 
-      await tester.tap(find.byIcon(HeroAppIcons.grip.data));
+      await tester.tap(find.byIcon(HeroAppIcons.solidFaceSmile.data));
       await tester.pump();
-      await tester.tap(find.byIcon(HeroAppIcons.gif.data));
+      await tester.tap(find.byKey(const ValueKey('mediaSegment-gif')));
       await tester.pump();
       expect(find.byKey(const ValueKey('gif-200')), findsOneWidget);
 
@@ -2773,7 +2813,7 @@ void main() {
 
       expect(mediaSendTaps, 2);
       expect(messageSentCallbacks, 1);
-      expect(find.byKey(const ValueKey('stickerPanelTabs')), findsOneWidget);
+      expect(find.byKey(const ValueKey('gifPanelTabs')), findsOneWidget);
 
       vm.gifSend.complete(true);
       await tester.pump();
@@ -2835,9 +2875,16 @@ void main() {
         tester.widget<ColoredBox>(safeAreaBackground).color,
         colors.inputBarBackground,
       );
+      // The panel extends the bar's surface through the home indicator; the
+      // recessed panelBackground (still distinct in this palette) must not
+      // reappear below the panel.
       expect(
         tester.widget<ColoredBox>(panelSafeAreaBackground).color,
-        colors.panelBackground,
+        colors.inputBarBackground,
+      );
+      expect(
+        tester.widget<ColoredBox>(panelSafeAreaBackground).color,
+        isNot(colors.panelBackground),
       );
     });
 
@@ -3884,7 +3931,7 @@ void main() {
   });
 
   group('MessageBubble reply quote', () {
-    testWidgets('only the up arrow opens the original and media is inline', (
+    testWidgets('the full quote opens the original and media is inline', (
       tester,
     ) async {
       SharedPreferences.setMockInitialValues({});
@@ -3931,11 +3978,21 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('[图片]'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('messageReplyNavigateUpIcon')),
+        findsOneWidget,
+      );
+      expect(find.byType(AppArrowUpToLineIcon), findsOneWidget);
 
       await tester.tap(find.byKey(const ValueKey('messageReplyQuote')));
-      expect(openedMessageId, isNull);
+      expect(openedMessageId, 9);
 
-      await tester.tap(find.byKey(const ValueKey('messageReplyOpenOriginal')));
+      openedMessageId = null;
+      await tester.tapAt(
+        tester.getCenter(
+          find.byKey(const ValueKey('messageReplyMediaPreview')),
+        ),
+      );
       expect(openedMessageId, 9);
 
       // Expire the mocked TDLib download timeout before test teardown.

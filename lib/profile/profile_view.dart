@@ -15,12 +15,14 @@ import 'package:flutter/material.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:provider/provider.dart';
 
+import '../app/ipad_window_chrome.dart';
 import '../app/primary_chat_launcher.dart';
 import '../auth/account_store.dart';
 import '../auth/auth_manager.dart';
 import '../call/calls_view.dart';
 import '../chat/chat_wallpaper.dart';
 import '../chat/custom_emoji.dart';
+import '../chat/link_handler.dart';
 import '../chat/shared_media_view.dart';
 import '../components/app_icons.dart';
 import '../components/confirm_dialog.dart';
@@ -31,14 +33,18 @@ import '../components/ui_components.dart';
 import '../components/vip_badge.dart';
 import '../platform/adaptive_platform.dart';
 import '../settings/edit_profile_view.dart';
+import '../settings/proxy_status.dart';
+import '../settings/proxy_view.dart';
 import '../settings/settings_view.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
+import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
 import '../theme/theme_controller.dart';
 import 'emoji_status_picker.dart';
 import 'profile_detail_view.dart';
+import 'profile_proxy_button.dart';
 import 'profile_theme_backdrop.dart';
 import 'profile_username_pill.dart';
 import 'profile_username_summary.dart';
@@ -277,7 +283,7 @@ class _ProfileViewState extends State<ProfileView> {
         Padding(
           padding: EdgeInsets.fromLTRB(
             20,
-            MediaQuery.of(context).padding.top + 8,
+            topChromeInsetOf(context) + 8,
             16,
             20,
           ),
@@ -379,7 +385,15 @@ class _ProfileViewState extends State<ProfileView> {
                             children: [
                               for (final identity in identities)
                                 identity.startsWith('@')
-                                    ? ProfileUsernamePill(username: identity)
+                                    ? ProfileUsernamePill(
+                                        username: identity,
+                                        onTap: (username) => unawaited(
+                                          openLink(
+                                            context,
+                                            'https://t.me/$username',
+                                          ),
+                                        ),
+                                      )
                                     : Text(
                                         identity,
                                         style: TextStyle(
@@ -673,8 +687,10 @@ class _ProfileViewState extends State<ProfileView> {
     final c = context.colors;
     final avatarCacheSize = (36 * MediaQuery.devicePixelRatioOf(context))
         .ceil();
-    return SizedBox(
-      height: 56,
+    return ConstrainedBox(
+      // A minimum rather than a fixed height: the two stacked lines grow with
+      // the text scale and would otherwise clip out of the row.
+      constraints: const BoxConstraints(minHeight: 56),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(
@@ -695,6 +711,7 @@ class _ProfileViewState extends State<ProfileView> {
             const SizedBox(width: 12),
             Expanded(
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 mainAxisAlignment: MainAxisAlignment.center,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -725,14 +742,9 @@ class _ProfileViewState extends State<ProfileView> {
   Widget _bottomBar() {
     final c = context.colors;
     final theme = context.watch<ThemeController>();
-    // Derive from the EFFECTIVE brightness, not just the stored mode: when mode
-    // is `system` the rendered brightness comes from the OS, so a plain
-    // `mode==dark` check would mislabel the button and the toggle could resolve
-    // to the same brightness (a visible no-op after the first tap).
-    final isDark =
-        theme.mode == AppearanceMode.dark ||
-        (theme.mode == AppearanceMode.system &&
-            MediaQuery.platformBrightnessOf(context) == Brightness.dark);
+    // The OS value can already have changed while the rendered theme is still
+    // transitioning. Label the action relative to what is actually on screen.
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
       decoration: BoxDecoration(
         color: c.navBar,
@@ -756,13 +768,11 @@ class _ProfileViewState extends State<ProfileView> {
                 ),
               ),
               const SizedBox(width: 24),
+              ProfileProxyButton(onTap: _openProxySettings),
+              const SizedBox(width: 24),
               GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                // Flip between EXPLICIT light/dark every tap (never `system`,
-                // which could equal the current brightness and do nothing).
-                onTap: () => theme.mode = isDark
-                    ? AppearanceMode.light
-                    : AppearanceMode.dark,
+                onTap: () => theme.toggleDayNight(Theme.of(context).brightness),
                 child: _barItem(
                   isDark ? HeroAppIcons.sun : HeroAppIcons.moon,
                   isDark
@@ -776,6 +786,17 @@ class _ProfileViewState extends State<ProfileView> {
         ),
       ),
     );
+  }
+
+  /// 代理 straight from the sidebar instead of through 设置. The page reports its
+  /// own mutations to [ProxyStatusController]; the reading is refreshed on the
+  /// way back too, since a visit that changed nothing still spans time TDLib
+  /// may have reconnected in.
+  Future<void> _openProxySettings() async {
+    await _root.push(
+      AppPageRoute<void>(pageBuilder: (_, _, _) => const ProxyView()),
+    );
+    unawaited(ProxyStatusController.shared.refresh());
   }
 
   Widget _barItem(AppIconData icon, String tooltip) {
@@ -816,6 +837,12 @@ class _AccountActionRowState extends State<AccountActionRow> {
   static const double _actionsWidth = _actionWidth * 2;
   double _offset = 0;
 
+  // The swipe actions sit behind the row, so the row has to be a bounded box
+  // rather than one that sizes to its content. Grow it with the name and
+  // phone lines it holds instead.
+  double _rowExtent(BuildContext context) =>
+      AppMetric.rowExtentFor(context, base: 56, lines: const [15, 12]);
+
   void _close() {
     if (_offset == 0) return;
     setState(() => _offset = 0);
@@ -847,7 +874,7 @@ class _AccountActionRowState extends State<AccountActionRow> {
         ),
       ];
       return SizedBox(
-        height: 56,
+        height: _rowExtent(context),
         child: DesktopRowActionRegion(
           actions: actions,
           child: GestureDetector(
@@ -878,7 +905,7 @@ class _AccountActionRowState extends State<AccountActionRow> {
       );
     }
     return SizedBox(
-      height: 56,
+      height: _rowExtent(context),
       child: Stack(
         children: [
           Positioned.fill(

@@ -12,14 +12,18 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app/app_navigator.dart';
+import '../app/chat_pane.dart';
+import '../app/ipad_window_chrome.dart';
 import '../chat/chat_members_view.dart';
 import '../chat/chat_picker_view.dart';
 import '../chat/chat_view.dart';
-import '../chat/custom_emoji.dart';
+import '../chat/forum_topic_transcript.dart';
 import '../chat/forward_options.dart';
 import '../chat/group_remark_controller.dart';
+import '../chat/link_preview_fixer.dart';
 import '../chat/message_replies_sheet.dart';
 import '../chat/outgoing_attachment.dart';
+import '../chat/pangu_spacing.dart';
 import '../chat/rich_text_composer_view.dart';
 import '../chat/rich_text_format.dart';
 import '../components/app_icons.dart';
@@ -27,9 +31,11 @@ import '../components/confirm_dialog.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../config/build_flags.dart';
 import '../l10n/app_localizations.dart';
 import '../notifications/notification_settings_payload.dart';
-import '../settings/topic_group_display_mode.dart';
+import '../settings/ghost_mode_controller.dart';
+import '../tdlib/forum_topic_index.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -37,7 +43,18 @@ import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
 import '../theme/date_text.dart';
 import '../theme/theme_controller.dart';
+import 'forum_topic_fields.dart';
+import 'topic_list_actions.dart';
+import 'topic_list_host.dart';
+import 'topic_list_row.dart';
+import 'topic_navigation.dart';
 import 'topic_post_content.dart';
+
+export 'topic_list_actions.dart'
+    show
+        ForumTopicReadTarget,
+        forumTopicMarkAllReadRequests,
+        forumTopicViewMessagesRequest;
 
 /// Keeps a forum browser suspended while its topic route is replaced by other
 /// views in the same conversation. Only the newest route can reveal it.
@@ -78,10 +95,10 @@ void _replaceTrackedChatWithTopic(
     () => replaceWithAppChatRoute<void, void>(
       context,
       AppChatPageRoute<void>(
-        builder: (_) => TopicChatView(
-          chat: chat,
-          initialThreadId: threadId,
-          routeSession: routeSession,
+        builder: (_) => ChatView(
+          chatId: chat.id,
+          title: chat.title,
+          forumTopicId: threadId,
         ),
       ),
     ),
@@ -94,6 +111,7 @@ class TopicChatView extends StatefulWidget {
     required this.chat,
     this.initialThreadId,
     this.initialMessageId,
+    this.hasForumTabs = false,
     this.showBackButton = true,
     this.headerHeight = 48,
     this.headerColor,
@@ -107,6 +125,7 @@ class TopicChatView extends StatefulWidget {
   final ChatSummary chat;
   final int? initialThreadId;
   final int? initialMessageId;
+  final bool hasForumTabs;
   final bool showBackButton;
   final double headerHeight;
   final Color? headerColor;
@@ -132,6 +151,10 @@ class _ForumTopic {
     required this.iconCustomEmojiId,
     required this.iconColor,
     required this.lastMessageIsSynthetic,
+    this.hasRealLastMessage = false,
+    this.isGeneral = false,
+    this.isClosed = false,
+    this.creatorId = 0,
   });
 
   final int id;
@@ -143,6 +166,47 @@ class _ForumTopic {
   final int iconCustomEmojiId;
   final Color? iconColor;
   final bool lastMessageIsSynthetic;
+
+  /// True when getForumTopics carried an actual last message (including a
+  /// service one). The chat-list-style preview only renders for real
+  /// messages; the synthetic fallback's text is the topic name itself.
+  final bool hasRealLastMessage;
+
+  /// The General topic: keeps the chat avatar, and its name cannot change.
+  final bool isGeneral;
+  final bool isClosed;
+
+  /// Topic creator's user id, 0 when unknown. The creator may delete their
+  /// own topic even without can_manage_topics (TDLib enforces the rest).
+  final int creatorId;
+
+  _ForumTopic copyWith({
+    String? name,
+    ChatMessage? lastMessage,
+    bool? lastMessageIsSynthetic,
+    bool? hasRealLastMessage,
+    bool? isPinned,
+    bool? isMuted,
+    bool? isClosed,
+    int? unreadCount,
+    int? iconCustomEmojiId,
+    Color? iconColor,
+  }) => _ForumTopic(
+    id: id,
+    name: name ?? this.name,
+    lastMessage: lastMessage ?? this.lastMessage,
+    isPinned: isPinned ?? this.isPinned,
+    isMuted: isMuted ?? this.isMuted,
+    unreadCount: unreadCount ?? this.unreadCount,
+    iconCustomEmojiId: iconCustomEmojiId ?? this.iconCustomEmojiId,
+    iconColor: iconColor ?? this.iconColor,
+    lastMessageIsSynthetic:
+        lastMessageIsSynthetic ?? this.lastMessageIsSynthetic,
+    hasRealLastMessage: hasRealLastMessage ?? this.hasRealLastMessage,
+    isGeneral: isGeneral,
+    isClosed: isClosed ?? this.isClosed,
+    creatorId: creatorId,
+  );
 }
 
 class _TopicPost {
@@ -202,16 +266,12 @@ List<int> takeNewlyVisibleForumTopicMessageIds({
   return visible;
 }
 
-Map<String, dynamic> forumTopicViewMessagesRequest({
-  required int chatId,
-  required List<int> messageIds,
-}) => {
-  '@type': 'viewMessages',
-  'chat_id': chatId,
-  'message_ids': messageIds,
-  'source': {'@type': 'messageSourceForumTopicHistory'},
-  'force_read': true,
-};
+/// Whether the viewport report may leave the app: ghost mode (compile-time
+/// opt-in only) withholds it exactly like the ordinary chat read reports.
+/// Kept as a plain function so both flag variants can pin the decision.
+bool shouldReportForumTopicReads(int chatId) =>
+    !(allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock);
 
 typedef ForumTopicMessageQuery =
     Future<Map<String, dynamic>> Function(Map<String, dynamic> request);
@@ -296,6 +356,23 @@ class _TopicChatViewState extends State<TopicChatView> {
   bool _initialMessagePositionScheduled = false;
   int? _selectedThreadId;
   int? _pendingInitialMessageId;
+  late bool _hasForumTabs = widget.hasForumTabs;
+  final int _accountClientId = TdClient.shared.activeClientId;
+  final int _accountSlot = TdClient.shared.activeSlot;
+  int? _supergroupId;
+  int _topicLayoutRevision = 0;
+  StreamSubscription<Map<String, dynamic>>? _supergroupUpdates;
+  StreamSubscription<Map<String, dynamic>>? _topicUpdates;
+  TopicListHost? _topicListHost;
+  TopicListAttachment? _publishedAttachment;
+  bool _topicListOverlaid = false;
+
+  // Topic moderation rights, probed once per surface. iOS shows create/edit/
+  // delete affordances only while the account actually holds them.
+  int? _meUserId;
+  bool _canCreateTopics = false;
+  bool _canManageTopics = false;
+  bool _canDeleteMessages = false;
 
   @override
   void initState() {
@@ -303,14 +380,338 @@ class _TopicChatViewState extends State<TopicChatView> {
     _selectedThreadId = widget.initialThreadId;
     _pendingInitialMessageId = widget.initialMessageId;
     _scroll.addListener(_scheduleVisibleMessageUpdate);
+    if (widget.chat.isForum) {
+      _supergroupUpdates = TdClient.shared.updatesOf('updateSupergroup').listen(
+        (update) {
+          if (!mounted || TdClient.shared.activeClientId != _accountClientId) {
+            return;
+          }
+          final group = update.obj('supergroup');
+          if (_supergroupId == null || group?.int64('id') != _supergroupId) {
+            return;
+          }
+          ++_topicLayoutRevision;
+          setState(
+            () => _hasForumTabs = group?.boolean('has_forum_tabs') ?? false,
+          );
+          _syncTopicListHost();
+        },
+      );
+      unawaited(_loadTopicLayout());
+      unawaited(_loadTopicModerationRights());
+      _topicUpdates = TdClient.shared
+          .updatesOfAny(const [
+            'updateNewMessage',
+            'updateForumTopic',
+            'updateForumTopicInfo',
+            'updateDeleteMessages',
+          ])
+          .listen(_applyTopicUpdate);
+    }
     _loadTopics();
   }
 
+  /// Reads whether this account may create and manage topics in the forum.
+  ///
+  /// TDLib: creating needs the can_manage_topics administrator right or the
+  /// can_create_topics member right; pinning/editing/closing need
+  /// can_manage_topics; deleting needs can_delete_messages unless the user
+  /// created the topic. A failed probe leaves everything hidden, which is
+  /// the safe direction — the server still enforces the real rule.
+  Future<void> _loadTopicModerationRights() async {
+    try {
+      final chat = await _query({
+        '@type': 'getChat',
+        'chat_id': widget.chat.id,
+      });
+      if (!mounted) return;
+      final canCreate =
+          chat.obj('permissions')?.boolean('can_create_topics') ?? false;
+      int? meId;
+      bool canManage = false;
+      bool canDelete = false;
+      try {
+        final me = await _query({'@type': 'getMe'});
+        meId = me.int64('id');
+        if (meId != null) {
+          final member = await _query({
+            '@type': 'getChatMember',
+            'chat_id': widget.chat.id,
+            'member_id': {'@type': 'messageSenderUser', 'user_id': meId},
+          });
+          final status = member.obj('status');
+          switch (status?.type) {
+            case 'chatMemberStatusCreator':
+              canManage = true;
+              canDelete = true;
+            case 'chatMemberStatusAdministrator':
+              final rights = status?.obj('rights');
+              canManage = rights?.boolean('can_manage_topics') ?? false;
+              canDelete = rights?.boolean('can_delete_messages') ?? false;
+          }
+        }
+      } catch (_) {
+        // Keep the member-right answer; moderation stays hidden.
+      }
+      if (!mounted) return;
+      setState(() {
+        _meUserId = meId;
+        _canCreateTopics = canCreate || canManage;
+        _canManageTopics = canManage;
+        _canDeleteMessages = canDelete;
+      });
+      _syncTopicListHost();
+    } catch (_) {
+      // Offline or unsupported: no destructive affordances.
+    }
+  }
+
+  /// Whether this account may delete [topic]. Deletion needs the
+  /// can_delete_messages administrator right; the creator carve-out applies
+  /// only while the topic holds at most 11 messages and none from another
+  /// user, so it is verified against the topic's live history.
+  bool _canDeleteTopic(_ForumTopic topic) =>
+      !topic.isGeneral &&
+      (_canDeleteMessages ||
+          (_meUserId != null &&
+              topic.creatorId == _meUserId &&
+              (_creatorDeletableTopicIds[topic.id] ?? false)));
+
+  /// Probed creator deletion eligibility per topic; see [_canDeleteTopic].
+  /// Cleared on topic traffic so the next menu open re-probes.
+  final Map<int, bool> _creatorDeletableTopicIds = {};
+
+  Future<bool> _ensureTopicCreatorDeletable(int topicId) async {
+    if (topicId == generalForumTopicId) return false;
+    if (_creatorDeletableTopicIds.containsKey(topicId)) {
+      return _creatorDeletableTopicIds[topicId]!;
+    }
+    bool eligible = false;
+    try {
+      final response = await _queryForumTopicHistory(topicId, 12);
+      final messages = response.objects('messages') ?? const [];
+      eligible =
+          messages.length <= 11 &&
+          messages.every((raw) {
+            if (raw.boolean('is_outgoing') ?? false) return true;
+            final sender = raw.obj('sender_id');
+            return sender?.type == 'messageSenderUser' &&
+                sender?.int64('user_id') == _meUserId;
+          });
+    } catch (_) {
+      eligible = false;
+    }
+    _creatorDeletableTopicIds[topicId] = eligible;
+    return eligible;
+  }
+
+  void _invalidateCreatorDeletionForTopic(int topicId) {
+    if (_creatorDeletableTopicIds.remove(topicId) != null) setState(() {});
+  }
+
+  /// Folds live updates into the topic list so previews, badges, pins and
+  /// renames move without a full getForumTopics round-trip.
+  void _applyTopicUpdate(Map<String, dynamic> update) {
+    if (!mounted || TdClient.shared.activeClientId != _accountClientId) {
+      return;
+    }
+    if (_topics.isEmpty) return;
+    final chatId = widget.chat.id;
+    switch (update.type) {
+      case 'updateNewMessage':
+        final raw = update.obj('message');
+        if (raw?.int64('chat_id') != chatId) return;
+        final message = TDParse.message(raw!);
+        if (message == null) return;
+        final topicRef = raw.obj('topic_id');
+        final topicId = topicRef?.type == 'messageTopicForum'
+            ? topicRef?.integer('forum_topic_id')
+            : 1;
+        if (topicId == null) return;
+        final index = _topics.indexWhere((topic) => topic.id == topicId);
+        if (index < 0) return;
+        final topic = _topics[index];
+        if (topic.hasRealLastMessage &&
+            (message.date < topic.lastMessage.date ||
+                message.id < topic.lastMessage.id)) {
+          return;
+        }
+        _topics[index] = topic.copyWith(
+          lastMessage: message,
+          lastMessageIsSynthetic: message.isService,
+          hasRealLastMessage: true,
+        );
+        // The post feed renders the topic's fallback message while history
+        // is not loaded; keep that fallback in step with the row preview.
+        final loaded = _topicMessages[topicId];
+        if (loaded != null &&
+            loaded.length == 1 &&
+            identical(loaded.first, topic.lastMessage)) {
+          _topicMessages[topicId] = [message];
+        }
+        unawaited(_resolvePreviewSenders([message]));
+        // New traffic can cross the 12-message or other-user boundary of the
+        // creator deletion carve-out.
+        _invalidateCreatorDeletionForTopic(topicId);
+        _rebuildPosts();
+        setState(() {});
+        _syncTopicListHost();
+
+      case 'updateForumTopic':
+        if (update.int64('chat_id') != chatId) return;
+        final topicId = update.integer('forum_topic_id');
+        if (topicId == null) return;
+        final index = _topics.indexWhere((topic) => topic.id == topicId);
+        if (index < 0) return;
+        final settings = update.obj('notification_settings');
+        final current = _topics[index];
+        final lastReadInbox = update.int64('last_read_inbox_message_id');
+        // An authoritative read reaching the newest known message clears the
+        // badge locally, exactly like the shared index does. A partial read
+        // leaves the remaining counter for the next page to confirm.
+        final readEverything =
+            lastReadInbox != null &&
+            current.hasRealLastMessage &&
+            lastReadInbox >= current.lastMessage.id;
+        _topics[index] = current.copyWith(
+          isPinned: update.boolean('is_pinned'),
+          isMuted: settings == null
+              ? null
+              : (settings.integer('mute_for') ?? 0) > 0,
+          unreadCount: readEverything ? 0 : null,
+        );
+        setState(() {});
+        _syncTopicListHost();
+
+      case 'updateForumTopicInfo':
+        // forumTopicInfo carries the topic's name and icon — never its pin:
+        // `is_pinned` lives on the forumTopic/updateForumTopic side only, so
+        // folding a pin from here would read null and lose the state.
+        final info = update.obj('info');
+        if (info?.int64('chat_id') != chatId) return;
+        final topicId = info?.integer('forum_topic_id');
+        final name = info?.str('name');
+        if (topicId == null || name == null || name.isEmpty) return;
+        final index = _topics.indexWhere((topic) => topic.id == topicId);
+        if (index < 0) return;
+        final icon = info?.obj('icon');
+        _topics[index] = _topics[index].copyWith(
+          name: name,
+          isClosed: info?.boolean('is_closed'),
+          iconCustomEmojiId: icon?.int64('custom_emoji_id'),
+          iconColor: icon == null
+              ? null
+              : _iconColorFromRaw(icon.integer('color')),
+        );
+        setState(() {});
+        _syncTopicListHost();
+
+      case 'updateDeleteMessages':
+        if (update.int64('chat_id') != chatId) return;
+        // A deleted last message leaves a stale preview; a refresh is cheap
+        // enough here because deletions in forum lists are rare. The deleted
+        // message's topic is not part of the update, so every probed creator
+        // carve-out is dropped and re-probed on the next menu open.
+        if (_creatorDeletableTopicIds.isNotEmpty) {
+          _creatorDeletableTopicIds.clear();
+          setState(() {});
+        }
+        unawaited(_loadTopics());
+    }
+  }
+
+  Color? _iconColorFromRaw(int? raw) {
+    if (raw == null || raw == 0) return null;
+    return Color(0xFF000000 | (raw & 0xFFFFFF));
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncTopicListHost();
+  }
+
+  /// Wide split shells overlay this view's topic list on the chat list
+  /// column, so the in-pane rail stays out of the conversation there.
+  void _syncTopicListHost() {
+    final host = context.read<TopicListHost?>();
+    final overlaid =
+        host != null &&
+        !_hasForumTabs &&
+        TopicListPlacementScope.of(context) == TopicListPlacement.sidebar;
+    _topicListOverlaid = overlaid;
+    _topicListHost = overlaid ? host : null;
+    final attachment = overlaid ? _topicListAttachment() : null;
+    final previous = _publishedAttachment;
+    if (attachment != null &&
+        previous != null &&
+        previous.sameContent(attachment)) {
+      return;
+    }
+    _publishedAttachment = attachment;
+    // The shell's sidebar listens to the host; publishing mid-build would
+    // mark an already-built ancestor dirty.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (attachment != null) {
+        if (mounted) host?.publish(attachment);
+        return;
+      }
+      if (previous != null) host?.unpublish(previous);
+    });
+  }
+
+  TopicListAttachment _topicListAttachment() => TopicListAttachment(
+    chatId: widget.chat.id,
+    title: widget.chat.title,
+    usesSquareAvatar: widget.chat.usesSquareAvatar,
+    photo: widget.chat.photo,
+    topics: [for (final topic in _topics) _navigationItem(topic)],
+    selectedTopicId: _selectedThreadId,
+    onSelect: _selectTopic,
+    onCreateTopic: _canCreateTopics ? _openCreateTopicDialog : null,
+    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
+    onTopicMenu: _showTopicRowMenu,
+  );
+
+  bool get _hasUnreadTopics => _topics.any((topic) => topic.unreadCount > 0);
+
   Future<Map<String, dynamic>> _query(Map<String, dynamic> request) =>
-      (widget.query ?? TdClient.shared.query)(request);
+      widget.query?.call(request) ??
+      TdClient.shared.queryTo(request, _accountClientId);
+
+  Future<void> _loadTopicLayout() async {
+    try {
+      final chat = await _query({
+        '@type': 'getChat',
+        'chat_id': widget.chat.id,
+      });
+      if (!mounted) return;
+      _supergroupId = chat.obj('type')?.int64('supergroup_id');
+      if (_supergroupId == null) return;
+      final revision = _topicLayoutRevision;
+      final group = await _query({
+        '@type': 'getSupergroup',
+        'supergroup_id': _supergroupId,
+      });
+      if (!mounted || revision != _topicLayoutRevision) return;
+      setState(() => _hasForumTabs = group.boolean('has_forum_tabs') ?? false);
+      _syncTopicListHost();
+    } catch (_) {
+      // Keep the entry snapshot while offline or while metadata is unavailable.
+    }
+  }
 
   @override
   void dispose() {
+    final host = _topicListHost;
+    final published = _publishedAttachment;
+    if (host != null && published != null) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => host.unpublish(published),
+      );
+    }
+    _supergroupUpdates?.cancel();
+    _topicUpdates?.cancel();
     _scroll.dispose();
     _input.dispose();
     super.dispose();
@@ -333,17 +734,21 @@ class _TopicChatViewState extends State<TopicChatView> {
         'offset_forum_topic_id': 0,
         'limit': 80,
       });
+      if (!mounted) return;
       final rawTopics =
           response.objects('topics') ?? const <Map<String, dynamic>>[];
       final next = <_ForumTopic>[];
+      final pageEntries = <ForumTopicIndexEntry>[];
       for (final topic in rawTopics) {
         final info = topic.obj('info') ?? topic;
         final last = topic.obj('last_message');
         final message = last == null ? null : TDParse.message(last);
-        final id = _topicId(topic, info) ?? message?.id;
+        final id = forumTopicId(topic, info) ?? message?.id;
         if (id == null || id == 0) continue;
         final isServiceLast = message?.isService == true;
         final fallbackDate = last?.integer('date');
+        final indexed = ForumTopicIndexEntry.fromTopic(topic);
+        if (indexed != null) pageEntries.add(indexed);
         next.add(
           _ForumTopic(
             id: id,
@@ -363,12 +768,55 @@ class _TopicChatViewState extends State<TopicChatView> {
             isMuted:
                 (topic.obj('notification_settings')?.integer('mute_for') ?? 0) >
                 0,
-            unreadCount: _topicUnreadCount(topic, info),
-            iconCustomEmojiId: _topicCustomEmojiId(topic, info),
-            iconColor: _topicIconColor(topic, info),
+            unreadCount: forumTopicUnreadCount(topic, info),
+            iconCustomEmojiId: forumTopicCustomEmojiId(topic, info),
+            iconColor: forumTopicIconColor(topic, info),
             lastMessageIsSynthetic: message == null || isServiceLast,
+            hasRealLastMessage: message != null,
+            isGeneral:
+                info.boolean('is_general') == true ||
+                topic.boolean('is_general') == true,
+            isClosed:
+                info.boolean('is_closed') == true ||
+                topic.boolean('is_closed') == true,
+            creatorId: _topicCreatorId(info),
           ),
         );
+      }
+      final previousById = {for (final topic in _topics) topic.id: topic};
+      // Store the page so the shared index keeps its watermark bookkeeping
+      // current. storeAll keeps a live read position the page predates.
+      ForumTopicIndex.shared.storeAll(
+        _accountSlot,
+        widget.chat.id,
+        pageEntries,
+      );
+      // A page fetched before a successful read (or an authoritative update)
+      // must not resurrect a counter the index already cleared. The merged
+      // entry is the live state: its counter wins, and a live newer last
+      // message keeps the row's later mark-read targeting real traffic.
+      for (var i = 0; i < next.length; i++) {
+        var topic = next[i];
+        final live = ForumTopicIndex.shared.entryFor(
+          _accountSlot,
+          widget.chat.id,
+          topic.id,
+        );
+        if (live == null) continue;
+        if (topic.unreadCount != live.unreadCount) {
+          topic = topic.copyWith(unreadCount: live.unreadCount);
+        }
+        final previous = previousById[topic.id];
+        if (previous != null &&
+            live.lastMessageId > topic.lastMessage.id &&
+            previous.lastMessage.id == live.lastMessageId) {
+          topic = topic.copyWith(
+            lastMessage: previous.lastMessage,
+            lastMessageIsSynthetic: previous.lastMessageIsSynthetic,
+            hasRealLastMessage: true,
+          );
+        }
+        next[i] = topic;
       }
       next.sort((a, b) => b.lastMessage.date.compareTo(a.lastMessage.date));
       _topics
@@ -380,8 +828,19 @@ class _TopicChatViewState extends State<TopicChatView> {
       }
       _rebuildPosts();
       await _loadVisibleThreads();
+      unawaited(
+        _resolvePreviewSenders([
+          for (final topic in next)
+            if (topic.hasRealLastMessage) topic.lastMessage,
+        ]),
+      );
+    } catch (_) {
+      // A failed topic refresh must not surface as an uncaught navigation error.
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted) {
+        setState(() => _loading = false);
+        _syncTopicListHost();
+      }
     }
   }
 
@@ -450,6 +909,7 @@ class _TopicChatViewState extends State<TopicChatView> {
       _selectedThreadId = threadId;
       _rebuildPosts();
     });
+    _syncTopicListHost();
     _loadVisibleThreads();
     if (_scroll.hasClients) {
       _scroll.animateTo(
@@ -458,23 +918,6 @@ class _TopicChatViewState extends State<TopicChatView> {
         curve: Curves.easeOutCubic,
       );
     }
-  }
-
-  int _topicUnreadCount(Map<String, dynamic> topic, Map<String, dynamic> info) {
-    final count =
-        topic.integer('unread_count') ??
-        info.integer('unread_count') ??
-        topic.integer('unread_mention_count') ??
-        info.integer('unread_mention_count') ??
-        0;
-    return count < 0 ? 0 : count;
-  }
-
-  int? _topicId(Map<String, dynamic> topic, Map<String, dynamic> info) {
-    return info.integer('forum_topic_id') ??
-        topic.integer('forum_topic_id') ??
-        info.int64('message_thread_id') ??
-        topic.int64('message_thread_id');
   }
 
   ChatMessage _fallbackTopicMessage(
@@ -497,28 +940,432 @@ class _TopicChatViewState extends State<TopicChatView> {
     );
   }
 
-  int _topicCustomEmojiId(
-    Map<String, dynamic> topic,
-    Map<String, dynamic> info,
-  ) {
-    return info.obj('icon')?.int64('custom_emoji_id') ??
-        topic.obj('icon')?.int64('custom_emoji_id') ??
-        info.int64('icon_custom_emoji_id') ??
-        topic.int64('icon_custom_emoji_id') ??
-        0;
+  int _topicCreatorId(Map<String, dynamic> info) {
+    final creator = info.obj('creator_id');
+    if (creator?.type == 'messageSenderUser') {
+      return creator?.int64('user_id') ?? 0;
+    }
+    return 0;
   }
 
-  Color? _topicIconColor(
-    Map<String, dynamic> topic,
-    Map<String, dynamic> info,
-  ) {
-    final raw =
-        info.obj('icon')?.integer('color') ??
-        topic.obj('icon')?.integer('color') ??
-        info.integer('icon_color') ??
-        topic.integer('icon_color');
-    if (raw == null || raw == 0) return null;
-    return Color(0xFF000000 | (raw & 0xFFFFFF));
+  /// Resolves preview sender names through the same cache the post rows use,
+  /// so the chat-list-style topic rows can draw the "Alice: …" prefix.
+  Future<void> _resolvePreviewSenders(List<ChatMessage> messages) async {
+    final missing = messages
+        .where((message) => !message.isOutgoing)
+        .map((message) => message.senderId)
+        .whereType<int>()
+        .where((id) => id != 0 && !_senderCache.containsKey(id))
+        .toSet();
+    if (missing.isEmpty) {
+      if (mounted) setState(() {});
+      return;
+    }
+    for (final id in missing) {
+      try {
+        if (id > 0) {
+          final user = await _query({'@type': 'getUser', 'user_id': id});
+          _senderCache[id] = _SenderInfo(
+            name: TDParse.userName(user),
+            photo: TDParse.smallPhoto(user.obj('profile_photo')),
+          );
+        } else {
+          final chat = await _query({'@type': 'getChat', 'chat_id': id});
+          _senderCache[id] = _SenderInfo(
+            name: chat.str('title') ?? AppStringKeys.topicChatUsers,
+            photo: TDParse.smallPhoto(chat.obj('photo')),
+          );
+        }
+      } catch (_) {
+        // An unresolved sender simply omits the preview prefix.
+      }
+    }
+    if (mounted) {
+      setState(() {});
+      _syncTopicListHost();
+    }
+  }
+
+  /// The chat-list-style preview for a topic: the sender prefix source and
+  /// the message text with media/service placeholders (composed by
+  /// TDParse.messageText through TDParse.message). Synthetic fallback
+  /// messages render no preview at all — their text is the topic's own name.
+  String? _topicPreviewSender(_ForumTopic topic) {
+    final message = topic.lastMessage;
+    if (message.isOutgoing) {
+      return AppStrings.t(AppStringKeys.chatMeLabel);
+    }
+    final senderId = message.senderId;
+    if (senderId == null || senderId == 0) {
+      return message.senderName?.trim().isNotEmpty == true
+          ? message.senderName!.trim()
+          : null;
+    }
+    final cached = _senderCache[senderId];
+    if (cached != null && cached.name.trim().isNotEmpty) {
+      return cached.name.trim();
+    }
+    final name = message.senderName?.trim();
+    return name != null && name.isNotEmpty ? name : null;
+  }
+
+  TopicNavigationItem _navigationItem(_ForumTopic topic) => TopicNavigationItem(
+    id: topic.id,
+    name: topic.name,
+    iconCustomEmojiId: topic.iconCustomEmojiId,
+    iconColor: topic.iconColor?.toARGB32() ?? 0,
+    unreadCount: topic.unreadCount,
+    isMuted: topic.isMuted,
+    isPinned: topic.isPinned,
+    isGeneral: topic.isGeneral,
+    isClosed: topic.isClosed,
+    lastPreview: topic.hasRealLastMessage ? topic.lastMessage.text.trim() : '',
+    lastSender: topic.hasRealLastMessage ? _topicPreviewSender(topic) : null,
+    lastMessageDate: topic.hasRealLastMessage ? topic.lastMessage.date : 0,
+  );
+
+  // MARK: - Topic moderation (Telegram iOS parity)
+
+  _ForumTopic? _topicById(int? id) {
+    if (id == null) return null;
+    for (final topic in _topics) {
+      if (topic.id == id) return topic;
+    }
+    return null;
+  }
+
+  /// Telegram iOS offers topic creation right from the topic list.
+  Future<void> _openCreateTopicDialog() async {
+    final draft = await showDialog<TopicDraft>(
+      context: context,
+      builder: (dialogContext) => TopicDraftDialog(
+        title: AppStrings.t(AppStringKeys.groupAdministrationNewTopic),
+        initialName: '',
+        initialColor: topicIconColors[_topics.length % topicIconColors.length],
+        initialCustomEmojiId: 0,
+        canChangeColor: true,
+      ),
+    );
+    if (!mounted || draft == null || draft.name.isEmpty) return;
+    try {
+      final created = await _query(
+        createForumTopicRequest(
+          chatId: widget.chat.id,
+          name: draft.name,
+          color: draft.color,
+          customEmojiId: draft.customEmojiId,
+        ),
+      );
+      _topicMessages.clear();
+      await _loadTopics();
+      // Open the fresh topic the way iOS does after creation.
+      final newId = created.integer('forum_topic_id');
+      if (mounted && newId != null && newId != 0) _selectTopic(newId);
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(
+          AppStringKeys.groupAdministrationCouldnTCreateTopicValue1,
+          {'value1': error},
+        ),
+      );
+    }
+  }
+
+  Future<void> _editTopic(_ForumTopic topic) async {
+    if (topic.isGeneral) return;
+    final draft = await showDialog<TopicDraft>(
+      context: context,
+      builder: (dialogContext) => TopicDraftDialog(
+        title: AppStrings.t(AppStringKeys.groupAdministrationEditTopic),
+        initialName: topic.name,
+        initialColor: topic.iconColor?.toARGB32() ?? topicIconColors.first,
+        initialCustomEmojiId: topic.iconCustomEmojiId,
+        canChangeColor: false,
+      ),
+    );
+    if (!mounted || draft == null || draft.name.isEmpty) return;
+    try {
+      await _query(
+        editForumTopicRequest(
+          chatId: widget.chat.id,
+          forumTopicId: topic.id,
+          name: draft.name,
+          customEmojiId: draft.customEmojiId,
+        ),
+      );
+      await _loadTopics();
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.groupAdministrationCouldnTEditTopicValue1, {
+          'value1': error,
+        }),
+      );
+    }
+  }
+
+  Future<void> _deleteTopic(_ForumTopic topic) async {
+    if (topic.isGeneral || !_canDeleteTopic(topic)) return;
+    final ok = await confirmDialog(
+      context,
+      title: AppStrings.t(
+        AppStringKeys.groupAdministrationDeleteTopicAndMessages,
+        {'value1': topic.name},
+      ),
+      confirmText: AppStringKeys.chatDelete,
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    // The dialog can outlive a rights change or a topic deletion elsewhere;
+    // re-verify before anything destructive is sent.
+    final current = _topicById(topic.id);
+    if (current == null || !_canDeleteTopic(current)) return;
+    try {
+      await _query(
+        deleteForumTopicRequest(
+          chatId: widget.chat.id,
+          forumTopicId: current.id,
+        ),
+      );
+      if (_selectedThreadId == topic.id) {
+        _selectTopic(null);
+      }
+      _topicMessages.remove(topic.id);
+      await _loadTopics();
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(
+          AppStringKeys.groupAdministrationCouldnTDeleteTopicValue1,
+          {'value1': error},
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicPinned(_ForumTopic topic) async {
+    try {
+      await _query(
+        toggleForumTopicPinnedRequest(
+          chatId: widget.chat.id,
+          forumTopicId: topic.id,
+          isPinned: !topic.isPinned,
+        ),
+      );
+      await _loadTopics();
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.groupAdministrationCouldnTPinTopicValue1, {
+          'value1': error,
+        }),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicMuted(_ForumTopic topic) async {
+    try {
+      await _query(
+        setForumTopicMutedRequest(
+          chatId: widget.chat.id,
+          forumTopicId: topic.id,
+          muted: !topic.isMuted,
+        ),
+      );
+      await _loadTopics();
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        _topicActionError(AppStringKeys.topicChatMuteFailed, error),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicClosed(_ForumTopic topic) async {
+    try {
+      await _query(
+        toggleForumTopicClosedRequest(
+          chatId: widget.chat.id,
+          forumTopicId: topic.id,
+          isClosed: !topic.isClosed,
+        ),
+      );
+      await _loadTopics();
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        _topicActionError(AppStringKeys.topicPostContentActionFailed, error),
+      );
+    }
+  }
+
+  /// Marks the topic read the way viewing its newest message does: TDLib
+  /// advances the topic's inbox watermark to the highest viewed message id.
+  Future<void> _markTopicRead(_ForumTopic topic) async {
+    if (!topic.hasRealLastMessage || topic.unreadCount == 0) return;
+    try {
+      await _query(
+        forumTopicViewMessagesRequest(
+          chatId: widget.chat.id,
+          messageIds: [topic.lastMessage.id],
+        ),
+      );
+      await _loadTopics();
+    } catch (_) {
+      // A failed mark-read is silent: nothing destructive happened.
+    }
+  }
+
+  String _topicActionError(String fallback, Object error) =>
+      topicActionErrorText(fallback, error);
+
+  /// Clears every topic in the list at once: one scoped read per topic, with
+  /// the rows' unread counters cleared optimistically and each failed read
+  /// restoring only its own topic. Topics with no real last message have no
+  /// watermark to advance.
+  ///
+  /// A rollback never overwrites a read the index saw move: an authoritative
+  /// updateForumTopic during the batch (or a successful read of that topic)
+  /// keeps its zero.
+  Future<void> _markAllTopicsRead() async {
+    final targets = [
+      for (final topic in _topics)
+        if (topic.hasRealLastMessage)
+          ForumTopicReadTarget(
+            topicId: topic.id,
+            lastMessageId: topic.lastMessage.id,
+            unreadCount: topic.unreadCount,
+          ),
+    ];
+    final plan = forumTopicMarkAllReadPlan(
+      chatId: widget.chat.id,
+      topics: targets,
+    );
+    if (plan.isEmpty) return;
+    final previous =
+        <
+          int,
+          ({int unreadCount, int? lastReadInboxMessageId, int? lastMessageId})
+        >{};
+    for (final target in targets) {
+      if (target.unreadCount <= 0) continue;
+      final entry = ForumTopicIndex.shared.entryFor(
+        _accountSlot,
+        widget.chat.id,
+        target.topicId,
+      );
+      previous[target.topicId] = (
+        unreadCount: target.unreadCount,
+        lastReadInboxMessageId: entry?.lastReadInboxMessageId,
+        lastMessageId: entry?.lastMessageId,
+      );
+    }
+    setState(() {
+      for (final target in targets) {
+        if (target.unreadCount <= 0) continue;
+        final index = _topics.indexWhere((item) => item.id == target.topicId);
+        if (index >= 0) {
+          _topics[index] = _topics[index].copyWith(unreadCount: 0);
+        }
+      }
+    });
+    if (previous.isNotEmpty) {
+      ForumTopicIndex.shared.setUnreadCounts(_accountSlot, widget.chat.id, {
+        for (final topicId in previous.keys) topicId: 0,
+      });
+    }
+    _syncTopicListHost();
+    final failed = <int>{};
+    for (final entry in plan) {
+      if (!mounted) return;
+      try {
+        await _query(entry.request);
+        if (!mounted) return;
+        // The read advanced this topic's inbox watermark; record it so the
+        // next getForumTopics page cannot resurrect the cleared counter.
+        ForumTopicIndex.shared.recordRead(
+          _accountSlot,
+          widget.chat.id,
+          entry.target.topicId,
+          readMessageId: entry.target.lastMessageId,
+          lastMessageId: entry.target.lastMessageId,
+        );
+      } catch (_) {
+        failed.add(entry.target.topicId);
+      }
+    }
+    if (!mounted) return;
+    if (failed.isNotEmpty) {
+      setState(() {
+        for (final topicId in failed) {
+          final snapshot = previous[topicId];
+          if (snapshot == null) continue;
+          // Restore only this topic, and only while no authoritative read
+          // moved its watermark or newest message during the batch.
+          final restored = ForumTopicIndex.shared.restoreUnreadCountIfUnmoved(
+            _accountSlot,
+            widget.chat.id,
+            topicId,
+            restoreCount: snapshot.unreadCount,
+            expectedUnreadCount: 0,
+            expectedLastReadInboxMessageId: snapshot.lastReadInboxMessageId,
+            expectedLastMessageId: snapshot.lastMessageId,
+          );
+          if (!restored) continue;
+          final index = _topics.indexWhere((item) => item.id == topicId);
+          if (index >= 0) {
+            _topics[index] = _topics[index].copyWith(
+              unreadCount: snapshot.unreadCount,
+            );
+          }
+        }
+      });
+      _syncTopicListHost();
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+    }
+    await _loadTopics();
+  }
+
+  /// The topic row's context menu (iOS swipe action / long press). Destructive
+  /// and management items only appear while the account holds the right;
+  /// mute and mark-read stay available to everyone.
+  Future<void> _showTopicRowMenu(
+    TopicNavigationItem item,
+    Offset? globalPosition,
+  ) async {
+    final topic = _topicById(item.id);
+    if (topic == null) return;
+    // The creator deletion carve-out depends on the topic's live history, so
+    // probe before the menu is offered.
+    if (!topic.isGeneral && !_canDeleteMessages && _meUserId != null) {
+      await _ensureTopicCreatorDeletable(topic.id);
+      if (!mounted) return;
+    }
+    await showTopicRowMenuSheet(
+      context: context,
+      topic: item,
+      actions: topicRowActions(
+        topic: item,
+        canManage: _canManageTopics,
+        canDelete: _canDeleteTopic(topic),
+        onMarkRead: () => _markTopicRead(topic),
+        onTogglePinned: () => _toggleTopicPinned(topic),
+        onToggleMuted: () => _toggleTopicMuted(topic),
+        onEdit: () => _editTopic(topic),
+        onToggleClosed: () => _toggleTopicClosed(topic),
+        onDelete: () => _deleteTopic(topic),
+      ),
+    );
   }
 
   // Materialized rather than recomputed: as a getter this allocated a
@@ -662,6 +1509,9 @@ class _TopicChatViewState extends State<TopicChatView> {
       alreadyReported: _reportedVisibleMessageIds,
     );
     if (visible.isEmpty) return;
+    // Ghost mode withholds the read report for forum topics too; the
+    // locally tracked visible set below keeps working.
+    if (!shouldReportForumTopicReads(widget.chat.id)) return;
     TdClient.shared.send(
       forumTopicViewMessagesRequest(
         chatId: widget.chat.id,
@@ -705,13 +1555,20 @@ class _TopicChatViewState extends State<TopicChatView> {
     if (!canComposeInTopicSurface(chat: widget.chat, forumTopicId: threadId)) {
       return;
     }
+    // 盘古之白 after Markdown parsing, so entity offsets stay valid.
+    final spaced = PanguSpacing.gated(
+      enabled: context.read<ThemeController>().panguOnSend,
+      text: formatted.text,
+      entities: formatted.entities,
+    );
+    final payload = FormattedTextPayload(spaced.text, spaced.entities);
     try {
       final request = <String, dynamic>{
         '@type': 'sendMessage',
         'chat_id': widget.chat.id,
         'input_message_content': {
           '@type': 'inputMessageText',
-          'text': formatted.toTdJson(),
+          'text': payload.toTdJson(),
         },
       };
       if (threadId != null) _attachForumTopic(request, threadId);
@@ -742,11 +1599,16 @@ class _TopicChatViewState extends State<TopicChatView> {
     if (!canComposeInTopicSurface(chat: widget.chat, forumTopicId: threadId)) {
       return;
     }
+    final spaced = PanguSpacing.gated(
+      enabled: context.read<ThemeController>().panguOnSend,
+      text: result.text,
+      entities: result.entities,
+    );
     final requests = buildAttachmentSendRequests(
       chatId: widget.chat.id,
       attachments: result.attachments,
-      caption: result.text,
-      captionEntities: result.entities,
+      caption: spaced.text,
+      captionEntities: spaced.entities,
     );
     for (final request in requests) {
       if (threadId != null) _attachForumTopic(request, threadId);
@@ -768,13 +1630,16 @@ class _TopicChatViewState extends State<TopicChatView> {
   }
 
   Future<void> _sendForumMessage(Map<String, dynamic> request) async {
-    if (!request.containsKey('topic_id')) {
-      await TdClient.shared.query(request);
+    // The topic composer builds its own request, so it opts into the same
+    // preview fix as the main chat composer.
+    final outgoing = LinkPreviewFixer.shared.applyTo(request);
+    if (!outgoing.containsKey('topic_id')) {
+      await TdClient.shared.query(outgoing);
       return;
     }
     await sendScopedForumTopicMessage(
       query: TdClient.shared.query,
-      request: request,
+      request: outgoing,
     );
   }
 
@@ -820,11 +1685,23 @@ class _TopicChatViewState extends State<TopicChatView> {
   }
 
   Future<void> _openChatView() async {
-    await TopicGroupDisplayPreference.set(TopicGroupDisplayMode.chat);
-    if (!mounted) return;
     final onOpenChatView = widget.onOpenChatView;
     if (onOpenChatView != null) {
       onOpenChatView();
+      return;
+    }
+    final chat = widget.chat;
+    if (ChatPane.replace(
+      context,
+      (onBack) => ChatView(
+        chatId: chat.id,
+        title: chat.title,
+        seedMessage: chat.lastChatMessage,
+        headerHeight: widget.headerHeight,
+        headerColor: widget.headerColor,
+        onBack: onBack,
+      ),
+    )) {
       return;
     }
     if (widget.chatRouteBelow) {
@@ -832,13 +1709,12 @@ class _TopicChatViewState extends State<TopicChatView> {
       return;
     }
     final routeSession = widget.routeSession;
-    final chat = widget.chat;
     final route = AppChatPageRoute<void>(
       builder: (chatContext) => ChatView(
         chatId: chat.id,
         title: chat.title,
         seedMessage: chat.lastChatMessage,
-        onOpenTopicMode: routeSession == null
+        onOpenTopicTranscript: routeSession == null
             ? null
             : (threadId) => _replaceTrackedChatWithTopic(
                 chatContext,
@@ -1034,19 +1910,43 @@ class _TopicChatViewState extends State<TopicChatView> {
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
+    final body = Column(
+      children: [
+        if (_selectedThreadId == null && widget.chat.lastMessage.isNotEmpty)
+          _pinnedLine(),
+        Expanded(child: _content()),
+        if (canComposeInTopicSurface(
+          chat: widget.chat,
+          forumTopicId: _selectedThreadId,
+        ))
+          _bottomComposer(),
+      ],
+    );
     return Scaffold(
       backgroundColor: c.background,
       body: Column(
         children: [
           _header(),
-          if (_selectedThreadId == null && widget.chat.lastMessage.isNotEmpty)
-            _pinnedLine(),
-          Expanded(child: _content()),
-          if (canComposeInTopicSurface(
-            chat: widget.chat,
-            forumTopicId: _selectedThreadId,
-          ))
-            _bottomComposer(),
+          Expanded(
+            child: _topicListOverlaid
+                ? body
+                : TopicNavigationLayout(
+                    topics: [
+                      for (final topic in _topics) _navigationItem(topic),
+                    ],
+                    selectedTopicId: _selectedThreadId,
+                    hasForumTabs: _hasForumTabs,
+                    onSelected: _selectTopic,
+                    onCreateTopic: _canCreateTopics
+                        ? _openCreateTopicDialog
+                        : null,
+                    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
+                    onTopicMenu: _showTopicRowMenu,
+                    generalAvatarTitle: widget.chat.title,
+                    generalAvatarPhoto: widget.chat.photo,
+                    child: body,
+                  ),
+          ),
         ],
       ),
     );
@@ -1054,7 +1954,10 @@ class _TopicChatViewState extends State<TopicChatView> {
 
   Widget _header() {
     final c = context.colors;
-    final top = MediaQuery.of(context).padding.top;
+    final listHiddenByUser =
+        _topicListOverlaid &&
+        (context.watch<TopicListHost?>()?.listHidden ?? false);
+    final top = topChromeInsetOf(context);
     final title = widget.chat.isBotTopicChat
         ? widget.chat.title
         : context.watch<GroupRemarkController?>()?.displayTitleFor(
@@ -1063,7 +1966,7 @@ class _TopicChatViewState extends State<TopicChatView> {
               ) ??
               widget.chat.title;
     return Container(
-      height: top + widget.headerHeight + 44,
+      height: top + widget.headerHeight,
       padding: EdgeInsets.only(top: top),
       decoration: BoxDecoration(
         color: widget.headerColor ?? c.navBar,
@@ -1081,8 +1984,10 @@ class _TopicChatViewState extends State<TopicChatView> {
               children: [
                 if (widget.showBackButton)
                   GestureDetector(
+                    key: const ValueKey('topic-header-back'),
                     behavior: HitTestBehavior.opaque,
-                    onTap: widget.onBack ?? () => Navigator.of(context).pop(),
+                    onTap:
+                        widget.onBack ?? () => Navigator.of(context).maybePop(),
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
                         horizontal: AppSpacing.sm,
@@ -1134,6 +2039,7 @@ class _TopicChatViewState extends State<TopicChatView> {
                   ),
                 ),
                 GestureDetector(
+                  key: const ValueKey('topic-header-search'),
                   behavior: HitTestBehavior.opaque,
                   onTap: _openSearch,
                   child: Padding(
@@ -1145,8 +2051,25 @@ class _TopicChatViewState extends State<TopicChatView> {
                     ),
                   ),
                 ),
+                if (listHiddenByUser) ...[
+                  const SizedBox(width: AppSpacing.md),
+                  GestureDetector(
+                    key: const ValueKey('topic-header-list'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => context.read<TopicListHost?>()?.showList(),
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: AppIcon(
+                        HeroAppIcons.hashtag,
+                        size: 25,
+                        color: c.textPrimary,
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(width: AppSpacing.md),
                 GestureDetector(
+                  key: const ValueKey('topic-header-chat-mode'),
                   behavior: HitTestBehavior.opaque,
                   onTap: _openChatView,
                   child: Padding(
@@ -1158,9 +2081,28 @@ class _TopicChatViewState extends State<TopicChatView> {
                     ),
                   ),
                 ),
+                if (showsGroupTopicControls(widget.chat) &&
+                    _canCreateTopics &&
+                    (!_topicListOverlaid || _hasForumTabs)) ...[
+                  const SizedBox(width: AppSpacing.md),
+                  GestureDetector(
+                    key: const ValueKey('topic-header-create-topic'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _openCreateTopicDialog,
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: AppIcon(
+                        HeroAppIcons.plus,
+                        size: 25,
+                        color: AppTheme.brand,
+                      ),
+                    ),
+                  ),
+                ],
                 if (showsGroupTopicControls(widget.chat)) ...[
                   const SizedBox(width: AppSpacing.xl),
                   GestureDetector(
+                    key: const ValueKey('topic-header-settings'),
                     behavior: HitTestBehavior.opaque,
                     onTap: _openSettings,
                     child: Padding(
@@ -1177,74 +2119,7 @@ class _TopicChatViewState extends State<TopicChatView> {
               ],
             ),
           ),
-          _topicTabs(inHeader: true),
         ],
-      ),
-    );
-  }
-
-  Widget _topicTabs({bool inHeader = false}) {
-    final c = context.colors;
-    final visibleTopics = _topics.take(8).toList();
-    return Container(
-      height: inHeader ? 44 : 52,
-      decoration: BoxDecoration(
-        color: inHeader ? Colors.transparent : c.background,
-        border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),
-      ),
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg),
-        itemBuilder: (context, index) {
-          final all = index == 0;
-          final topic = all ? null : visibleTopics[index - 1];
-          final id = topic?.id;
-          final selected = id == _selectedThreadId;
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => _selectTopic(id),
-            child: SizedBox(
-              height: inHeader ? 44 : 52,
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _TopicTabIcon(topic: topic, selected: selected),
-                      const SizedBox(width: 5),
-                      Text(
-                        all
-                            ? AppStringKeys.topicChatAllFilter.l10n(context)
-                            : topic!.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: selected
-                              ? FontWeight.w600
-                              : FontWeight.w500,
-                          color: c.textPrimary,
-                        ),
-                      ),
-                    ],
-                  ),
-                  SizedBox(height: inHeader ? 7 : 9),
-                  Container(
-                    width: 38,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: selected ? AppTheme.brand : Colors.transparent,
-                      borderRadius: BorderRadius.circular(AppRadius.sm),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-        separatorBuilder: (_, _) => const SizedBox(width: 28),
-        itemCount: visibleTopics.length + 1,
       ),
     );
   }
@@ -1316,6 +2191,9 @@ class _TopicChatViewState extends State<TopicChatView> {
               chatId: widget.chat.id,
               post: post,
               sender: _senderCache[post.message.senderId],
+              showTopicChip: _selectedThreadId == null,
+              onOpenTopic: () => _selectTopic(post.topic.id),
+              onOpenCurrentChat: () => unawaited(_openChatView()),
               onLike: () => _addReaction(post, '❤️'),
               onPickReaction: () => _showReactionPicker(post),
               onComments: () => _openComments(post),
@@ -1385,34 +2263,6 @@ class _TopicChatViewState extends State<TopicChatView> {
   }
 }
 
-class _TopicTabIcon extends StatelessWidget {
-  const _TopicTabIcon({required this.topic, required this.selected});
-
-  final _ForumTopic? topic;
-  final bool selected;
-
-  @override
-  Widget build(BuildContext context) {
-    final c = context.colors;
-    final topic = this.topic;
-    if (topic == null) {
-      return AppIcon(
-        HeroAppIcons.hashtag,
-        size: 17,
-        color: selected ? AppTheme.brand : c.textSecondary,
-      );
-    }
-    if (topic.iconCustomEmojiId != 0) {
-      return CustomEmojiView(id: topic.iconCustomEmojiId, size: 18);
-    }
-    return AppIcon(
-      HeroAppIcons.solidMessage,
-      size: 17,
-      color: topic.iconColor ?? (selected ? AppTheme.brand : c.textSecondary),
-    );
-  }
-}
-
 class _TopicPostRow extends StatelessWidget {
   const _TopicPostRow({
     required this.chatId,
@@ -1421,6 +2271,9 @@ class _TopicPostRow extends StatelessWidget {
     required this.onPickReaction,
     required this.onComments,
     required this.onShare,
+    this.showTopicChip = false,
+    this.onOpenTopic,
+    this.onOpenCurrentChat,
     this.sender,
   });
 
@@ -1432,10 +2285,16 @@ class _TopicPostRow extends StatelessWidget {
   final VoidCallback onComments;
   final VoidCallback onShare;
 
+  /// The aggregated "All" feed labels every post with its topic; a single
+  /// topic's feed already names itself in the header, so the chip is
+  /// redundant there.
+  final bool showTopicChip;
+  final VoidCallback? onOpenTopic;
+  final VoidCallback? onOpenCurrentChat;
+
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
-    final text = _displayText;
     final chatTextSize = context.watch<ThemeController>().chatTextSize(15);
     final name = sender?.name.trim().isNotEmpty == true
         ? sender!.name.trim()
@@ -1446,6 +2305,10 @@ class _TopicPostRow extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (showTopicChip) ...[
+            _TopicChip(topic: post.topic, onOpen: onOpenTopic),
+            const SizedBox(height: 10),
+          ],
           Row(
             children: [
               PhotoAvatar(title: name, photo: sender?.photo, size: 48),
@@ -1479,13 +2342,16 @@ class _TopicPostRow extends StatelessWidget {
             TopicPostContent(
               chatId: chatId,
               message: post.message,
-              text: text,
+              // The raw text: TopicPostContent trims it for display and
+              // re-addresses the entities to whatever it renders.
+              text: post.message.text,
               textStyle: TextStyle(
                 fontSize: chatTextSize,
                 height: 1.35,
                 color: c.textPrimary,
               ),
               imageReactions: _ExtraReactions(message: post.message),
+              onOpenCurrentChat: onOpenCurrentChat,
             ),
           ],
           const SizedBox(height: 13),
@@ -1502,6 +2368,8 @@ class _TopicPostRow extends StatelessWidget {
   }
 
   String get _displayText {
+    // Trim only for the emptiness check; TopicPostContent trims for display
+    // and re-addresses the entities to the trimmed text itself.
     return post.message.text.trim();
   }
 
@@ -1510,6 +2378,59 @@ class _TopicPostRow extends StatelessWidget {
       post.message.image != null ||
       post.message.document != null ||
       post.message.buttonRows.isNotEmpty;
+}
+
+/// Topic label above a post in the aggregated feed: a 20px `TopicIconSurface`
+/// (custom emoji or tinted hashtag tile), 6px gap, single-line 14px w600 topic
+/// name tinted with `topic.iconColor ?? AppTheme.avatarColor(topic.name)`, and
+/// an optional 12px `HeroAppIcons.lock` (`c.textTertiary`, 4px gap) for closed
+/// topics. Tapping it routes through `_selectTopic(post.topic.id)`.
+class _TopicChip extends StatelessWidget {
+  const _TopicChip({required this.topic, this.onOpen});
+
+  final _ForumTopic topic;
+  final VoidCallback? onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final tint = topic.iconColor ?? AppTheme.avatarColor(topic.name);
+    return GestureDetector(
+      key: ValueKey('topic-post-chip-${topic.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: onOpen,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TopicIconSurface(
+              size: 20,
+              iconCustomEmojiId: topic.iconCustomEmojiId,
+              tint: tint,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                topic.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: tint,
+                ),
+              ),
+            ),
+            if (topic.isClosed) ...[
+              const SizedBox(width: 4),
+              AppIcon(HeroAppIcons.lock, size: 12, color: c.textTertiary),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _PostActions extends StatelessWidget {
@@ -2227,6 +3148,7 @@ class _TopicChannelSettingsViewState extends State<_TopicChannelSettingsView> {
     final c = context.colors;
     final topic = _topic;
     return Scaffold(
+      key: const ValueKey('topic-settings'),
       backgroundColor: c.groupedBackground,
       body: SafeArea(
         child: Column(
@@ -2236,6 +3158,7 @@ class _TopicChannelSettingsViewState extends State<_TopicChannelSettingsView> {
               child: Row(
                 children: [
                   IconButton(
+                    key: const ValueKey('topic-settings-back'),
                     onPressed: () => Navigator.of(context).pop(),
                     icon: AppIcon(
                       HeroAppIcons.chevronLeft,
@@ -2314,6 +3237,7 @@ class _TopicChannelSettingsViewState extends State<_TopicChannelSettingsView> {
                   SettingsCard(
                     children: [
                       SettingsRow(
+                        key: const ValueKey('topic-settings-members'),
                         title: AppStrings.t(
                           AppStringKeys.topicChatChannelMembers,
                         ),

@@ -138,21 +138,19 @@ void main() {
     expect(tester.getRect(composer), initialRect);
   });
 
-  testWidgets('desktop emoji picker is anchored and Escape dismisses it', (
+  testWidgets('desktop media picker is anchored and Escape dismisses it', (
     tester,
   ) async {
     final vm = await _pumpDesktopComposer(tester);
     final composer = find.byType(ChatInputBar);
     final initialRect = tester.getRect(composer);
 
-    await tester.tap(find.byKey(const ValueKey('desktopComposerEmojiAction')));
+    await tester.tap(find.byKey(const ValueKey('desktopComposerMediaAction')));
     await tester.pump();
 
-    expect(find.byKey(const ValueKey('desktopEmojiPopover')), findsOneWidget);
-    expect(
-      find.byKey(const ValueKey('desktopEmojiPopoverContent')),
-      findsOneWidget,
-    );
+    expect(find.byKey(const ValueKey('desktopMediaPopover')), findsOneWidget);
+    expect(find.byKey(const ValueKey('composerMediaPanel')), findsOneWidget);
+    expect(find.byKey(const ValueKey('mediaKindSegments')), findsOneWidget);
     expect(tester.getRect(composer), initialRect);
 
     await tester.tap(find.text('😀').first);
@@ -164,12 +162,12 @@ void main() {
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     await tester.pump();
 
-    expect(find.byKey(const ValueKey('desktopEmojiPopover')), findsNothing);
+    expect(find.byKey(const ValueKey('desktopMediaPopover')), findsNothing);
     expect(tester.getRect(composer), initialRect);
     await _disposeDesktopComposer(tester, vm);
   });
 
-  testWidgets('desktop sticker picker is anchored and never relayouts input', (
+  testWidgets('desktop media picker switches segments inside one popover', (
     tester,
   ) async {
     final vm = await _pumpDesktopComposer(tester);
@@ -177,21 +175,37 @@ void main() {
     final composer = find.byType(ChatInputBar);
     final initialRect = tester.getRect(composer);
 
-    await tester.tap(
-      find.byKey(const ValueKey('desktopComposerStickerAction')),
-    );
+    await tester.tap(find.byKey(const ValueKey('desktopComposerMediaAction')));
     await tester.pump();
 
-    expect(find.byKey(const ValueKey('desktopStickerPopover')), findsOneWidget);
+    // The popover shares the panel body with a docked panel, but it is an
+    // overlay card anchored above the bar: it keeps the recessed surface with
+    // its own outline and shadow instead of continuing the bar.
     expect(
-      find.byKey(const ValueKey('desktopStickerPopoverContent')),
-      findsOneWidget,
+      _popoverSurfaceColor(tester, const ValueKey('desktopMediaPopover')),
+      AppColors.light.panelBackground,
     );
+
+    final popover = find.byKey(const ValueKey('desktopMediaPopover'));
+    expect(popover, findsOneWidget);
+
+    // The sticker segment swaps the secondary strip and content in place.
+    await tester.tap(find.byKey(const ValueKey('mediaSegment-sticker')));
+    await tester.pump();
+    expect(popover, findsOneWidget);
+    expect(find.byKey(const ValueKey('stickerPanelTabs')), findsOneWidget);
+    expect(find.byKey(const ValueKey('emojiPanelTabs')), findsNothing);
+
+    // The GIF segment shows its saved-GIFs strip.
+    await tester.tap(find.byKey(const ValueKey('mediaSegment-gif')));
+    await tester.pump();
+    expect(popover, findsOneWidget);
+    expect(find.byKey(const ValueKey('gifPanelTabs')), findsOneWidget);
     expect(tester.getRect(composer), initialRect);
 
     await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     await tester.pump();
-    expect(find.byKey(const ValueKey('desktopStickerPopover')), findsNothing);
+    expect(popover, findsNothing);
     expect(tester.getRect(composer), initialRect);
   });
 
@@ -209,7 +223,7 @@ void main() {
     );
     expect(
       tester
-          .getSize(find.byKey(const ValueKey('desktopComposerEmojiAction')))
+          .getSize(find.byKey(const ValueKey('desktopComposerMediaAction')))
           .height,
       32,
     );
@@ -225,17 +239,13 @@ void main() {
       find.byKey(const ValueKey('desktopComposerScheduledAction')),
       findsOneWidget,
     );
-    final emojiX = tester
-        .getTopLeft(find.byKey(const ValueKey('desktopComposerEmojiAction')))
-        .dx;
-    final stickerX = tester
-        .getTopLeft(find.byKey(const ValueKey('desktopComposerStickerAction')))
+    final mediaX = tester
+        .getTopLeft(find.byKey(const ValueKey('desktopComposerMediaAction')))
         .dx;
     final voiceX = tester
         .getTopLeft(find.byKey(const ValueKey('desktopComposerVoiceAction')))
         .dx;
-    expect(emojiX, lessThan(stickerX));
-    expect(stickerX, lessThan(voiceX));
+    expect(mediaX, lessThan(voiceX));
   });
 
   testWidgets('toolbar capture opens media preview instead of sending', (
@@ -384,11 +394,10 @@ void main() {
         },
       );
 
-      final editable = find.byType(EditableText).first;
-      Actions.invoke(
-        tester.element(editable),
-        const PasteTextIntent(SelectionChangedCause.keyboard),
-      );
+      await tester.tap(find.byType(TextField).first);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
       await tester.pumpAndSettle();
 
       expect(clipboardReads, 1);
@@ -458,6 +467,7 @@ void main() {
       );
       await _disposeDesktopComposer(tester, vm);
     },
+    variant: TargetPlatformVariant.only(TargetPlatform.macOS),
   );
 
   testWidgets('desktop inline edit submits and restores the prior draft', (
@@ -527,6 +537,19 @@ void main() {
     );
     await _disposeDesktopComposer(tester, vm);
   });
+}
+
+/// The colour a keyed [Container] paints, walking decoration or `color`.
+Color? _popoverSurfaceColor(WidgetTester tester, Key key) {
+  final found = find.byKey(key);
+  if (found.evaluate().isEmpty) return null;
+  final widget = found.evaluate().first.widget;
+  if (widget is Container) {
+    final decoration = widget.decoration;
+    if (decoration is BoxDecoration) return decoration.color;
+    return widget.color;
+  }
+  return null;
 }
 
 Future<void> _disposeDesktopComposer(

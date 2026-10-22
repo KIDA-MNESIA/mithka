@@ -8,12 +8,60 @@ import 'package:mithka/components/app_icons.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/translation_controller.dart';
 import 'package:mithka/tdlib/td_models.dart';
+import 'package:mithka/theme/app_theme.dart';
 import 'package:mithka/theme/theme_controller.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('quote action is opt-in and requires selectable message text', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final translation = TranslationController(
+      await SharedPreferences.getInstance(),
+    );
+    addTearDown(translation.dispose);
+    MessageAction? selected;
+    Future<void> pumpMenu({
+      required bool allowQuote,
+      String text = 'original',
+    }) async {
+      await tester.pumpWidget(
+        ChangeNotifierProvider.value(
+          value: translation,
+          child: MaterialApp(
+            home: Scaffold(
+              body: MessageActionMenu(
+                message: ChatMessage(
+                  id: 7,
+                  isOutgoing: false,
+                  text: text,
+                  date: 1,
+                  contentType: 'messageText',
+                ),
+                isPinned: false,
+                allowQuote: allowQuote,
+                onSelect: (action) => selected = action,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    final quote = find.byKey(const ValueKey('message-action-quote'));
+    await pumpMenu(allowQuote: false);
+    expect(quote, findsNothing);
+    await pumpMenu(allowQuote: true, text: '');
+    expect(quote, findsNothing);
+    await pumpMenu(allowQuote: true);
+    expect(quote, findsOneWidget);
+    await tester.tap(quote);
+    expect(selected, MessageAction.quote);
+  });
 
   test('message action rows stay balanced', () {
     expect(MessageActionMenu.rowCountsForActionCount(6), (first: 3, second: 3));
@@ -619,6 +667,170 @@ void main() {
 
     expect(
       find.byKey(const ValueKey('message-action-translate')),
+      findsNothing,
+    );
+  });
+
+  testWidgets('the desktop strip is laid out to the menu it rides on', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Align(
+          alignment: Alignment.topLeft,
+          child: SizedBox(
+            width: MessageActionMenu.desktopPreferredWidth,
+            child: MenuReactionBar(
+              reactions: const [
+                QuickReactionChoice.emoji('\u{1F44D}'),
+                QuickReactionChoice.emoji('\u2764\uFE0F'),
+                QuickReactionChoice.emoji('\u{1F525}'),
+                QuickReactionChoice.emoji('\u{1F389}'),
+                QuickReactionChoice.emoji('\u{1F601}'),
+                QuickReactionChoice.emoji('\u{1F622}'),
+                QuickReactionChoice.emoji('\u{1F621}'),
+              ],
+              onReaction: (_) {},
+              onExpand: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    final strip = find.byKey(const ValueKey('menu-reaction-bar'));
+    expect(
+      tester.getSize(strip),
+      const Size(
+        MessageActionMenu.desktopPreferredWidth,
+        MenuReactionBar.height,
+      ),
+    );
+    // The seventh configured reaction lives behind the expand button.
+    expect(
+      find.byKey(const ValueKey('menu-reaction-emoji:\u{1F621}')),
+      findsNothing,
+    );
+    expect(find.byKey(const ValueKey('menu-reaction-expand')), findsOneWidget);
+
+    // Same surface, same corner, same hairline as the menu below it: the two
+    // are one stack, not a pill parked on a card.
+    final decoration =
+        tester.widget<Container>(strip).decoration! as BoxDecoration;
+    expect(decoration.color, MessageActionMenu.surface);
+    expect(decoration.borderRadius, BorderRadius.circular(AppRadius.control));
+    expect(decoration.border, isNotNull);
+  });
+
+  testWidgets('the desktop strip reports the slot that was clicked', (
+    tester,
+  ) async {
+    QuickReactionChoice? reacted;
+    var expanded = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Align(
+          alignment: Alignment.topLeft,
+          child: SizedBox(
+            width: MessageActionMenu.desktopPreferredWidth,
+            child: MenuReactionBar(
+              reactions: const [
+                QuickReactionChoice.emoji('\u{1F44D}'),
+                QuickReactionChoice.emoji('\u2764\uFE0F'),
+              ],
+              onReaction: (reaction) => reacted = reaction,
+              onExpand: () => expanded += 1,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey('menu-reaction-emoji:\u2764\uFE0F')),
+    );
+    await tester.pump();
+    expect(reacted, const QuickReactionChoice.emoji('\u2764\uFE0F'));
+
+    await tester.tap(find.byKey(const ValueKey('menu-reaction-expand')));
+    await tester.pump();
+    expect(expanded, 1);
+  });
+  testWidgets('desktop media offers a save panel instead of the album', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    final translation = TranslationController(prefs);
+    await tester.binding.setSurfaceSize(const Size(500, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    Widget menuFor(TargetPlatform platform, {bool allowForwarding = true}) =>
+        ChangeNotifierProvider.value(
+          value: translation,
+          child: MaterialApp(
+            theme: ThemeData(platform: platform),
+            locale: const Locale('en'),
+            localizationsDelegates: const [AppLocalizations.delegate],
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: Align(
+                alignment: Alignment.topLeft,
+                child: MessageActionMenu(
+                  message: ChatMessage(
+                    id: 42,
+                    isOutgoing: false,
+                    text: '',
+                    date: 1,
+                    contentType: 'messagePhoto',
+                    image: TdFileRef(id: 42),
+                  ),
+                  isPinned: false,
+                  allowForwarding: allowForwarding,
+                  onSelect: (_) {},
+                ),
+              ),
+            ),
+          ),
+        );
+
+    await tester.pumpWidget(menuFor(TargetPlatform.macOS));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('message-action-saveAs')), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('message-action-saveToPhotos')),
+      findsNothing,
+    );
+    expect(find.text('Save As…'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('message-action-copyImage')),
+      findsOneWidget,
+    );
+    expect(find.text('Copy image'), findsOneWidget);
+
+    // MaterialApp lerps between themes, so the platform swap only lands once
+    // the theme animation has settled.
+    await tester.pumpWidget(menuFor(TargetPlatform.iOS));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('message-action-saveToPhotos')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('message-action-saveAs')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('message-action-copyImage')),
+      findsNothing,
+    );
+
+    await tester.pumpWidget(
+      menuFor(TargetPlatform.macOS, allowForwarding: false),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('message-action-copyImage')),
       findsNothing,
     );
   });

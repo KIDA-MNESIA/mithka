@@ -17,6 +17,7 @@ import '../app/performance_metrics.dart';
 import '../communities/community_models.dart';
 import '../notifications/notification_settings_payload.dart';
 import '../notifications/scope_notification_settings.dart';
+import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../tdlib/chat_membership.dart';
 import '../tdlib/json_helpers.dart';
@@ -24,14 +25,41 @@ import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
 import '../tdlib/td_user_index.dart';
 import 'chat_delete_policy.dart';
+import 'chat_list_preview.dart';
+import 'chat_removal_actions.dart';
 
 class ChatFilterOption {
-  const ChatFilterOption({required this.title, this.folderId});
+  const ChatFilterOption({
+    required this.title,
+    this.folderId,
+    this.iconName = 'Custom',
+    this.unreadChatCount = 0,
+    this.hasUnmutedUnread = false,
+  });
 
   final String title;
   final int? folderId;
+  final String iconName;
+
+  /// Unread chats inside the folder (a chat counts once, not per message).
+  /// Telegram's own folder badges report chat counts, and muted chats still
+  /// count — muting only decides the badge's colour.
+  final int unreadChatCount;
+
+  /// Whether at least one of those unread chats is unmuted, which is what
+  /// makes Telegram draw the badge in the accent colour instead of grey.
+  final bool hasUnmutedUnread;
 
   bool get isAll => folderId == null;
+
+  ChatFilterOption withUnread({required int count, required bool unmuted}) =>
+      ChatFilterOption(
+        title: title,
+        folderId: folderId,
+        iconName: iconName,
+        unreadChatCount: count,
+        hasUnmutedUnread: unmuted,
+      );
 }
 
 class _CommunityLookup {
@@ -55,6 +83,7 @@ class ChatListViewModel extends ChangeNotifier {
   ChatListViewModel({
     @visibleForTesting this._queryForTesting,
     @visibleForTesting this._membershipForTesting,
+    this.accountSlot,
   });
 
   List<ChatSummary> _chats = [];
@@ -71,6 +100,11 @@ class ChatListViewModel extends ChangeNotifier {
   Timer? _resortTimer;
   int _pendingResortSignals = 0;
 
+  /// Debounces the badge refresh that in-place summary updates need. Kept apart
+  /// from [_resortTimer] so a burst of them can never cancel a resort that
+  /// something else already owed the list.
+  Timer? _badgeTimer;
+
   List<ChatSummary> get chats => _chats;
   List<ChatSummary> get archived => _archived;
   List<ChatSummary> get filtered => _filtered;
@@ -78,7 +112,9 @@ class ChatListViewModel extends ChangeNotifier {
   /// The projection walks every chat in the account while the rest of a build
   /// is O(visible rows), and it is asked for from inside a LayoutBuilder. It can
   /// only change when the sort or the community grouping does, and both of those
-  /// run through `_scheduleResort`/`_resort`, which drop the cache.
+  /// run through `_scheduleResort`/`_resort`, which drop the cache. An update
+  /// that only repaints a row changes neither, so it keeps the cache and mutates
+  /// the summaries the cached entries already point at.
   List<CommunityChatListEntry>? _entriesCache;
   bool _entriesCacheCommunitiesEnabled = true;
 
@@ -195,6 +231,13 @@ class ChatListViewModel extends ChangeNotifier {
   final Set<String> _exhaustedChatLists = {};
   final ChatListQuery? _queryForTesting;
   final ChatMembershipResolver? _membershipForTesting;
+
+  /// The account this list belongs to, when the caller already knows it.
+  ///
+  /// Chat ids are account-scoped, so follow-up row hydration must stay pinned
+  /// to the slot that produced the list instead of re-resolving the foreground
+  /// account after a switch. Null keeps the foreground resolution.
+  final int? accountSlot;
   static const _pageSize = 100;
   static const _initialPageSize = 36;
   static const _backgroundHydrateLimit = 60;
@@ -204,7 +247,11 @@ class ChatListViewModel extends ChangeNotifier {
     if (_disposed || _listening) return;
     _listening = true;
     _subscribe();
-    for (final update in _client.latestCommunityUpdates) {
+    final slot = accountSlot;
+    final cachedCommunities = slot == null
+        ? _client.latestCommunityUpdates
+        : _client.latestCommunityUpdatesForClient(_client.clientId(slot) ?? 0);
+    for (final update in cachedCommunities) {
       final community = update.obj('community');
       if (community != null) _applyCommunity(community);
     }
@@ -256,6 +303,18 @@ class ChatListViewModel extends ChangeNotifier {
 
   int? communityForChat(int chatId) => _communityByChat[chatId];
 
+  /// The community a chat row links to from its avatar corner, or null when the
+  /// row stands on its own.
+  CommunitySummary? communityBadgeFor(
+    int chatId, {
+    required bool communitiesEnabled,
+  }) => CommunityRowBadge.communityFor(
+    chatId: chatId,
+    communityByChat: _communityByChat,
+    communities: _communities,
+    communitiesEnabled: communitiesEnabled,
+  );
+
   void setCommunityCollapsed(int communityId, bool collapsed) {
     final community = _communities[communityId];
     if (community == null || community.collapsed == collapsed) return;
@@ -286,6 +345,8 @@ class ChatListViewModel extends ChangeNotifier {
     _sub = null;
     _resortTimer?.cancel();
     _resortTimer = null;
+    _badgeTimer?.cancel();
+    _badgeTimer = null;
     super.dispose();
   }
 
@@ -296,7 +357,12 @@ class ChatListViewModel extends ChangeNotifier {
       : {'@type': 'chatListFolder', 'chat_folder_id': _selectedFilter.folderId};
 
   void _loadFilters() {
-    final cached = _client.latestChatFoldersUpdate;
+    // The cached bootstrap update belongs to the foreground account. A pinned
+    // list must read its own account's chat folders, never the foreground's.
+    final slot = accountSlot;
+    final cached = slot == null
+        ? _client.latestChatFoldersUpdate
+        : _client.latestChatFoldersUpdateForClient(_client.clientId(slot) ?? 0);
     if (cached != null) _applyChatFolders(cached);
   }
 
@@ -312,7 +378,22 @@ class ChatListViewModel extends ChangeNotifier {
       final id = folder.integer('id') ?? folder.integer('chat_folder_id');
       if (id == null) continue;
       final title = _folderTitle(folder, id);
-      folders.add(ChatFilterOption(title: title, folderId: id));
+      ChatFilterOption? previous;
+      for (final candidate in _filters) {
+        if (candidate.folderId == id) {
+          previous = candidate;
+          break;
+        }
+      }
+      folders.add(
+        ChatFilterOption(
+          title: title,
+          folderId: id,
+          iconName: folder.obj('icon')?.str('name') ?? 'Custom',
+          unreadChatCount: previous?.unreadChatCount ?? 0,
+          hasUnmutedUnread: previous?.hasUnmutedUnread ?? false,
+        ),
+      );
     }
     _filters = folders;
     if (_selectedFilter.folderId != null &&
@@ -322,6 +403,11 @@ class ChatListViewModel extends ChangeNotifier {
       _prefetchMainChats();
       _resort();
     }
+    _selectedFilter = _filters.firstWhere(
+      (filter) => filter.folderId == _selectedFilter.folderId,
+      orElse: () => _filters.first,
+    );
+    _refreshFolderUnreadCounts();
     _notifyIfAlive();
   }
 
@@ -349,16 +435,19 @@ class ChatListViewModel extends ChangeNotifier {
         .then((folder) {
           if (_disposed) return;
           _resolvingFolders.remove(id);
-          final title = _folderTitle(folder, id);
+          final option = ChatFilterOption(
+            title: _folderTitle(folder, id),
+            folderId: id,
+            iconName: folder.obj('icon')?.str('name') ?? 'Custom',
+          );
           _filters = [
             for (final filter in _filters)
-              filter.folderId == id
-                  ? ChatFilterOption(title: title, folderId: id)
-                  : filter,
+              filter.folderId == id ? option : filter,
           ];
           if (_selectedFilter.folderId == id) {
-            _selectedFilter = ChatFilterOption(title: title, folderId: id);
+            _selectedFilter = option;
           }
+          _refreshFolderUnreadCounts();
           _notifyIfAlive();
         })
         .catchError((_) {
@@ -570,8 +659,14 @@ class ChatListViewModel extends ChangeNotifier {
     }
   }
 
-  Future<Map<String, dynamic>> _chatListQuery(Map<String, dynamic> request) =>
-      _queryForTesting?.call(request) ?? _client.query(request);
+  Future<Map<String, dynamic>> _chatListQuery(Map<String, dynamic> request) {
+    final queryForTesting = _queryForTesting;
+    if (queryForTesting != null) return queryForTesting(request);
+    final slot = accountSlot;
+    return slot == null
+        ? _client.query(request)
+        : _client.queryForSlot(request, slot);
+  }
 
   // MARK: - Row actions (swipe)
 
@@ -615,11 +710,37 @@ class ChatListViewModel extends ChangeNotifier {
     });
   }
 
+  /// Moves an archived chat back to the main list without deleting history.
+  void unarchive(ChatSummary chat) {
+    _chatListQuery({
+      '@type': 'addChatToList',
+      'chat_id': chat.id,
+      'chat_list': {'@type': 'chatListMain'},
+    }).catchError((Object _) => <String, dynamic>{});
+  }
+
+  /// Moves a main-list chat into the archive without deleting history.
+  ///
+  /// [owner] must be pinned at preview/menu open. A missing or expired owner
+  /// drops the request; otherwise it is dispatched
+  /// through [ChatPreviewOwner.query] (bound to `owner.clientId`).
+  void archive(ChatSummary chat, {required ChatPreviewOwner? owner}) {
+    if (_disposed) return;
+    if (owner == null || !owner.isCurrent) return;
+    final request = <String, dynamic>{
+      '@type': 'addChatToList',
+      'chat_id': chat.id,
+      'chat_list': {'@type': 'chatListArchive'},
+    };
+    final send = owner.query;
+    send(request).catchError((Object _) => <String, dynamic>{});
+  }
+
   void toggleMute(ChatSummary chat) {
     final newValue = !chat.isMuted;
     final id = chat.id;
     _mutate(id, (summary) => summary.isMuted = newValue);
-    _resort();
+    _refreshBadges();
 
     _client
         .query({
@@ -636,20 +757,30 @@ class ChatListViewModel extends ChangeNotifier {
               newValue ? AppStringKeys.callMute : AppStringKeys.chatUnmute,
             ),
           });
-          _resort();
+          _refreshBadges();
           return <String, dynamic>{};
         });
   }
 
-  void markRead(ChatSummary chat) {
+  void markRead(ChatSummary chat) => _markRead(chat, refresh: true);
+
+  /// Clears one chat's read state. Read state is not a sort key, so this owes
+  /// the list [_refreshBadges] and nothing else. [refresh] lets
+  /// [markChatsRead] pay for one refresh over the whole batch instead of one per
+  /// chat.
+  void _markRead(ChatSummary chat, {required bool refresh}) {
     if (chat.unreadCount <= 0 && !chat.isMarkedUnread) return;
     final previousUnread = chat.unreadCount;
     final previousMarked = chat.isMarkedUnread;
+    final previousLastReadInboxMessageId = chat.lastReadInboxMessageId;
     _mutate(chat.id, (s) {
       s.unreadCount = 0;
       s.isMarkedUnread = false;
+      if (s.lastMessageId > s.lastReadInboxMessageId) {
+        s.lastReadInboxMessageId = s.lastMessageId;
+      }
     });
-    _resort();
+    if (refresh) _refreshBadges();
 
     if (previousMarked) {
       _client.send({
@@ -663,8 +794,9 @@ class ChatListViewModel extends ChangeNotifier {
       _mutate(chat.id, (s) {
         s.unreadCount = previousUnread;
         s.isMarkedUnread = previousMarked;
+        s.lastReadInboxMessageId = previousLastReadInboxMessageId;
       });
-      _resort();
+      _refreshBadges();
     });
   }
 
@@ -678,9 +810,11 @@ class ChatListViewModel extends ChangeNotifier {
     final targets = chats
         .where((chat) => chat.unreadCount > 0 || chat.isMarkedUnread)
         .toList();
+    if (targets.isEmpty) return;
     for (final chat in targets) {
-      markRead(chat);
+      _markRead(chat, refresh: false);
     }
+    _refreshBadges();
   }
 
   Future<void> _forceReadChat(ChatSummary chat) async {
@@ -690,7 +824,6 @@ class ChatListViewModel extends ChangeNotifier {
       final fresh = TDParse.chat(raw);
       if (fresh == null) return;
       messageId = fresh.lastMessageId;
-      _map[chat.id] = fresh;
     }
     if (messageId <= 0) return;
     await _client.query({
@@ -704,9 +837,9 @@ class ChatListViewModel extends ChangeNotifier {
   Future<ChatDeleteCapabilities> deleteCapabilities(ChatSummary chat) async {
     try {
       final raw = await _client.query({'@type': 'getChat', 'chat_id': chat.id});
-      return chatDeleteCapabilities(raw);
+      return chatListDeleteCapabilities(raw);
     } catch (_) {
-      return const ChatDeleteCapabilities.selfOnly();
+      return const ChatDeleteCapabilities.none();
     }
   }
 
@@ -730,14 +863,16 @@ class ChatListViewModel extends ChangeNotifier {
   }) async {
     final leavesChat = shouldLeaveBeforeDeletingChat(chat.kind, scope);
     if (leavesChat) {
-      await _client.query({'@type': 'leaveChat', 'chat_id': chat.id});
+      await leaveChatAndRemoveFromList(
+        chatId: chat.id,
+        query: _client.query,
+        onLeft: () => _client.emitLocalUpdate(chatLeftLocalUpdate(chat.id)),
+      );
+      return;
     }
     await _client.query(
       deleteChatHistoryRequest(chatId: chat.id, scope: scope),
     );
-    if (leavesChat) {
-      _client.emitLocalUpdate(chatLeftLocalUpdate(chat.id));
-    }
   }
 
   Future<void> clearSavedMessages(ChatSummary chat) async {
@@ -763,11 +898,57 @@ class ChatListViewModel extends ChangeNotifier {
   // MARK: - Update stream
 
   void _subscribe() {
-    _sub = _client.subscribe().listen(_apply);
+    // A pinned list follows its own slot; `allAccounts` is the only way to
+    // receive that slot's updates while another account is foreground. The
+    // unpinned list keeps the active-account stream it always had.
+    _sub = _client
+        .updatesOfAny(const [
+          'updateNewChat',
+          'updateChatFolders',
+          'updateChatLastMessage',
+          'updateChatPosition',
+          'updateChatAddedToList',
+          'updateChatRemovedFromList',
+          'mithkaChatLeft',
+          'updateChatDraftMessage',
+          'updateChatReadInbox',
+          'updateChatUnreadMentionCount',
+          'updateMessageMentionRead',
+          'updateChatUnreadReactionCount',
+          'updateMessageUnreadReactions',
+          'updateChatIsMarkedAsUnread',
+          'updateChatTitle',
+          'updateChatNotificationSettings',
+          'updateChatPhoto',
+          'updateCommunity',
+          'updateSupergroup',
+          'updateSupergroupFullInfo',
+          'updateUserFullInfo',
+          'updateUser',
+        ], allAccounts: accountSlot != null)
+        .listen(_apply);
+  }
+
+  /// True when [update] was produced by the client this list is pinned to.
+  ///
+  /// Chat and user ids are account-scoped: ingesting the foreground account's
+  /// `updateNewChat` into a slot-7 picker adds a selectable row whose id a
+  /// later draft write resolves against slot 7, and an `updateChatTitle` can
+  /// rename an unrelated row that happens to share the numeric id. Routed
+  /// updates carry the originating `@client_id`; a local update carries none
+  /// and is accepted only while the pinned slot is the active one.
+  bool _belongsToOwner(Map<String, dynamic> update) {
+    final slot = accountSlot;
+    if (slot == null) return true;
+    final owner = _client.clientId(slot);
+    if (owner == null) return false;
+    final source = update.integer('@client_id');
+    if (source == null) return _client.activeClientId == owner;
+    return source == owner;
   }
 
   void _apply(Map<String, dynamic> update) {
-    if (_disposed) return;
+    if (_disposed || !_belongsToOwner(update)) return;
     switch (update.type) {
       case 'updateNewChat':
         final chat = update.obj('chat');
@@ -789,7 +970,11 @@ class ChatListViewModel extends ChangeNotifier {
             s.lastChatMessage = TDParse.message(last);
             final content = last.obj('content');
             if (content != null) {
-              s.lastMessage = _previewText(TDParse.messageText(content));
+              s.lastMessage = _previewText(
+                TDParse.messageText(content),
+                chatId: id,
+                senderId: s.lastChatMessage?.senderId,
+              );
             }
           } else {
             s.lastMessage = '';
@@ -821,6 +1006,7 @@ class ChatListViewModel extends ChangeNotifier {
           final folderId = list.integer('chat_folder_id');
           if (folderId != null) {
             _folderOrders.putIfAbsent(folderId, () => {})[id] = 1;
+            _mutate(id, (s) => s.folderIds.add(folderId));
           }
         }
         _scheduleResort();
@@ -836,7 +1022,10 @@ class ChatListViewModel extends ChangeNotifier {
             _mutate(id, (s) => s.archiveOrder = 0);
           case 'chatListFolder':
             final folderId = list.integer('chat_folder_id');
-            if (folderId != null) _folderOrders[folderId]?.remove(id);
+            if (folderId != null) {
+              _folderOrders[folderId]?.remove(id);
+              _mutate(id, (s) => s.folderIds.remove(folderId));
+            }
         }
         _scheduleResort();
 
@@ -867,14 +1056,26 @@ class ChatListViewModel extends ChangeNotifier {
       case 'updateChatReadInbox':
         final id = update.int64('chat_id');
         if (id == null) return;
-        _mutate(
-          id,
-          (s) =>
-              s.unreadCount = update.integer('unread_count') ?? s.unreadCount,
-        );
-        _scheduleResort();
+        _mutate(id, (s) {
+          final lastReadInboxMessageId = update.int64(
+            'last_read_inbox_message_id',
+          );
+          // A locally emitted read update can overtake an older TDLib snapshot.
+          // Read boundaries never move backwards, so ignore the stale pair
+          // instead of letting its unread count resurrect a cleared badge.
+          if (lastReadInboxMessageId != null &&
+              lastReadInboxMessageId < s.lastReadInboxMessageId) {
+            return;
+          }
+          if (lastReadInboxMessageId != null) {
+            s.lastReadInboxMessageId = lastReadInboxMessageId;
+          }
+          s.unreadCount = update.integer('unread_count') ?? s.unreadCount;
+        });
+        _scheduleBadgeRefresh();
 
       case 'updateChatUnreadMentionCount':
+      case 'updateMessageMentionRead':
         final id = update.int64('chat_id');
         if (id == null) return;
         _mutate(
@@ -882,7 +1083,18 @@ class ChatListViewModel extends ChangeNotifier {
           (s) => s.unreadMentionCount =
               update.integer('unread_mention_count') ?? s.unreadMentionCount,
         );
-        _scheduleResort();
+        _scheduleBadgeRefresh();
+
+      case 'updateChatUnreadReactionCount':
+      case 'updateMessageUnreadReactions':
+        final id = update.int64('chat_id');
+        if (id == null) return;
+        _mutate(
+          id,
+          (s) => s.unreadReactionCount =
+              update.integer('unread_reaction_count') ?? s.unreadReactionCount,
+        );
+        _scheduleBadgeRefresh();
 
       case 'updateChatIsMarkedAsUnread':
         final id = update.int64('chat_id');
@@ -892,13 +1104,13 @@ class ChatListViewModel extends ChangeNotifier {
           (s) =>
               s.isMarkedUnread = update.boolean('is_marked_as_unread') ?? false,
         );
-        _scheduleResort();
+        _scheduleBadgeRefresh();
 
       case 'updateChatTitle':
         final id = update.int64('chat_id');
         if (id == null) return;
         _mutate(id, (s) => s.title = update.str('title') ?? s.title);
-        _scheduleResort();
+        _scheduleBadgeRefresh();
 
       case 'updateChatNotificationSettings':
         final id = update.int64('chat_id');
@@ -914,13 +1126,13 @@ class ChatListViewModel extends ChangeNotifier {
               : (notificationSettings?.integer('mute_for') ?? 0);
           s.isMuted = muteFor > 0;
         });
-        _scheduleResort();
+        _scheduleBadgeRefresh();
 
       case 'updateChatPhoto':
         final id = update.int64('chat_id');
         if (id == null) return;
         _mutate(id, (s) => s.photo = TDParse.smallPhoto(update.obj('photo')));
-        _scheduleResort();
+        _scheduleBadgeRefresh();
 
       case 'updateCommunity':
         final community = update.obj('community');
@@ -971,6 +1183,19 @@ class ChatListViewModel extends ChangeNotifier {
 
   // MARK: - Mutation helpers
 
+  /// Restores [ChatSummary.folderIds] on a summary that has just been parsed
+  /// fresh from TDLib.
+  ///
+  /// A raw chat only carries positions for chat lists TDLib has loaded, so a
+  /// re-ingest would otherwise drop every folder the chat is in — the tags
+  /// appeared and then vanished on the next update. [_folderOrders] is the
+  /// same store [_projectChats] filters on, so the two cannot disagree.
+  void _restoreFolderIds(ChatSummary summary) {
+    for (final entry in _folderOrders.entries) {
+      if ((entry.value[summary.id] ?? 0) > 0) summary.folderIds.add(entry.key);
+    }
+  }
+
   void _mutate(int id, void Function(ChatSummary) body) {
     final s = _map[id] ?? _communityDirectoryChats[id];
     if (s == null) return;
@@ -1008,6 +1233,13 @@ class ChatListViewModel extends ChangeNotifier {
         } else {
           orders.remove(id);
         }
+        _mutate(id, (s) {
+          if (order > 0) {
+            s.folderIds.add(folderId);
+          } else {
+            s.folderIds.remove(folderId);
+          }
+        });
     }
   }
 
@@ -1051,9 +1283,16 @@ class ChatListViewModel extends ChangeNotifier {
       if (recency < 0 || (preserveExistingIfNotNewer && recency == 0)) {
         return;
       }
+      if (recency == 0) {
+        _preserveFresherReadState(summary, existing);
+      }
     }
     if (_meId != null) summary.isSavedMessages = summary.peerUserId == _meId;
-    summary.lastMessage = _previewText(summary.lastMessage);
+    summary.lastMessage = _previewText(
+      summary.lastMessage,
+      chatId: summary.id,
+      senderId: summary.lastChatMessage?.senderId,
+    );
     _indexCommunityPeer(summary.id, raw);
     _resolveForumIfNeeded(summary, raw);
     _resolveCommunityIfNeeded(summary, raw);
@@ -1061,6 +1300,7 @@ class ChatListViewModel extends ChangeNotifier {
     if (cachedJoined == false) {
       _map.remove(summary.id);
       _communityDirectoryChats[summary.id] = summary;
+      _restoreFolderIds(summary);
       // After the chat is in a map: the peer resolution can now complete
       // synchronously off the user cache, and it looks the chat up by id.
       _resolvePeerIfNeeded(summary);
@@ -1083,6 +1323,7 @@ class ChatListViewModel extends ChangeNotifier {
     _viewableCommunityChatIds.remove(summary.id);
     _checkingCommunityChatAccess.remove(summary.id);
     _map[summary.id] = summary;
+    _restoreFolderIds(summary);
     _resolvePeerIfNeeded(summary);
     _applyPositions(summary.id, raw.objects('positions'));
     _resolveSenderIfNeeded(summary.id, raw.obj('last_message'));
@@ -1152,7 +1393,7 @@ class ChatListViewModel extends ChangeNotifier {
     final existing = _communities[id];
     final community = CommunitySummary.fromTd(
       object,
-      collapsed: existing?.collapsed ?? true,
+      collapsed: existing?.collapsed ?? false,
     );
     if (existing == null) {
       _communities[id] = community;
@@ -1171,7 +1412,7 @@ class ChatListViewModel extends ChangeNotifier {
     _client
         .query(communityFullInfoRequest(communityId))
         .then((result) async {
-          final entries = result.objects('peers') ?? const [];
+          final entries = communityCatalogEntries(result);
           for (final entry in entries) {
             if (_disposed) return;
             final chatId = entry.int64('chat_id');
@@ -1184,8 +1425,9 @@ class ChatListViewModel extends ChangeNotifier {
               await _ingestRawChat(raw);
               if (_disposed) return;
               _applyChatCommunityId(chatId, communityId);
+              // Membership resolves after ingestion. Keep the server's grant
+              // even before the chat moves into the non-member directory.
               if (entry.boolean('can_view_history') == true &&
-                  _communityDirectoryChats.containsKey(chatId) &&
                   _viewableCommunityChatIds.add(chatId)) {
                 _scheduleResort();
               } else if (_communityDirectoryChats.containsKey(chatId)) {
@@ -1197,9 +1439,8 @@ class ChatListViewModel extends ChangeNotifier {
           }
         })
         .catchError((_) {
-          // Stock TDLib builds don't expose getCommunityFullInfo. Mithka's
-          // patched builds do; retaining this fallback keeps older sessions
-          // usable until their native library is updated.
+          // Bot API sessions and native libraries older than the upstream
+          // getCommunityFullInfo merge expose no community catalogue.
         })
         .whenComplete(() => _loadingCommunityCatalogs.remove(communityId));
   }
@@ -1369,8 +1610,10 @@ class ChatListViewModel extends ChangeNotifier {
     await prefs.setBool(_communityCollapsedKey(communityId), collapsed);
   }
 
-  String _previewText(String text) {
-    return KeywordBlocker.shared.matches(text)
+  String _previewText(String text, {int? chatId, int? senderId}) {
+    final hidden =
+        chatId != null && HiddenSenderStore.shared.hides(senderId, chatId);
+    return hidden || KeywordBlocker.shared.matches(text)
         ? AppStringKeys.chatListBlockedPlaceholder
         : text;
   }
@@ -1396,6 +1639,7 @@ class ChatListViewModel extends ChangeNotifier {
             : b.date.compareTo(a.date),
       );
     _chats = _projectChats(_selectedFilter.folderId, visible);
+    _refreshFolderUnreadCounts();
     _invalidateEntriesCaches();
     stopwatch.stop();
     AppPerformanceMetrics.chatListResorted(
@@ -1409,6 +1653,62 @@ class ChatListViewModel extends ChangeNotifier {
 
   List<ChatSummary> _visibleChats() =>
       _map.values.where((c) => _joinedChatCache[c.id] ?? true).toList();
+
+  /// Recomputes each folder's unread-chat badge from the chat store.
+  ///
+  /// Telegram's folder badge is a count of unread *chats*, not messages: a
+  /// chat with 50 unread messages still contributes 1. A muted chat counts
+  /// towards the number but not towards [ChatFilterOption.hasUnmutedUnread],
+  /// which is what decides the badge's colour. Native positive folder
+  /// positions and joined-chat visibility are authoritative, exactly as in
+  /// `_projectChats`; independently reapplying folder rules would disagree
+  /// with the visible list while metadata or positions are being refreshed.
+  void _refreshFolderUnreadCounts() {
+    var changed = false;
+    final updated = <ChatFilterOption>[];
+    for (final filter in _filters) {
+      final folderId = filter.folderId;
+      if (folderId == null) {
+        updated.add(filter);
+        continue;
+      }
+      var count = 0;
+      var unmuted = false;
+      final orders = _folderOrders[folderId];
+      if (orders != null) {
+        for (final entry in orders.entries) {
+          final chatId = entry.key;
+          final chat = _map[chatId];
+          if (chat == null ||
+              entry.value <= 0 ||
+              _joinedChatCache[chatId] == false) {
+            continue;
+          }
+          if (!(chat.unreadCount > 0 || chat.isMarkedUnread)) continue;
+          count++;
+          if (!chat.isMuted) unmuted = true;
+        }
+      }
+      if (count != filter.unreadChatCount ||
+          unmuted != filter.hasUnmutedUnread) {
+        changed = true;
+        updated.add(filter.withUnread(count: count, unmuted: unmuted));
+      } else {
+        updated.add(filter);
+      }
+    }
+    if (!changed) return;
+    _filters = updated;
+    final selectedId = _selectedFilter.folderId;
+    if (selectedId != null) {
+      for (final filter in _filters) {
+        if (filter.folderId == selectedId) {
+          _selectedFilter = filter;
+          break;
+        }
+      }
+    }
+  }
 
   List<ChatSummary> _projectChats(int? folderId, List<ChatSummary> visible) {
     if (folderId == null) {
@@ -1431,10 +1731,51 @@ class ChatListViewModel extends ChangeNotifier {
     // callers that then schedule a resort, so drop the projection here too.
     _invalidateEntriesCaches();
     _pendingResortSignals++;
+    // A resort recomputes the folder badges as well, so a badge refresh still
+    // waiting on its debounce is redundant.
+    _badgeTimer?.cancel();
+    _badgeTimer = null;
     if (_resortTimer != null) return;
     // TDLib can deliver many dependent updates in one burst. A 50 ms window
     // keeps the list responsive while avoiding a full sort/rebuild per frame.
     _resortTimer = Timer(const Duration(milliseconds: 50), _resort);
+  }
+
+  /// Debounces the refresh owed by an update that mutates summaries in place
+  /// without changing the sort.
+  ///
+  /// Read state, mute state, titles and photos are not sort keys — [_compare]
+  /// orders by pin, TDLib position and last-message date — and none of them can
+  /// change folder membership or community grouping, which is what
+  /// [_projectChats] and the cached projection are built from. The summaries are
+  /// mutated in place and both the projection and [_entriesCache] hold
+  /// references to them, so the sorted window and its caches stay valid. Of
+  /// everything [_resort] rebuilds, only the folder badges derive from any of
+  /// it, and [_refreshFolderUnreadCounts] is a no-op when nothing unread moved.
+  ///
+  /// Routing these updates through [_scheduleResort] instead dropped every cache
+  /// and re-sorted the whole account to repaint a row. Closing a conversation
+  /// that still had unread messages emits `updateChatReadInbox` while the pop
+  /// transition is running, so that resort landed mid-animation and changed no
+  /// position at all.
+  void _scheduleBadgeRefresh() {
+    if (_disposed) return;
+    // A resort already pending rebuilds the badges too, and it still has to run
+    // because something else moved the list.
+    if (_resortTimer != null) return;
+    if (_badgeTimer != null) return;
+    _badgeTimer = Timer(const Duration(milliseconds: 50), _refreshBadges);
+  }
+
+  /// Recomputes the folder badges and republishes the list, leaving the sort and
+  /// the entry caches alone. Also the synchronous half of
+  /// [_scheduleBadgeRefresh], for the paths a user is watching.
+  void _refreshBadges() {
+    _badgeTimer?.cancel();
+    _badgeTimer = null;
+    if (_disposed) return;
+    _refreshFolderUnreadCounts();
+    _notifyIfAlive();
   }
 
   @visibleForTesting
@@ -1472,6 +1813,24 @@ class ChatListViewModel extends ChangeNotifier {
     return candidate.lastMessageId.compareTo(existing.lastMessageId);
   }
 
+  /// A `getChat` requested by the community catalogue can finish after the
+  /// chat has already been marked read. For the same last-message snapshot,
+  /// the furthest read boundary is authoritative; at an equal boundary the
+  /// smaller unread count reflects more read progress. A genuinely newer last
+  /// message bypasses this merge and is free to add unread messages normally.
+  static void _preserveFresherReadState(
+    ChatSummary candidate,
+    ChatSummary existing,
+  ) {
+    final existingIsFresher =
+        existing.lastReadInboxMessageId > candidate.lastReadInboxMessageId ||
+        (existing.lastReadInboxMessageId == candidate.lastReadInboxMessageId &&
+            existing.unreadCount < candidate.unreadCount);
+    if (!existingIsFresher) return;
+    candidate.lastReadInboxMessageId = existing.lastReadInboxMessageId;
+    candidate.unreadCount = existing.unreadCount;
+  }
+
   static int _compare(ChatSummary a, ChatSummary b) {
     if (a.isPinned != b.isPinned) return a.isPinned ? -1 : 1;
     if (a.order != b.order) return b.order.compareTo(a.order);
@@ -1487,14 +1846,17 @@ class ChatListViewModel extends ChangeNotifier {
     // TDLib emits updateUser before it exposes a user id, and TdUserIndex has
     // been observing since process start — so the peer is normally already
     // cached and the getUser is one round trip per private chat for nothing.
-    final cached = TdUserIndex.shared.userFor(_client.activeSlot, userId);
+    // Both the cache key and the lookup follow this model's account: a picker
+    // kept open for its launching account must not describe slot-7 peers with
+    // slot-0 data.
+    final slot = accountSlot ?? _client.activeSlot;
+    final cached = TdUserIndex.shared.userFor(slot, userId);
     if (cached != null) {
       _applyPeerUser(cached);
       return;
     }
     _resolvingPeers.add(userId);
-    _client
-        .query({'@type': 'getUser', 'user_id': userId})
+    _chatListQuery({'@type': 'getUser', 'user_id': userId})
         .then((user) {
           _resolvingPeers.remove(userId);
           _applyPeerUser(user);

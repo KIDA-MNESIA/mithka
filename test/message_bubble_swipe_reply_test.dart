@@ -16,6 +16,7 @@ import 'package:mithka/chat/custom_emoji.dart';
 import 'package:mithka/chat/message_action_menu.dart';
 import 'package:mithka/chat/message_bubble.dart';
 import 'package:mithka/components/app_icons.dart';
+import 'package:mithka/components/photo_avatar.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/tdlib/td_models.dart';
 import 'package:mithka/theme/app_theme.dart';
@@ -96,8 +97,12 @@ void main() {
   Future<TestGesture> dragLeft(
     WidgetTester tester, {
     required int steps,
+    PointerDeviceKind kind = PointerDeviceKind.touch,
   }) async {
-    final gesture = await tester.startGesture(tester.getCenter(bubbleText));
+    final gesture = await tester.startGesture(
+      tester.getCenter(bubbleText),
+      kind: kind,
+    );
     for (var step = 0; step < steps; step++) {
       await gesture.moveBy(const Offset(-20, 0));
       await tester.pump(const Duration(milliseconds: 16));
@@ -201,6 +206,108 @@ void main() {
     expect(replyIcon, findsNothing);
   });
 
+  testWidgets('a swipe that starts beside the bubble still replies', (
+    tester,
+  ) async {
+    final replied = await pumpBubble(tester);
+    final bubble = tester.getRect(
+      find.byKey(const ValueKey('messageTapTarget-78')),
+    );
+
+    // Far past the bubble's trailing edge. The row is the target, not the
+    // bubble, so a two-word message can be answered from the empty margin.
+    final gesture = await tester.startGesture(
+      Offset(bubble.right + 120, bubble.center.dy),
+    );
+    for (var step = 0; step < 8; step++) {
+      await gesture.moveBy(const Offset(-20, 0));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(replyIcon, findsOneWidget);
+
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(replied()?.id, 78);
+  });
+
+  testWidgets('a swipe that starts on the avatar still replies', (
+    tester,
+  ) async {
+    final replied = await pumpBubble(tester);
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(PhotoAvatar).first),
+    );
+    for (var step = 0; step < 8; step++) {
+      await gesture.moveBy(const Offset(-20, 0));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(replied()?.id, 78);
+  });
+
+  testWidgets('a vertical drag on the row scrolls the transcript', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final preferences = await SharedPreferences.getInstance();
+    final theme = ThemeController(preferences);
+    addTearDown(theme.dispose);
+    final scrollController = ScrollController();
+    addTearDown(scrollController.dispose);
+    ChatMessage? replied;
+    await tester.pumpWidget(
+      ChangeNotifierProvider<ThemeController>.value(
+        value: theme,
+        child: MaterialApp(
+          theme: ThemeData(
+            platform: TargetPlatform.android,
+            extensions: [AppColors.light],
+          ),
+          locale: const Locale('en'),
+          localizationsDelegates: const [AppLocalizations.delegate],
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: ListView(
+              controller: scrollController,
+              children: [
+                MessageBubble(
+                  message: ChatMessage(
+                    id: 78,
+                    isOutgoing: false,
+                    text: 'Swipe me',
+                    date: 1785862260,
+                  ),
+                  peerTitle: 'Test',
+                  isGroup: false,
+                  onReply: (message) => replied = message,
+                ),
+                const SizedBox(height: 1200),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(scrollController.offset, 0);
+
+    final gesture = await tester.startGesture(tester.getCenter(bubbleText));
+    for (var step = 0; step < 8; step++) {
+      await gesture.moveBy(const Offset(0, -30));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    expect(scrollController.offset, greaterThan(0));
+    expect(replied, isNull);
+    expect(replyIcon, findsNothing);
+  });
+
   testWidgets(
     'desktop mouse drag selects text without triggering swipe to reply',
     (tester) async {
@@ -254,6 +361,72 @@ void main() {
     expect(anchor, Rect.fromLTWH(clickPosition.dx, clickPosition.dy, 0, 0));
   });
 
+  for (final platform in [TargetPlatform.windows, TargetPlatform.linux]) {
+    testWidgets(
+      '${platform.name} touch long press uses the right-click action anchor',
+      (tester) async {
+        var actionRequests = 0;
+        Rect? anchor;
+        await pumpBubble(
+          tester,
+          platform: platform,
+          onActionMenu: (_, bounds, _) {
+            actionRequests += 1;
+            anchor = bounds;
+          },
+        );
+
+        final touchPosition = tester.getCenter(bubbleText);
+        final gesture = await tester.startGesture(touchPosition);
+        await tester.pump(kLongPressTimeout + const Duration(milliseconds: 40));
+        await gesture.up();
+        await tester.pump();
+
+        expect(actionRequests, 1);
+        expect(anchor, Rect.fromLTWH(touchPosition.dx, touchPosition.dy, 0, 0));
+        expect(
+          tester.renderObject<RenderParagraph>(bubbleText).selections,
+          isEmpty,
+        );
+      },
+    );
+
+    testWidgets('${platform.name} touch swipe left replies', (tester) async {
+      final replied = await pumpBubble(tester, platform: platform);
+
+      final gesture = await dragLeft(tester, steps: 12);
+      expect(replyIcon, findsOneWidget);
+
+      await gesture.up();
+      await tester.pumpAndSettle();
+
+      expect(replied()?.id, 78);
+      expect(replyIcon, findsNothing);
+    });
+
+    testWidgets(
+      '${platform.name} mouse drag still selects instead of replying',
+      (tester) async {
+        final replied = await pumpBubble(tester, platform: platform);
+
+        final paragraph = tester.renderObject<RenderParagraph>(bubbleText);
+        final gesture = await tester.startGesture(
+          textOffsetToPosition(paragraph, 0),
+          kind: PointerDeviceKind.mouse,
+        );
+        addTearDown(gesture.removePointer);
+        await gesture.moveTo(textOffsetToPosition(paragraph, 5));
+        await gesture.up();
+        await tester.pump();
+
+        expect(paragraph.selections, isNotEmpty);
+        expect(paragraph.selections.single.isCollapsed, isFalse);
+        expect(replied(), isNull);
+        expect(replyIcon, findsNothing);
+      },
+    );
+  }
+
   testWidgets('desktop video secondary-click dispatches one video action', (
     tester,
   ) async {
@@ -294,6 +467,46 @@ void main() {
 
     expect(actionRequests, 1);
     expect(selectedMessage?.id, 80);
+    expect(selectedSource, MessageActionSource.video);
+  });
+
+  testWidgets('windows video touch-hold dispatches one video action', (
+    tester,
+  ) async {
+    var actionRequests = 0;
+    ChatMessage? selectedMessage;
+    MessageActionSource? selectedSource;
+    await pumpBubble(
+      tester,
+      platform: TargetPlatform.windows,
+      message: ChatMessage(
+        id: 83,
+        isOutgoing: false,
+        text: '[Video]',
+        date: 1785862260,
+        contentType: 'messageVideo',
+        video: TdFileRef(id: 403),
+        videoDuration: 75,
+        imageWidth: 1280,
+        imageHeight: 720,
+      ),
+      onActionMenu: (message, _, source) {
+        actionRequests += 1;
+        selectedMessage = message;
+        selectedSource = source;
+      },
+    );
+
+    final playIcon = find.byWidgetPredicate(
+      (widget) => widget is AppIcon && widget.icon == HeroAppIcons.play,
+    );
+    final gesture = await tester.startGesture(tester.getCenter(playIcon));
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 40));
+    await gesture.up();
+    await tester.pump();
+
+    expect(actionRequests, 1);
+    expect(selectedMessage?.id, 83);
     expect(selectedSource, MessageActionSource.video);
   });
 

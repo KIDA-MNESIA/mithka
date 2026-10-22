@@ -19,6 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app/chat_deep_link_controller.dart';
 import '../settings/country_chat_blocker.dart';
+import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../tdlib/chat_membership.dart';
 import '../tdlib/json_helpers.dart';
@@ -182,6 +183,11 @@ class NotificationController with WidgetsBindingObserver, ChangeNotifier {
           defaultPresentSound: false,
           defaultPresentBadge: false,
         ),
+        windows: WindowsInitializationSettings(
+          appName: 'Mithka',
+          appUserModelId: 'Iebb.Mithka.Desktop',
+          guid: '19a46b98-1781-4d9e-92ed-bd0576e48e2d',
+        ),
       ),
       onDidReceiveNotificationResponse: _openNotification,
     );
@@ -209,7 +215,17 @@ class NotificationController with WidgetsBindingObserver, ChangeNotifier {
           AndroidFlutterLocalNotificationsPlugin
         >()
         ?.createNotificationChannel(_androidChannel);
-    _sub = _client.subscribeAll().listen(_handle);
+    _sub = _client
+        .updatesOfAny(const [
+          'updateConnectionState',
+          'updateChatReadInbox',
+          'updateChatNotificationSettings',
+          'updateScopeNotificationSettings',
+          'updateBasicGroup',
+          'updateSupergroup',
+          'updateNewMessage',
+        ], allAccounts: true)
+        .listen(_handle);
     _ready = true;
     // Foreground banners don't require notification permission. Subscribe
     // before asking so an OS permission sheet can't create a blind spot.
@@ -368,6 +384,10 @@ class NotificationController with WidgetsBindingObserver, ChangeNotifier {
 
     final messageText = _notificationText(content);
     if (KeywordBlocker.shared.matches(messageText)) return;
+    // Same id space as ChatMessage.senderId: users positive, chats negative.
+    final sender = raw.obj('sender_id');
+    final senderId = sender?.int64('user_id') ?? sender?.int64('chat_id');
+    if (HiddenSenderStore.shared.hides(senderId, chatId)) return;
     final surface = notificationSurfaceFor(
       lifecycleState: _state,
       inAppBannersEnabled: _inAppBannersEnabled,

@@ -2,8 +2,10 @@ import 'package:flutter/foundation.dart';
 
 import 'quick_reaction_choice.dart';
 
+final RegExp _variationSelectors = RegExp('[\uFE0E\uFE0F]');
+
 String normalizedReactionEmoji(String emoji) =>
-    emoji.replaceAll(RegExp('[\uFE0E\uFE0F]'), '');
+    emoji.replaceAll(_variationSelectors, '');
 
 class MessageReactionUnavailableException implements Exception {
   const MessageReactionUnavailableException();
@@ -12,11 +14,15 @@ class MessageReactionUnavailableException implements Exception {
   String toString() => 'Reaction is unavailable for this message';
 }
 
+/// Whether the action overlay carries reaction controls.
+///
+/// Desktop draws them as a strip on top of the context menu, touch as the
+/// rounded bar above the pressed message. Neither has anything to offer for a
+/// call log, or for a message the server allows no reactions on.
 bool messageActionShowsReactionControls({
-  required bool isDesktop,
   required bool isCall,
   required MessageReactionAvailability? availability,
-}) => !isDesktop && !isCall && availability?.canAdd == true;
+}) => !isCall && availability?.canAdd == true;
 
 bool messageReactionAvailabilityResultIsCurrent({
   required int requestGeneration,

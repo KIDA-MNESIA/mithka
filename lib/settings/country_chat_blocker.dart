@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import '../config/build_flags.dart';
 import '../notifications/notification_settings_payload.dart';
+import '../settings/ghost_mode_controller.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import 'country_message_filter.dart';
@@ -270,6 +272,11 @@ class CountryChatBlocker {
   }
 
   Future<void> _markRead(int chatId, int messageId, int clientId) async {
+    // Ghost mode leaves blocked-country messages unread on the server too.
+    if (allowTelegramTosViolations &&
+        GhostModeController.shared.shouldBlockRead(chatId).isBlock) {
+      return;
+    }
     try {
       await _query({
         '@type': 'viewMessages',

@@ -87,6 +87,21 @@ class AppearanceView extends StatelessWidget {
                 ),
               ),
             ]),
+          SettingsSection(
+            titleKey: AppStringKeys.featureBottomTabs,
+            rows: [
+              SettingsSwitchRow(
+                key: const ValueKey('settings-liquid-glass-bottom-bar'),
+                title: AppStringKeys.featureLiquidGlassBottomBar,
+                subtitle: AppStringKeys.featureLiquidGlassBottomBarHint,
+                value: theme.liquidGlassBottomBar,
+                leading: const SettingsLeadingIcon(
+                  icon: HeroAppIcons.wandMagicSparkles,
+                ),
+                onChanged: (value) => theme.liquidGlassBottomBar = value,
+              ),
+            ],
+          ),
           _label(context, AppStrings.t(AppStringKeys.appearanceSectionText)),
           _card(context, [
             KeyedSubtree(
@@ -529,44 +544,54 @@ class _SenderNameReadabilityPreview extends StatelessWidget {
             incomingBackground.foregroundColor ?? c.bubbleIncomingText;
         final colors = messageNameColorsForTheme(cloudTheme);
         final sample = AppStrings.t(AppStringKeys.appearancePreviewUsersSample);
+        // The wallpaper expands to its constraints, and a settings list gives
+        // its children unbounded height, so wrapping the names in it forces an
+        // infinite height and the page lays out blank. It fills behind them
+        // instead, leaving the names to decide how tall the preview is.
         return ClipRRect(
           key: const ValueKey('senderNameReadabilityPreview'),
           borderRadius: BorderRadius.circular(AppRadius.card),
-          child: ChatWallpaperBackground(
-            wallpaper: selected == null
-                ? null
-                : wallpaperController.resolvedWallpaper(selected),
-            fallbackColor: c.chatBackground,
-            brightness: Theme.of(context).brightness,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppSpacing.xl,
-                vertical: AppSpacing.xxl,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: ChatWallpaperBackground(
+                  wallpaper: selected == null
+                      ? null
+                      : wallpaperController.resolvedWallpaper(selected),
+                  fallbackColor: c.chatBackground,
+                  brightness: Theme.of(context).brightness,
+                ),
               ),
-              child: Wrap(
-                spacing: AppSpacing.lg,
-                runSpacing: AppSpacing.lg,
-                alignment: WrapAlignment.center,
-                children: [
-                  for (final color in colors)
-                    SenderIdentityPills(
-                      readabilityMode: theme.senderNameReadabilityMode,
-                      bubbleColor: bubbleColor,
-                      textColor: bubbleTextColor,
-                      name: sample,
-                      nameStyle: TextStyle(fontSize: 12, color: color),
-                      // The background treatment is a tag joined to the name,
-                      // so previewing it without a tag would hide half of what
-                      // is being chosen.
-                      role:
-                          theme.senderNameReadabilityMode ==
-                              SenderNameReadabilityMode.background
-                          ? MemberRole.admin
-                          : null,
-                    ),
-                ],
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.xl,
+                  vertical: AppSpacing.xxl,
+                ),
+                child: Wrap(
+                  spacing: AppSpacing.lg,
+                  runSpacing: AppSpacing.lg,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    for (final color in colors)
+                      SenderIdentityPills(
+                        readabilityMode: theme.senderNameReadabilityMode,
+                        bubbleColor: bubbleColor,
+                        textColor: bubbleTextColor,
+                        name: sample,
+                        nameStyle: TextStyle(fontSize: 12, color: color),
+                        // The background treatment is a tag joined to the name,
+                        // so previewing it without a tag would hide half of what
+                        // is being chosen.
+                        role:
+                            theme.senderNameReadabilityMode ==
+                                SenderNameReadabilityMode.background
+                            ? MemberRole.admin
+                            : null,
+                      ),
+                  ],
+                ),
               ),
-            ),
+            ],
           ),
         );
       },
@@ -1400,6 +1425,26 @@ class ChatFolderSettingsView extends StatelessWidget {
                 theme.chatFolderDisplayMode == mode,
                 () => theme.chatFolderDisplayMode = mode,
               ),
+          ]),
+          const AppearanceView()._label(
+            context,
+            AppStrings.t(AppStringKeys.appearanceUnreadBadge),
+          ),
+          const AppearanceView()._card(context, [
+            const AppearanceView()._toggleRow(
+              context,
+              HeroAppIcons.solidBell.data,
+              AppStrings.t(AppStringKeys.appearanceShowFolderBadges),
+              theme.showFolderUnreadBadges,
+              (value) => theme.showFolderUnreadBadges = value,
+            ),
+            const AppearanceView()._toggleRow(
+              context,
+              HeroAppIcons.solidBell.data,
+              AppStrings.t(AppStringKeys.appearanceCapUnreadCountAt99),
+              theme.capUnreadBadgeAt99,
+              (value) => theme.capUnreadBadgeAt99 = value,
+            ),
           ]),
         ],
       ),

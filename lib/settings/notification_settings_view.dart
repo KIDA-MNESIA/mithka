@@ -10,8 +10,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../app/primary_chat_launcher.dart';
 import '../auth/account_store.dart';
 import '../components/app_icons.dart';
+import '../components/app_interactive_surface.dart';
 import '../components/ui_components.dart';
 import '../l10n/app_localizations.dart';
 import '../notifications/notification_preferences.dart';
@@ -22,13 +24,7 @@ import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
-
-String _notificationExceptionCount(int count) => AppStrings.t(
-  count == 1
-      ? AppStringKeys.notificationException
-      : AppStringKeys.notificationExceptions,
-  {'value1': count},
-);
+import 'notification_exceptions_sheet.dart';
 
 class NotificationSettingsView extends StatefulWidget {
   const NotificationSettingsView({super.key, this.showBackButton = true});
@@ -113,19 +109,7 @@ class _NotificationSettingsViewState extends State<NotificationSettingsView> {
         });
         loadedSettings[scope] = Map<String, dynamic>.from(result);
       } catch (_) {}
-      try {
-        final result = await _client.query({
-          '@type': 'getChatNotificationSettingsExceptions',
-          'scope': {'@type': scope},
-          'compare_sound': true,
-        });
-        loadedExceptions[scope] =
-            result.int64Array('chat_ids')?.length ??
-            result.integer('total_count') ??
-            0;
-      } catch (_) {
-        loadedExceptions[scope] = 0;
-      }
+      loadedExceptions[scope] = await _countExceptions(scope);
     }
 
     var defaultSoundId = loadedSettings.values
@@ -157,17 +141,9 @@ class _NotificationSettingsViewState extends State<NotificationSettingsView> {
       }
     } catch (_) {}
 
-    try {
-      final storyExceptions = await _client.query({
-        '@type': 'getStoryNotificationSettingsExceptions',
-      });
-      loadedExceptions['stories'] =
-          storyExceptions.int64Array('chat_ids')?.length ??
-          storyExceptions.integer('total_count') ??
-          0;
-    } catch (_) {
-      loadedExceptions['stories'] = 0;
-    }
+    loadedExceptions[storiesNotificationScope] = await _countExceptions(
+      storiesNotificationScope,
+    );
 
     _loadInProgress = false;
     if (!mounted) return;
@@ -211,10 +187,51 @@ class _NotificationSettingsViewState extends State<NotificationSettingsView> {
     enabled ? AppStringKeys.privacyEnabled : AppStringKeys.privacyDisabled,
   );
 
-  String _exceptionsLabel(String key) {
-    final count = _exceptionCounts[key] ?? 0;
-    if (count == 0) return '';
-    return _notificationExceptionCount(count);
+  /// Reads the number of chats deviating from [scope] from the server.
+  ///
+  /// The count and the sheet request the same list, so the number on the row
+  /// always matches the rows the sheet can show.
+  Future<int> _countExceptions(String scope) async {
+    try {
+      final result = scope == storiesNotificationScope
+          ? await _client.query({
+              '@type': 'getStoryNotificationSettingsExceptions',
+            })
+          : await _client.query({
+              '@type': 'getChatNotificationSettingsExceptions',
+              'scope': {'@type': scope},
+              'compare_sound': true,
+            });
+      return result.int64Array('chat_ids')?.length ??
+          result.integer('total_count') ??
+          0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Re-reads one scope's count after the sheet reset a chat.
+  Future<void> _refreshExceptionCount(String scope) async {
+    final count = await _countExceptions(scope);
+    if (!mounted) return;
+    setState(() => _exceptionCounts[scope] = count);
+  }
+
+  Future<void> _openExceptions(
+    String scope,
+    String title,
+    Map<String, dynamic> settings,
+  ) async {
+    if ((_exceptionCounts[scope] ?? 0) == 0) return;
+    await showNotificationExceptionsSheet(
+      context: context,
+      scope: scope,
+      title: title,
+      scopeSettings: settings,
+      onOpenChat: (chatId, chatTitle) =>
+          openChatFromCurrentWindow(context, chatId: chatId, title: chatTitle),
+      onExceptionsChanged: () => _refreshExceptionCount(scope),
+    );
   }
 
   Future<void> _setScopeSettings(
@@ -352,42 +369,42 @@ class _NotificationSettingsViewState extends State<NotificationSettingsView> {
               key: const ValueKey('notification-section-telegram'),
               titleKey: AppStringKeys.notificationMessageNotifications,
               rows: [
-                _navigationRow(
+                _scopeRow(
+                  scope: _private,
                   icon: HeroAppIcons.circleUser,
                   title: AppStrings.t(
                     AppStringKeys.notificationPrivateMessages,
                   ),
-                  subtitle: _exceptionsLabel(_private),
                   value: _enabledLabel(_enabled(_private)),
                   onTap: () => _openScope(
                     _private,
                     AppStrings.t(AppStringKeys.notificationPrivateMessages),
                   ),
                 ),
-                _navigationRow(
+                _scopeRow(
+                  scope: _group,
                   icon: HeroAppIcons.users,
                   title: AppStrings.t(AppStringKeys.notificationGroupMessages),
-                  subtitle: _exceptionsLabel(_group),
                   value: _enabledLabel(_enabled(_group)),
                   onTap: () => _openScope(
                     _group,
                     AppStrings.t(AppStringKeys.notificationGroupMessages),
                   ),
                 ),
-                _navigationRow(
+                _scopeRow(
+                  scope: _channel,
                   icon: HeroAppIcons.towerBroadcast,
                   title: AppStrings.t(AppStringKeys.notificationChannels),
-                  subtitle: _exceptionsLabel(_channel),
                   value: _enabledLabel(_enabled(_channel)),
                   onTap: () => _openScope(
                     _channel,
                     AppStrings.t(AppStringKeys.notificationChannels),
                   ),
                 ),
-                _navigationRow(
+                _scopeRow(
+                  scope: storiesNotificationScope,
                   icon: HeroAppIcons.circleNotch,
                   title: AppStrings.t(AppStringKeys.notificationStories),
-                  subtitle: _exceptionsLabel('stories'),
                   value: _storySummary,
                   onTap: _openStories,
                 ),
@@ -481,6 +498,191 @@ class _NotificationSettingsViewState extends State<NotificationSettingsView> {
     leading: SettingsLeadingIcon(icon: icon),
     onTap: onTap,
   );
+
+  /// A scope row whose exception count opens the chats behind it.
+  ///
+  /// The count is its own tap target: the rest of the row keeps opening the
+  /// scope's notification settings.
+  Widget _scopeRow({
+    required String scope,
+    required AppIconData icon,
+    required String title,
+    required String value,
+    required VoidCallback onTap,
+  }) {
+    final count = _exceptionCounts[scope] ?? 0;
+    return _ScopeSettingsRow(
+      key: ValueKey('notification-scope-$scope'),
+      icon: icon,
+      title: title,
+      value: value,
+      exceptionCount: count,
+      exceptionsKey: ValueKey('notification-exceptions-$scope'),
+      onTap: onTap,
+      onExceptionsTap: count == 0
+          ? null
+          : () => unawaited(
+              _openExceptions(
+                scope,
+                title,
+                Map<String, dynamic>.from(
+                  (scope == storiesNotificationScope
+                          ? _settings[_private]
+                          : _settings[scope]) ??
+                      const {},
+                ),
+              ),
+            ),
+    );
+  }
+}
+
+/// A scope row that keeps the settings-row metrics while giving its exception
+/// count a tap target of its own.
+///
+/// [SettingsRow] deliberately makes its trailing slot inert whenever the row
+/// itself is tappable, which would swallow the count. The row therefore lays
+/// out the same parts here: leading icon, title, optional value, chevron.
+class _ScopeSettingsRow extends StatelessWidget {
+  const _ScopeSettingsRow({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.value,
+    required this.exceptionCount,
+    required this.exceptionsKey,
+    required this.onTap,
+    required this.onExceptionsTap,
+  });
+
+  final AppIconData icon;
+  final String title;
+  final String value;
+  final int exceptionCount;
+  final Key exceptionsKey;
+  final VoidCallback onTap;
+  final VoidCallback? onExceptionsTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final pointerDense = isDesktopTargetPlatform();
+    final gap = pointerDense ? AppSpacing.md : AppSpacing.lg;
+    final verticalPadding = pointerDense ? AppSpacing.sm : AppSpacing.md;
+    return AppInteractiveSurface(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(AppRadius.sm),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(minHeight: SettingsRow.resolveHeight()),
+        child: Padding(
+          padding: EdgeInsetsDirectional.only(
+            start: pointerDense
+                ? AppSpacing.lg
+                : AppMetric.settingsLeadingInset,
+            end: pointerDense ? AppSpacing.lg : AppMetric.settingsTrailingInset,
+            top: verticalPadding,
+            bottom: verticalPadding,
+          ),
+          child: Row(
+            children: [
+              SettingsLeadingIcon(icon: icon),
+              SizedBox(width: gap),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: pointerDense
+                          ? AppTextStyle.callout(c.textPrimary)
+                          : AppTextStyle.body(c.textPrimary),
+                    ),
+                    if (exceptionCount > 0) ...[
+                      const SizedBox(height: AppSpacing.xxs),
+                      _ExceptionCountAction(
+                        key: exceptionsKey,
+                        count: exceptionCount,
+                        onTap: onExceptionsTap,
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (value.isNotEmpty) ...[
+                SizedBox(width: gap),
+                Expanded(
+                  flex: 2,
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 190),
+                      child: Text(
+                        value,
+                        textAlign: TextAlign.right,
+                        style: pointerDense
+                            ? AppTextStyle.caption(c.textTertiary)
+                            : AppTextStyle.footnote(c.textTertiary),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              SizedBox(width: pointerDense ? AppSpacing.sm : AppSpacing.md),
+              AppIcon(
+                HeroAppIcons.chevronRight,
+                size: pointerDense ? AppIconSize.sm : AppIconSize.chevron,
+                color: c.textTertiary,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ExceptionCountAction extends StatelessWidget {
+  const _ExceptionCountAction({
+    super.key,
+    required this.count,
+    required this.onTap,
+  });
+
+  final int count;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    return AppInteractiveSurface(
+      onTap: onTap,
+      isButton: true,
+      borderRadius: BorderRadius.circular(AppRadius.control),
+      child: Padding(
+        padding: const EdgeInsetsDirectional.fromSTEB(
+          0,
+          AppSpacing.sm,
+          AppSpacing.xs,
+          AppSpacing.sm,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              notificationExceptionCountLabel(count),
+              style: AppTextStyle.footnote(
+                c.linkBlue,
+                weight: AppTextWeight.medium,
+              ),
+            ),
+            const SizedBox(width: 1),
+            AppIcon(HeroAppIcons.chevronRight, size: 11, color: c.linkBlue),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _AccountNotificationSelectionView extends StatefulWidget {
@@ -692,7 +894,7 @@ class _ScopeNotificationSettingsViewState
           ),
         ],
         _NotificationFootnote(
-          _notificationExceptionCount(widget.exceptionCount),
+          notificationExceptionCountLabel(widget.exceptionCount),
         ),
       ],
     );
@@ -811,7 +1013,7 @@ class _StoryNotificationSettingsViewState
           ),
         ],
         _NotificationFootnote(
-          _notificationExceptionCount(widget.exceptionCount),
+          notificationExceptionCountLabel(widget.exceptionCount),
         ),
       ],
     );

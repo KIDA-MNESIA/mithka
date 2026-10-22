@@ -1,9 +1,10 @@
 package ad.neko.mithka
 
+import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
-import android.content.ClipDescription
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -22,7 +23,10 @@ import android.util.Log
 import android.view.DragEvent
 import android.view.WindowManager
 import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.iebb.f_videoplayer_pip.FVideoPictureInPicturePlugin
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.languageid.LanguageIdentification
@@ -50,10 +54,12 @@ class MainActivity : FlutterFragmentActivity() {
     private var telegramPasskeys: TelegramPasskeyPlugin? = null
     private var accountBackup: AccountBackupPlugin? = null
     private var mithkaPro: MithkaProPlugin? = null
+    private var nowPlaying: NowPlayingPlugin? = null
     private var mediaDropChannel: MethodChannel? = null
     private var shareIntentChannel: MethodChannel? = null
     private var pendingSharePayload: Map<String, Any?>? = null
     private var acceptingImageDrop = false
+    private var fullscreenSystemUi = false
     private val translators = mutableMapOf<String, Translator>()
     private val languageIdentifierDelegate = lazy<LanguageIdentifier> {
         LanguageIdentification.getClient()
@@ -75,6 +81,23 @@ class MainActivity : FlutterFragmentActivity() {
     override fun onResume() {
         super.onResume()
         FVideoPictureInPicturePlugin.onActivityResumed(this)
+        if (fullscreenSystemUi) applyFullscreenSystemUi()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && fullscreenSystemUi) applyFullscreenSystemUi()
+    }
+
+    private fun applyFullscreenSystemUi() {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (fullscreenSystemUi) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
     }
 
     override fun onPause() {
@@ -111,6 +134,16 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         registerPlugins(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mithka/fullscreen_system_ui")
+            .setMethodCallHandler { call, result ->
+                if (call.method == "setFullscreen") {
+                    fullscreenSystemUi = call.arguments == true
+                    applyFullscreenSystemUi()
+                    result.success(null)
+                } else {
+                    result.notImplemented()
+                }
+            }
         configureShareIntentChannel(flutterEngine)
         telegramPasskeys = TelegramPasskeyPlugin(
             this,
@@ -122,6 +155,10 @@ class MainActivity : FlutterFragmentActivity() {
         )
         mithkaPro = MithkaProPlugin(
             this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
+        nowPlaying = NowPlayingPlugin(
+            applicationContext,
             flutterEngine.dartExecutor.binaryMessenger,
         )
         val plugin = CallMediaPlugin(
@@ -237,6 +274,25 @@ class MainActivity : FlutterFragmentActivity() {
                 }
             }
 
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "mithka/app_lock_privacy",
+        ).setMethodCallHandler { call, result ->
+            if (call.method != "setPrivacyShieldVisible") {
+                result.notImplemented()
+                return@setMethodCallHandler
+            }
+            val visible = call.argument<Boolean>("visible") ?: false
+            runOnUiThread {
+                if (visible) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+            result.success(null)
+        }
+
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mithka/player_brightness")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -322,6 +378,66 @@ class MainActivity : FlutterFragmentActivity() {
             .setMethodCallHandler { call, result ->
                 var clipboardDescription: ClipDescription? = null
                 val requestedMimeType: String?
+                if (call.method == "writeImage") {
+                    val bytes = call.arguments as? ByteArray
+                    if (bytes == null || bytes.isEmpty()) {
+                        result.success(false)
+                        return@setMethodCallHandler
+                    }
+                    val mimeType = when {
+                        bytes.size >= 4 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() &&
+                            bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte() -> "image/png"
+                        bytes.size >= 4 && bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte() &&
+                            bytes[2] == 0x46.toByte() && bytes[3] == 0x38.toByte() -> "image/gif"
+                        bytes.size >= 3 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
+                            bytes[2] == 0xFF.toByte() -> "image/jpeg"
+                        bytes.size >= 12 && bytes[0] == 0x52.toByte() && bytes[1] == 0x49.toByte() &&
+                            bytes[2] == 0x46.toByte() && bytes[3] == 0x46.toByte() &&
+                            bytes[8] == 0x57.toByte() && bytes[9] == 0x45.toByte() &&
+                            bytes[10] == 0x42.toByte() && bytes[11] == 0x50.toByte() -> "image/webp"
+                        else -> {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                    }
+                    val clipboard =
+                        getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    // Android's clipboard has no raw-bytes clip: an image
+                    // must be shared as a content URI other apps can resolve.
+                    // Write the bytes to this app's cache and hand the clip a
+                    // FileProvider URI from the open_filex provider already
+                    // merged into the manifest (it covers cache-path).
+                    val extension = when (mimeType) {
+                        "image/gif" -> "gif"
+                        "image/jpeg" -> "jpg"
+                        "image/webp" -> "webp"
+                        else -> "png"
+                    }
+                    try {
+                        val directory = File(cacheDir, "clipboard")
+                        if (!directory.exists()) directory.mkdirs()
+                        // One image per copy: drop the previous clip's file so
+                        // repeated copies cannot grow the cache without bound.
+                        directory.listFiles()?.forEach { it.delete() }
+                        val file = File(
+                            directory,
+                            "image-${System.currentTimeMillis()}.$extension"
+                        )
+                        file.writeBytes(bytes)
+                        val uri = FileProvider.getUriForFile(
+                            this,
+                            "$packageName.fileProvider.com.crazecoder.openfile",
+                            file
+                        )
+                        clipboard.setPrimaryClip(
+                            ClipData.newUri(contentResolver, mimeType, uri)
+                        )
+                        result.success(true)
+                    } catch (error: Exception) {
+                        result.success(false)
+                    }
+                    return@setMethodCallHandler
+                }
                 val uri = when (call.method) {
                     "readImage" -> {
                         val clipboard =
@@ -781,8 +897,13 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private fun registerPlugins(flutterEngine: FlutterEngine) {
+        // Keep per-plugin isolation while matching the generated production registry.
+        // test/android_plugin_registration_test.dart guards dependency drift.
         val pluginClasses = buildList {
+            add("com.llfbandit.app_links.AppLinksPlugin")
             add("com.ryanheise.audio_session.AudioSessionPlugin")
+            add("io.flutter.plugins.camerax.CameraAndroidCameraxPlugin")
+            add("com.fluttercavalry.fc_native_video_thumbnail.FcNativeVideoThumbnailPlugin")
             add("com.mr.flutter.plugin.filepicker.FilePickerPlugin")
             add("io.flutter.plugins.firebase.analytics.FlutterFirebaseAnalyticsPlugin")
             add("io.flutter.plugins.firebase.core.FlutterFirebaseCorePlugin")
@@ -795,16 +916,21 @@ class MainActivity : FlutterFragmentActivity() {
             add("io.flutter.plugins.imagepicker.ImagePickerPlugin")
             add("com.fluttercandies.photo_manager.PhotoManagerPlugin")
             add("com.github.dart_lang.jni.JniPlugin")
+            add("com.gurfdev.light_compressor_v2.LightCompressorPlugin")
             add("io.flutter.plugins.localauth.LocalAuthPlugin")
+            add("dev.steenbakker.mobile_scanner.MobileScannerPlugin")
             add("com.crazecoder.openfile.OpenFilePlugin")
             add("dev.fluttercommunity.plus.packageinfo.PackageInfoPlugin")
             add("io.flutter.plugins.pathprovider.PathProviderPlugin")
             add("com.baseflow.permissionhandler.PermissionHandlerPlugin")
+            add("com.llfbandit.record.RecordPlugin")
+            add("dev.fluttercommunity.plus.sensors.SensorsPlugin")
             add("io.sentry.flutter.SentryFlutterPlugin")
             add("io.flutter.plugins.sharedpreferences.SharedPreferencesPlugin")
             add("com.iebb.f_videoplayer_pip.FVideoPictureInPicturePlugin")
             add("io.flutter.plugins.urllauncher.UrlLauncherPlugin")
             add("io.flutter.plugins.videoplayer.VideoPlayerPlugin")
+            add("io.flutter.plugins.webviewflutter.WebViewFlutterPlugin")
         }
 
         for (className in pluginClasses) {
@@ -1034,6 +1160,8 @@ class MainActivity : FlutterFragmentActivity() {
         accountBackup = null
         mithkaPro?.dispose()
         mithkaPro = null
+        nowPlaying?.dispose()
+        nowPlaying = null
         callMedia?.dispose()
         callMedia = null
         super.cleanUpFlutterEngine(flutterEngine)

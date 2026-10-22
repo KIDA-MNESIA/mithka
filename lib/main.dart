@@ -41,7 +41,10 @@ import 'app/desktop_video_window.dart';
 import 'app/desktop_window_controls.dart';
 import 'app/global_video_split_host.dart';
 import 'app/handoff_service.dart';
+import 'app/horizontal_safe_viewport.dart';
+import 'app/scaled_app_view.dart';
 import 'app/telemetry_config.dart';
+import 'app/video_window_telemetry.dart';
 import 'auth/account_store.dart';
 import 'auth/auth_manager.dart';
 import 'call/call_manager.dart';
@@ -49,11 +52,15 @@ import 'call/call_overlay_host.dart';
 import 'chat/animated_sticker_view.dart';
 import 'chat/chat_view.dart';
 import 'chat/group_remark_controller.dart';
+import 'chat/link_preview_fixer.dart';
 import 'chat/music_player_controller.dart';
+import 'chats/chat_folder_tag_controller.dart';
 import 'components/drawer_controller.dart' as dc;
-import 'components/keyboard_dismiss_on_tap.dart';
+import 'config/build_flags.dart';
+import 'history/message_history_store.dart';
 import 'l10n/app_locale_controller.dart';
 import 'l10n/app_localizations.dart';
+import 'media/video_playback_reporting.dart';
 import 'media/video_view_compatibility.dart';
 import 'notifications/in_app_notification_banner.dart';
 import 'notifications/notification_controller.dart';
@@ -73,6 +80,8 @@ import 'settings/business_service.dart';
 import 'settings/country_message_filter.dart';
 import 'settings/desktop_hotkey_controller.dart';
 import 'settings/developer_mode_controller.dart';
+import 'settings/ghost_mode_controller.dart';
+import 'settings/hidden_sender_store.dart';
 import 'settings/keyword_blocker.dart';
 import 'settings/safety_notice_controller.dart';
 import 'settings/sensitive_content_controller.dart';
@@ -108,6 +117,7 @@ Future<void> main(List<String> arguments) async {
     if (videoArguments != null) {
       _initializeVideoBackend(installGlobalLogHandler: false);
       await _preloadLocaleCatalogue();
+      await initializeVideoWindowTelemetry();
       runApp(DesktopVideoWindowApp(arguments: videoArguments));
       return;
     }
@@ -240,9 +250,24 @@ Future<void> _bootstrapAndRunApp() async {
   ]);
   DesktopHotkeyController.initializeShared(prefs, replace: true);
   KeywordBlocker.shared.initialize(prefs);
+  LinkPreviewFixer.shared.initialize(prefs);
+  HiddenSenderStore.shared.initialize(prefs);
   CountryMessageFilter.shared.initialize(prefs);
+  // Compile-time gated: reads persisted ghost-mode prefs and pushes the
+  // `online` TDLib option only in opted-in self-built binaries.
+  if (allowTelegramTosViolations) {
+    GhostModeController.shared.initialize(prefs);
+  }
   unawaited(SensitiveContentController.shared.initialize());
   MusicPlayerController.shared.initialize(prefs);
+  // Telegram §1.4 exception: the deleted/edited message mirror exists only in
+  // opted-in self-builds — with the flag off nothing is subscribed, read or
+  // written, and old saved state stays inert.
+  if (allowTelegramTosViolations) {
+    MessageHistoryStore.shared.initialize(prefs);
+    unawaited(MessageHistoryStore.shared.ensureLoaded());
+    MessageHistoryStore.shared.startObserving();
+  }
   // Preload Telegram blocked-user list so chat filters have data right away.
   unawaited(BlockedUserService.shared.loadBlockedUsers());
   // Firebase + analytics + Sentry tags are several platform-channel round
@@ -343,8 +368,9 @@ void _configureSentry(SentryFlutterOptions options) {
   options.sendDefaultPii = false;
   options.tracesSampleRate = sentryTracesSampleRate;
   options.maxBreadcrumbs = 200;
-  options.beforeSend = (event, hint) =>
-      _isGoogleFontLoadFailure(event) ? null : event;
+  options.beforeSend = (event, hint) => _isGoogleFontLoadFailure(event)
+      ? null
+      : sanitizeVideoPlaybackEvent(event);
 }
 
 bool _isGoogleFontLoadFailure(SentryEvent event) {
@@ -423,6 +449,9 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
     widget.prefs,
     initialAccountUserId: _accounts.activeUserId,
   );
+  late final ChatFolderTagController _folderTags = ChatFolderTagController(
+    widget.prefs,
+  );
   late AppIconController _appIcons = AppIconController(widget.prefs);
   late final AutoDownloadMediaController _autoDownload =
       AutoDownloadMediaController.shared;
@@ -450,10 +479,12 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    MusicPlayerController.shared.setActiveAccountSlot(_accounts.activeSlot);
     WidgetsBinding.instance.addObserver(this);
     _performance.start();
     _accounts.addListener(_handleActiveAccountChange);
     _theme.addListener(_handleThemePreferencesChange);
+    HiddenSenderStore.shared.addListener(_handleHiddenSendersChange);
     BusinessQuickReplyService.shared.startPreloading(
       enabled: _theme.quickRepliesEnabled,
     );
@@ -494,6 +525,7 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
       ),
     );
     unawaited(_appIcons.initialize());
+    unawaited(_folderTags.refresh());
     unawaited(_accounts.recoverPendingAddOnStartup(_auth));
     NotificationController.shared.start(widget.prefs);
     // An iOS registerForRemoteNotifications round trip that nothing observes
@@ -509,7 +541,9 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
     _performance.dispose();
     _accounts.removeListener(_handleActiveAccountChange);
     _theme.removeListener(_handleThemePreferencesChange);
+    HiddenSenderStore.shared.removeListener(_handleHiddenSendersChange);
     _groupRemarks.dispose();
+    _folderTags.dispose();
     DesktopMiniAppWindowService.instance.detachMainProxy();
     DesktopChatWindowService.instance.detachMainProxy();
     DesktopUtilityWindowService.instance.detachMainProxy();
@@ -519,7 +553,9 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
   }
 
   void _handleActiveAccountChange() {
+    MusicPlayerController.shared.setActiveAccountSlot(_accounts.activeSlot);
     _groupRemarks.setActiveAccountUserId(_accounts.activeUserId);
+    unawaited(_folderTags.refresh());
     _theme.setActiveAccountSlot(
       _accounts.activeSlot,
       userId: _accounts.activeUserId,
@@ -534,6 +570,12 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
       if (account.slot == slot) return account.userId;
     }
     return null;
+  }
+
+  /// Hidden members changed here, or a child window asked this one to
+  /// re-read them: every other window re-reads them too.
+  void _handleHiddenSendersChange() {
+    unawaited(DesktopChatWindowService.instance.notifyPresentationChanged());
   }
 
   void _handleThemePreferencesChange() {
@@ -612,7 +654,11 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
 
         _autoDownload.initialize(widget.prefs);
         KeywordBlocker.shared.initialize(widget.prefs);
+        HiddenSenderStore.shared.initialize(widget.prefs);
         CountryMessageFilter.shared.initialize(widget.prefs);
+        if (allowTelegramTosViolations) {
+          GhostModeController.shared.initialize(widget.prefs);
+        }
         MusicPlayerController.shared.initialize(widget.prefs);
         BlockedUserService.shared.enabled = nextTheme.hideBlockedUserMessages;
         if (nextTheme.hideBlockedUserMessages) {
@@ -757,6 +803,7 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
         ChangeNotifierProvider.value(value: _locale),
         ChangeNotifierProvider.value(value: _accounts),
         ChangeNotifierProvider.value(value: _groupRemarks),
+        ChangeNotifierProvider.value(value: _folderTags),
         ChangeNotifierProvider.value(value: _mithkaPro),
         ChangeNotifierProvider.value(value: _chatDeepLinks),
         ChangeNotifierProvider.value(value: _appIcons),
@@ -793,17 +840,21 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
             theme: _themeData(Brightness.light, theme),
             darkTheme: _themeData(Brightness.dark, theme),
             themeMode: theme.themeMode,
-            // Apply the user's chosen font size app-wide (设置 › 通用 › 字体大小).
+            // Apply the user's chosen font size app-wide (设置 › 外观 › 字体大小).
             builder: (context, child) {
               // Aspect-scoped: MediaQuery.of would re-run this whole closure on
               // every keyboard-inset and window-resize frame just to read
               // boldText.
               final boldText = MediaQuery.boldTextOf(context);
               final currentTheme = Theme.of(context);
+              // An installed theme names its own on-accent ink; a colour the
+              // user picked in 外观 has none, and derives one.
+              final usesCloudTheme = theme.usesCloudThemeForUi(
+                currentTheme.brightness,
+              );
               AppTheme.applyBrand(
-                theme.usesCloudThemeForUi(currentTheme.brightness)
-                    ? context.colors.linkBlue
-                    : theme.brandColor,
+                usesCloudTheme ? context.colors.linkBlue : theme.brandColor,
+                onAccent: usesCloudTheme ? context.colors.onAccent : null,
               );
               final themedChild = Theme(
                 data: currentTheme.copyWith(
@@ -829,21 +880,34 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
               final unlockedApp = Stack(
                 children: [
                   Positioned.fill(
-                    child: GlobalVideoSplitHost(child: themedChild),
+                    child: GlobalVideoSplitHost(
+                      child: HorizontalSafeViewport(
+                        sideNavigation: true,
+                        child: themedChild,
+                      ),
+                    ),
                   ),
                   Overlay(
                     initialEntries: [
                       OverlayEntry(
-                        builder: (_) => const GlobalMusicPlayerOverlay(),
+                        builder: (_) => const HorizontalSafeViewport(
+                          child: Stack(children: [GlobalMusicPlayerOverlay()]),
+                        ),
                       ),
                     ],
                   ),
                   Positioned.fill(
-                    child: InAppNotificationBannerHost(
-                      controller: NotificationController.shared,
+                    child: HorizontalSafeViewport(
+                      child: InAppNotificationBannerHost(
+                        controller: NotificationController.shared,
+                      ),
                     ),
                   ),
-                  const Positioned.fill(child: GlobalCallOverlayHost()),
+                  const Positioned.fill(
+                    child: HorizontalSafeViewport(
+                      child: GlobalCallOverlayHost(),
+                    ),
+                  ),
                 ],
               );
               final framedUnlockedApp = DesktopPrimaryWindowFrame(
@@ -869,6 +933,7 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
               final hotkeyController = DesktopHotkeyController.shared;
               final hotkeyChild = DesktopHotkeyHost(
                 controller: hotkeyController,
+                enabled: !appLock.locked,
                 child: DesktopPrimaryHotkeyBindings(
                   controller: hotkeyController,
                   child: appChild,
@@ -876,15 +941,20 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
               );
               return AnnotatedRegion<SystemUiOverlayStyle>(
                 value: systemUiOverlayStyleForSurface(context.colors.navBar),
-                child: _ScaledAppView(
-                  fontScale: theme.fontScale,
+                child: ScaledAppView(
+                  textScale: theme.effectiveTextScale(
+                    MediaQuery.textScalerOf(context),
+                  ),
                   interfaceScale: theme.renderedInterfaceScale,
                   child: DefaultTextStyle(
                     style: theme.applyAppTextStyle(
                       AppTextStyle.body(context.colors.textPrimary),
                       boldText: boldText,
                     ),
-                    child: hotkeyChild,
+                    child: ColoredBox(
+                      color: context.colors.background,
+                      child: hotkeyChild,
+                    ),
                   ),
                 ),
               );
@@ -903,7 +973,7 @@ class _MithkaAppState extends State<MithkaApp> with WidgetsBindingObserver {
 
 /// A built [ThemeData] together with everything [_MithkaAppState._themeData]
 /// read to build it. Font scale and interface scale are deliberately absent:
-/// they are applied downstream by `_ScaledAppView`, never by the theme.
+/// they are applied downstream by `ScaledAppView`, never by the theme.
 class _ThemeDataMemo {
   const _ThemeDataMemo({
     required this.colors,
@@ -936,67 +1006,4 @@ List<NavigatorObserver> _telemetryNavigatorObservers() {
     // Sentry navigation breadcrumbs do not depend on Firebase availability.
   }
   return observers;
-}
-
-class _ScaledAppView extends StatelessWidget {
-  const _ScaledAppView({
-    required this.fontScale,
-    required this.interfaceScale,
-    required this.child,
-  });
-
-  final double fontScale;
-  final double interfaceScale;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    final scale = interfaceScale;
-    final virtualSize = Size(
-      media.size.width / scale,
-      media.size.height / scale,
-    );
-    final scaledMedia = media.copyWith(
-      size: virtualSize,
-      padding: _unscaleInsets(media.padding, scale),
-      viewPadding: _unscaleInsets(media.viewPadding, scale),
-      viewInsets: _unscaleInsets(media.viewInsets, scale),
-      systemGestureInsets: _unscaleInsets(media.systemGestureInsets, scale),
-      // The outer transform scales geometry and text together. Keep only the
-      // independent font preference here; dividing by interfaceScale caused
-      // normal Text widgets to stay small while noScaling text still grew.
-      textScaler: TextScaler.linear(fontScale),
-    );
-
-    return AppKeyboardDismissOnTap(
-      child: ClipRect(
-        child: OverflowBox(
-          alignment: Alignment.topLeft,
-          minWidth: virtualSize.width,
-          maxWidth: virtualSize.width,
-          minHeight: virtualSize.height,
-          maxHeight: virtualSize.height,
-          child: Transform.scale(
-            scale: scale,
-            alignment: Alignment.topLeft,
-            child: SizedBox(
-              width: virtualSize.width,
-              height: virtualSize.height,
-              child: MediaQuery(data: scaledMedia, child: child),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  EdgeInsets _unscaleInsets(EdgeInsets insets, double scale) {
-    return EdgeInsets.fromLTRB(
-      insets.left / scale,
-      insets.top / scale,
-      insets.right / scale,
-      insets.bottom / scale,
-    );
-  }
 }

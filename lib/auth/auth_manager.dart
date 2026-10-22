@@ -29,6 +29,14 @@ class AuthInitializing extends AuthStep {
   const AuthInitializing();
 }
 
+/// A reload of an already-started client is in flight (account switch, add
+/// account, session replacement). Unlike [AuthInitializing] this is NOT a
+/// cold-start: the login surface is already what the user asked for, so the
+/// auth gate must keep showing it instead of the full-screen splash.
+class AuthReloading extends AuthStep {
+  const AuthReloading();
+}
+
 class AuthWaitPhoneNumber extends AuthStep {
   const AuthWaitPhoneNumber();
 }
@@ -182,6 +190,14 @@ Map<String, dynamic> authenticationEmailCodeRequest(String code) => {
   'code': {'@type': 'emailAddressAuthenticationCode', 'code': code.trim()},
 };
 
+@visibleForTesting
+bool authReloadIsCurrent({
+  required int reloadAction,
+  required int currentAction,
+  required int reloadClientId,
+  required int currentClientId,
+}) => reloadAction == currentAction && reloadClientId == currentClientId;
+
 class AuthManager extends ChangeNotifier {
   static const _startupTimeout = Duration(seconds: 20);
 
@@ -230,16 +246,18 @@ class AuthManager extends ChangeNotifier {
       // Subscribe before start so no early update is missed.
       if (!_subscribed) {
         _subscribed = true;
-        _client.subscribe().listen((update) {
-          if (update.type == 'updateOption' &&
-              update.str('name') == 'can_use_login_passkey') {
-            unawaited(_loadPasskeyAvailability());
-            return;
-          }
-          if (update.type != 'updateAuthorizationState') return;
-          final state = update.obj('authorization_state');
-          if (state != null) _handle(state);
-        });
+        _client
+            .updatesOfAny(const ['updateOption', 'updateAuthorizationState'])
+            .listen((update) {
+              if (update.type == 'updateOption' &&
+                  update.str('name') == 'can_use_login_passkey') {
+                unawaited(_loadPasskeyAvailability());
+                return;
+              }
+              if (update.type != 'updateAuthorizationState') return;
+              final state = update.obj('authorization_state');
+              if (state != null) _handle(state);
+            });
       }
       await _client.start().timeout(_startupTimeout);
       if (_credentialsMissing && !_client.activeIsBotApi) {
@@ -386,22 +404,47 @@ class AuthManager extends ChangeNotifier {
 
   /// Re-reads the active account's authorization state (after an account
   /// switch) and updates `step` so the UI gates on the right account.
+  ///
+  /// The read takes real time (a fresh add-account slot reaches its first
+  /// authorization state only hundreds of milliseconds after setTdlibParameters),
+  /// so the intermediate frame is [AuthReloading] — mapped to the login surface,
+  /// not the cold-start splash. Startup keeps [AuthInitializing] for the splash.
   void reloadAuthState() {
-    _actionSerial += 1;
+    final action = ++_actionSerial;
+    final clientId = _client.activeClientId;
     _isWorking = false;
     _errorMessage = null;
     _canUseLoginPasskey = false;
-    _set(const AuthInitializing());
+    _set(const AuthReloading());
     unawaited(_loadPasskeyAvailability());
-    _client
-        .query({'@type': 'getAuthorizationState'})
-        .timeout(const Duration(seconds: 8))
-        .then(_handle)
-        .catchError((Object error) {
-          debugPrint('Auth state reload failed: $error');
-          _client.sendParametersForActiveClient();
-          _set(const AuthWaitPhoneNumber());
-        });
+    unawaited(_reloadAuthState(action: action, clientId: clientId));
+  }
+
+  Future<void> _reloadAuthState({
+    required int action,
+    required int clientId,
+  }) async {
+    bool isCurrent() => authReloadIsCurrent(
+      reloadAction: action,
+      currentAction: _actionSerial,
+      reloadClientId: clientId,
+      currentClientId: _client.activeClientId,
+    );
+
+    try {
+      final state = await _client.queryTo(
+        {'@type': 'getAuthorizationState'},
+        clientId,
+        timeout: const Duration(seconds: 8),
+      );
+      if (!isCurrent()) return;
+      _handle(state);
+    } catch (error) {
+      if (!isCurrent()) return;
+      debugPrint('Auth state reload failed: $error');
+      _client.sendParametersForActiveClient();
+      _set(const AuthWaitPhoneNumber());
+    }
   }
 
   // MARK: - User actions

@@ -14,12 +14,13 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app/app_navigator.dart';
+import '../app/bottom_bar_layout.dart';
+import '../chat/chat_view.dart';
 import '../chats/chat_list_view_model.dart';
 import '../components/app_icons.dart';
 import '../components/photo_avatar.dart';
 import '../components/ui_components.dart';
 import '../l10n/app_localizations.dart';
-import '../settings/topic_group_display_mode.dart';
 import '../tdlib/chat_membership.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
@@ -27,7 +28,7 @@ import '../tdlib/td_models.dart';
 import '../theme/app_theme.dart';
 import '../theme/date_text.dart';
 import '../theme/theme_controller.dart';
-import 'topic_chat_view.dart';
+import 'forum_topic_fields.dart';
 import 'topic_post_content.dart';
 
 class TopicChannelsView extends StatefulWidget {
@@ -74,7 +75,6 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
   void initState() {
     super.initState();
     unawaited(_loadCachedPosts());
-    unawaited(TopicGroupDisplayPreference.set(TopicGroupDisplayMode.channel));
     _model.addListener(_onModel);
     _model.onAppear();
   }
@@ -147,7 +147,7 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
         final info = topic.obj('info') ?? topic;
         final last = topic.obj('last_message');
         final parsedLast = last == null ? null : TDParse.message(last);
-        final threadId = _topicId(topic, info) ?? parsedLast?.id;
+        final threadId = forumTopicId(topic, info) ?? parsedLast?.id;
         final messages = await _recentRootPostsForTopic(
           chat.id,
           threadId,
@@ -232,9 +232,9 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
   }
 
   _TopicPost? _topicPostFromCache(Map<String, dynamic> item) {
-    final chatId = _cachedInt(item['chat_id']);
-    final messageId = _cachedInt(item['message_id']);
-    final threadId = _cachedInt(item['thread_id']);
+    final chatId = jsonInt(item['chat_id']);
+    final messageId = jsonInt(item['message_id']);
+    final threadId = jsonInt(item['thread_id']);
     if (chatId == null || messageId == null || threadId == null) return null;
     final chatTitle = (item['chat_title'] as String?)?.trim();
     final topicName = (item['topic_name'] as String?)?.trim();
@@ -245,9 +245,9 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
       return null;
     }
     final text = (item['text'] as String?) ?? '';
-    final date = _cachedInt(item['date']) ?? 0;
-    final commentCount = _cachedInt(item['comment_count']) ?? 0;
-    final reactionCount = _cachedInt(item['reaction_count']) ?? 0;
+    final date = jsonInt(item['date']) ?? 0;
+    final commentCount = jsonInt(item['comment_count']) ?? 0;
+    final reactionCount = jsonInt(item['reaction_count']) ?? 0;
     final message =
         ChatMessage(
             id: messageId,
@@ -281,20 +281,6 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
       threadId: threadId,
       message: message,
     );
-  }
-
-  int? _cachedInt(Object? value) {
-    if (value is int) return value;
-    if (value is double) return value.toInt();
-    if (value is String) return int.tryParse(value);
-    return null;
-  }
-
-  int? _topicId(Map<String, dynamic> topic, Map<String, dynamic> info) {
-    return info.integer('forum_topic_id') ??
-        topic.integer('forum_topic_id') ??
-        info.int64('message_thread_id') ??
-        topic.int64('message_thread_id');
   }
 
   Future<bool> _isJoinedChat(ChatSummary chat) async {
@@ -423,7 +409,9 @@ class _TopicChannelsViewState extends State<TopicChannelsView> {
             child: posts.isEmpty
                 ? _empty()
                 : ListView.separated(
-                    padding: EdgeInsets.zero,
+                    padding: EdgeInsets.only(
+                      bottom: BottomBarInset.of(context),
+                    ),
                     itemCount: posts.length,
                     separatorBuilder: (_, _) =>
                         const InsetDivider(leadingInset: 0),
@@ -485,25 +473,26 @@ class _TopicPostRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = context.colors;
-    final text = _displayText;
     final chatTextSize = context.watch<ThemeController>().chatTextSize(15);
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () {
-        unawaited(
-          TopicGroupDisplayPreference.set(TopicGroupDisplayMode.channel),
-        );
-        final detail = TopicChatView(
-          chat: post.chat,
-          initialThreadId: post.threadId,
-          initialMessageId: post.message.id,
-          showBackButton: onOpenDetail == null,
+        // Topics always open as ordinary chat transcripts; the topic feed
+        // (channel) form is gone. The split shell renders the detail in its
+        // pane; other hosts push the route.
+        final detail = ChatView(
+          chatId: post.chat.id,
+          title: post.chat.title,
+          forumTopicId: post.threadId,
         );
         if (onOpenDetail != null) {
           onOpenDetail!(detail);
           return;
         }
-        pushAppChatRoute(context, MaterialPageRoute(builder: (_) => detail));
+        pushAppChatRoute(
+          context,
+          AppChatPageRoute<void>(builder: (_) => detail),
+        );
       },
       child: Container(
         color: c.background,
@@ -552,7 +541,9 @@ class _TopicPostRow extends StatelessWidget {
               TopicPostContent(
                 chatId: post.chat.id,
                 message: post.message,
-                text: text,
+                // The raw text: TopicPostContent trims it for display and
+                // re-addresses the entities to whatever it renders.
+                text: post.message.text,
                 maxTextLines: 6,
                 textOverflow: TextOverflow.ellipsis,
                 textStyle: TextStyle(
@@ -560,6 +551,21 @@ class _TopicPostRow extends StatelessWidget {
                   height: 1.35,
                   color: c.textPrimary,
                 ),
+                onOpenCurrentChat: () {
+                  final detail = ChatView(
+                    chatId: post.chat.id,
+                    title: post.chat.title,
+                    forumTopicId: post.threadId,
+                  );
+                  if (onOpenDetail != null) {
+                    onOpenDetail!(detail);
+                    return;
+                  }
+                  pushAppChatRoute(
+                    context,
+                    AppChatPageRoute<void>(builder: (_) => detail),
+                  );
+                },
               ),
             ],
             const SizedBox(height: 12),

@@ -199,15 +199,27 @@ class AppChatPageRoute<T> extends PageRoute<T>
     if (AppMotion.isReduced(context) && !_fullPageBackSwipeActive) {
       return child;
     }
-    final leaving = _fullPageBackSwipeActive;
+    final leaving =
+        _fullPageBackSwipeActive ||
+        animation.status == AnimationStatus.reverse ||
+        animation.status == AnimationStatus.dismissed;
     if (leaving) {
       final effectiveAnimation = popGestureInProgress
           ? animation
           : CurvedAnimation(
               parent: animation,
               curve: AppMotion.standard,
-              reverseCurve: AppMotion.accelerate,
+              reverseCurve: AppMotion.standard.flipped,
             );
+      final slide = SlideTransition(
+        position: Tween<Offset>(
+          begin: const Offset(1, 0),
+          end: Offset.zero,
+        ).animate(effectiveAnimation),
+        transformHitTests: false,
+        child: child,
+      );
+      if (!_fullPageBackSwipeActive) return slide;
       return Stack(
         fit: StackFit.expand,
         children: [
@@ -220,14 +232,7 @@ class AppChatPageRoute<T> extends PageRoute<T>
               child: ColoredBox(color: Color(0xFF000000)),
             ),
           ),
-          SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(1, 0),
-              end: Offset.zero,
-            ).animate(effectiveAnimation),
-            transformHitTests: false,
-            child: child,
-          ),
+          slide,
         ],
       );
     }
@@ -250,8 +255,8 @@ class AppChatPageRoute<T> extends PageRoute<T>
           end: const Offset(-0.018, 0),
         ).animate(covered),
         transformHitTests: false,
-        child: FadeTransition(
-          opacity: Tween<double>(begin: 0.92, end: 1).animate(entrance),
+        child: _EntranceFade(
+          animation: entrance,
           child: SlideTransition(
             position: Tween<Offset>(
               begin: const Offset(0.045, 0),
@@ -275,6 +280,43 @@ class AppChatPageRoute<T> extends PageRoute<T>
   String get debugLabel => '${super.debugLabel}(${settings.name})';
 }
 
+/// Fades a conversation in as it arrives and holds it fully opaque as it leaves.
+///
+/// Replaying the arrival fade in reverse kept a full-screen [OpacityLayer] alive
+/// for the whole 240 ms pop, at an alpha below 255 on every frame. An [Opacity]
+/// over a group of widgets costs an offscreen buffer plus a render target switch
+/// (see the [Opacity] docs), and a pop is exactly when the chat list underneath
+/// is re-rasterizing itself. At 1.0 `RenderOpacity` paints its child directly
+/// and builds no opacity layer at all, so the departure becomes a plain slide.
+///
+/// The value a completed route starts its reverse at is 1.0, which is also the
+/// value this holds it at, so nothing jumps when a pop begins — including an
+/// interactive one, where the page now stays crisp while it follows the finger.
+/// The `covered` dim in `buildTransitions` cannot do the same: it sits at 0.96
+/// while a conversation is on top, so pinning it would brighten the returning
+/// page in a single frame.
+class _EntranceFade extends AnimatedWidget {
+  const _EntranceFade({
+    required Animation<double> animation,
+    required this.child,
+  }) : super(listenable: animation);
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final entrance = listenable as Animation<double>;
+    final leaving = switch (entrance.status) {
+      AnimationStatus.reverse || AnimationStatus.dismissed => true,
+      AnimationStatus.forward || AnimationStatus.completed => false,
+    };
+    return Opacity(
+      opacity: leaving ? 1.0 : 0.92 + 0.08 * entrance.value,
+      child: child,
+    );
+  }
+}
+
 Future<T?> pushAppChatRoute<T>(BuildContext context, Route<T> route) {
   final navigator =
       appNavigatorKey.currentState ??
@@ -295,6 +337,11 @@ Future<T?> replaceWithAppChatRoute<T, TO>(
       appNavigatorKey.currentState ??
       Navigator.of(context, rootNavigator: true);
   if (identical(sourceNavigator, rootNavigator)) {
+    // A pane can share the root navigator without owning its route. Keep the
+    // shell underneath the conversation, including roots with local history.
+    if (ModalRoute.of(context)?.isFirst != false) {
+      return rootNavigator.push<T>(route);
+    }
     return sourceNavigator.pushReplacement<T, TO>(route, result: result);
   }
   if (sourceNavigator.canPop()) sourceNavigator.pop<TO>(result);

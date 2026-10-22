@@ -5,6 +5,8 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:multi_window_manager/multi_window_manager.dart';
 
+import '../settings/desktop_hotkey_controller.dart';
+import '../settings/hidden_sender_store.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import 'chat_deep_link_controller.dart';
@@ -15,6 +17,8 @@ const _queryMethod = 'mithka.utility.td.query';
 const _sendMethod = 'mithka.utility.td.send';
 const _updateMethod = 'mithka.utility.td.update';
 const _settingsChangedMethod = 'mithka.utility.settings.changed';
+const _hiddenSendersChangedMethod = 'mithka.utility.hidden-senders.changed';
+const _hotkeyRecordingMethod = 'mithka.utility.hotkeys.recording';
 const _presentationChangedMethod = 'mithka.utility.presentation.changed';
 const _openUtilityMethod = 'mithka.utility.open';
 const _chatOpenUtilityMethod = 'mithka.chat.utility.open';
@@ -154,6 +158,24 @@ Future<void> closeCurrentDesktopUtilityWindow() async {
   }
 }
 
+Future<void> setDesktopUtilityHotkeyRecording(bool recording) async {
+  final arguments = _childArguments;
+  if (!supportsDesktopUtilityWindows ||
+      arguments?.kind != DesktopUtilityWindowKind.settings) {
+    return;
+  }
+  try {
+    await MultiWindowManager.current
+        .invokeMethodToWindow(0, _hotkeyRecordingMethod, {
+          ...arguments!.toIpcJson(),
+          'recording': recording,
+        })
+        .timeout(const Duration(seconds: 5));
+  } on Object {
+    // Closing the native settings window releases its recording owner too.
+  }
+}
+
 Future<void> notifyDesktopUtilitySettingsChanged(
   DesktopUtilityWindowArguments arguments,
 ) async {
@@ -172,6 +194,26 @@ Future<void> notifyDesktopUtilitySettingsChanged(
   }
 }
 
+/// Tells the primary window that this child changed the hidden members, so
+/// it re-reads them and passes the change on to the other windows. Unlike a
+/// settings reload, any registered child may ask for this one narrow read.
+Future<void> notifyDesktopUtilityHiddenSendersChanged() async {
+  final source = _childArguments;
+  if (!supportsDesktopUtilityWindows || source == null) return;
+  try {
+    if (MultiWindowManager.current.id <= 0) return;
+    await MultiWindowManager.current
+        .invokeMethodToWindow(
+          0,
+          _hiddenSendersChangedMethod,
+          source.toIpcJson(),
+        )
+        .timeout(const Duration(seconds: 5));
+  } on Object {
+    // The primary window may already be closing; the preference is durable.
+  }
+}
+
 WindowOptions desktopUtilityWindowOptions(
   DesktopUtilityWindowArguments arguments,
 ) {
@@ -187,6 +229,11 @@ WindowOptions desktopUtilityWindowOptions(
     DesktopUtilityWindowKind.files || DesktopUtilityWindowKind.videos => (
       const Size(1040, 760),
       const Size(720, 520),
+    ),
+    // Two 58pt columns of packs appear from 620pt; below that it is one.
+    DesktopUtilityWindowKind.stickerFinder => (
+      const Size(760, 720),
+      const Size(460, 480),
     ),
     DesktopUtilityWindowKind.search => (
       const Size(900, 720),
@@ -367,6 +414,9 @@ class _DesktopUtilityMainBridge with WindowListener {
       unawaited(lease.release());
     }
     _accountLeasesByWindow.clear();
+    for (final windowId in _argumentsByWindow.keys) {
+      DesktopHotkeyController.maybeShared?.setRecording(windowId, false);
+    }
     _argumentsByWindow.clear();
     _clientIdByWindow.clear();
     _subscribedWindows.clear();
@@ -472,6 +522,18 @@ class _DesktopUtilityMainBridge with WindowListener {
     if (registeredClientId == null) return null;
 
     switch (eventName) {
+      case _hotkeyRecordingMethod:
+        if (registered.kind != DesktopUtilityWindowKind.settings) {
+          return const {'ok': false};
+        }
+        DesktopHotkeyController.maybeShared?.setRecording(
+          fromWindowId,
+          arguments is Map && arguments['recording'] == true,
+        );
+        return const {'ok': true};
+      case _hiddenSendersChangedMethod:
+        await HiddenSenderStore.shared.reload();
+        return const {'ok': true};
       case _settingsChangedMethod:
         if (registered.kind != DesktopUtilityWindowKind.settings) {
           return const {'ok': false};
@@ -771,6 +833,7 @@ class _DesktopUtilityMainBridge with WindowListener {
   }
 
   void _removeWindow(int windowId) {
+    DesktopHotkeyController.maybeShared?.setRecording(windowId, false);
     _argumentsByWindow.remove(windowId);
     _clientIdByWindow.remove(windowId);
     final lease = _accountLeasesByWindow.remove(windowId);

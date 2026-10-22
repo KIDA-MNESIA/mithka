@@ -12,13 +12,15 @@ import '../chat/chat_members_view.dart';
 import '../chat/chat_view.dart';
 import '../chat/desktop_chat_context_pane.dart';
 import '../chat/group_remark_controller.dart';
+import '../chat/link_preview_fixer.dart';
 import '../chat/music_player_controller.dart';
-import '../components/keyboard_dismiss_on_tap.dart';
+import '../chats/chat_folder_tag_controller.dart';
 import '../l10n/app_locale_controller.dart';
 import '../l10n/app_localizations.dart';
 import '../settings/ai_settings_controller.dart';
 import '../settings/blocked_user_service.dart';
 import '../settings/country_message_filter.dart';
+import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../settings/sensitive_content_controller.dart';
 import '../settings/translation_controller.dart';
@@ -35,7 +37,9 @@ import 'desktop_chat_window_stub.dart'
     if (dart.library.io) 'desktop_chat_window_io.dart'
     as implementation;
 import 'desktop_utility_window_models.dart';
+import 'detail_content_reveal.dart';
 import 'global_video_split_host.dart';
+import 'scaled_app_view.dart';
 
 export 'desktop_chat_window_models.dart';
 
@@ -71,6 +75,9 @@ class DesktopChatWindowService {
 
   Future<void> notifyPresentationChanged() =>
       implementation.notifyDesktopChatPresentationChanged();
+
+  Future<void> notifyHiddenSendersChanged() =>
+      implementation.notifyDesktopChatHiddenSendersChanged();
 
   Future<bool> open(DesktopChatWindowArguments arguments) =>
       implementation.openDesktopChatWindow(arguments);
@@ -132,9 +139,16 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
     widget.prefs,
     initialAccountUserId: widget.arguments.accountUserId,
   );
+  late final ChatFolderTagController _folderTags = ChatFolderTagController(
+    widget.prefs,
+  );
   late final CallManager _calls = CallManager()..start();
   bool _presentationReloading = false;
   bool _presentationReloadQueued = false;
+
+  /// Re-reading the hidden members after another window changed them; that
+  /// is not a change of this window's to report back.
+  bool _readingHiddenSenders = false;
 
   @override
   void initState() {
@@ -147,11 +161,20 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
       _reloadPresentationPreferences,
     );
     KeywordBlocker.shared.initialize(widget.prefs);
+    LinkPreviewFixer.shared.initialize(widget.prefs);
+    HiddenSenderStore.shared
+      ..initialize(widget.prefs)
+      ..addListener(_handleHiddenSendersChanged);
     CountryMessageFilter.shared.initialize(widget.prefs);
     MusicPlayerController.shared.initialize(widget.prefs);
     unawaited(_ai.initialize());
     unawaited(SensitiveContentController.shared.initialize());
     unawaited(BlockedUserService.shared.loadBlockedUsers());
+  }
+
+  void _handleHiddenSendersChanged() {
+    if (_readingHiddenSenders) return;
+    unawaited(DesktopChatWindowService.instance.notifyHiddenSendersChanged());
   }
 
   Future<void> _reloadPresentationPreferences() async {
@@ -171,6 +194,9 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
           return;
         }
         if (!mounted) return;
+        _readingHiddenSenders = true;
+        HiddenSenderStore.shared.initialize(widget.prefs);
+        _readingHiddenSenders = false;
 
         final previousTheme = _theme;
         final previousTranslation = _translation;
@@ -205,10 +231,12 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
 
   @override
   void dispose() {
+    HiddenSenderStore.shared.removeListener(_handleHiddenSendersChanged);
     DesktopChatWindowService.instance.detachChildPresentationReload();
     unawaited(TdClient.shared.closeProxy());
     _calls.dispose();
     _groupRemarks.dispose();
+    _folderTags.dispose();
     _ai.dispose();
     _locale.dispose();
     _translation.dispose();
@@ -261,6 +289,7 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
       ChangeNotifierProvider.value(value: _locale),
       ChangeNotifierProvider.value(value: _ai),
       ChangeNotifierProvider.value(value: _groupRemarks),
+      ChangeNotifierProvider.value(value: _folderTags),
       ChangeNotifierProvider.value(value: _calls),
     ],
     child: AnimatedBuilder(
@@ -288,10 +317,14 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
           builder: (context, child) {
             final media = MediaQuery.of(context);
             final currentTheme = Theme.of(context);
+            // An installed theme names its own on-accent ink; a colour the
+            // user picked in 外观 has none, and derives one.
+            final usesCloudTheme = _theme.usesCloudThemeForUi(
+              currentTheme.brightness,
+            );
             AppTheme.applyBrand(
-              _theme.usesCloudThemeForUi(currentTheme.brightness)
-                  ? context.colors.linkBlue
-                  : _theme.brandColor,
+              usesCloudTheme ? context.colors.linkBlue : _theme.brandColor,
+              onAccent: usesCloudTheme ? context.colors.onAccent : null,
             );
             final themedChild = Theme(
               data: currentTheme.copyWith(
@@ -329,8 +362,10 @@ class _DesktopChatWindowAppState extends State<DesktopChatWindowApp> {
                 const Positioned.fill(child: GlobalCallOverlayHost()),
               ],
             );
-            return _DesktopChatScaledView(
-              fontScale: _theme.fontScale,
+            return ScaledAppView(
+              textScale: _theme.effectiveTextScale(
+                MediaQuery.textScalerOf(context),
+              ),
               interfaceScale: _theme.renderedInterfaceScale,
               child: appSurface,
             );
@@ -363,21 +398,31 @@ class _DesktopStandaloneChatSurface extends StatefulWidget {
 class _DesktopStandaloneChatSurfaceState
     extends State<_DesktopStandaloneChatSurface> {
   ChatKind? _kind;
-  bool _contextDismissed = false;
+
+  /// This window's hand-made pane choice. Null follows the app-wide default in
+  /// [ThemeController.hideChatContextPane].
+  bool? _contextDismissed;
+  int? _forumTopicId;
 
   @override
   void didUpdateWidget(_DesktopStandaloneChatSurface oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.arguments.chatId == widget.arguments.chatId) return;
     _kind = null;
-    _contextDismissed = false;
+    _contextDismissed = null;
+    _forumTopicId = null;
+  }
+
+  void _openTopicTranscript(int? topicId) {
+    if (_forumTopicId == topicId) return;
+    setState(() => _forumTopicId = topicId);
   }
 
   void _handleKindResolved(ChatKind kind) {
     if (_kind == kind) return;
     setState(() {
       _kind = kind;
-      _contextDismissed = false;
+      _contextDismissed = null;
     });
   }
 
@@ -385,7 +430,9 @@ class _DesktopStandaloneChatSurfaceState
       desktopStandaloneChatUsesContextPane(
         width: MediaQuery.sizeOf(context).width,
         kind: _kind,
-        dismissed: _contextDismissed,
+        dismissed:
+            _contextDismissed ??
+            context.watch<ThemeController>().hideChatContextPane,
       );
 
   Future<void> _openFullInfo() async {
@@ -442,7 +489,11 @@ class _DesktopStandaloneChatSurfaceState
       unawaited(_openFullInfo());
       return;
     }
-    setState(() => _contextDismissed = !_contextDismissed);
+    setState(
+      () => _contextDismissed =
+          !(_contextDismissed ??
+              context.read<ThemeController>().hideChatContextPane),
+    );
   }
 
   @override
@@ -460,9 +511,15 @@ class _DesktopStandaloneChatSurfaceState
           )
         : null;
     final chat = ChatView(
-      key: ValueKey('desktop-standalone-chat-${widget.arguments.chatId}'),
+      key: ValueKey((
+        'desktop-standalone-chat',
+        widget.arguments.chatId,
+        _forumTopicId,
+      )),
       chatId: widget.arguments.chatId,
       title: widget.arguments.title,
+      forumTopicId: _forumTopicId,
+      onOpenTopicTranscript: _openTopicTranscript,
       showBackButton: false,
       requestComposerFocusOnReady: true,
       onChatKindResolved: _handleKindResolved,
@@ -474,63 +531,13 @@ class _DesktopStandaloneChatSurfaceState
       onOpenFullInfo: () => unawaited(_openFullInfo()),
       onOpenUserProfile: _openUserProfile,
     );
-    return chat;
-  }
-}
-
-class _DesktopChatScaledView extends StatelessWidget {
-  const _DesktopChatScaledView({
-    required this.fontScale,
-    required this.interfaceScale,
-    required this.child,
-  });
-
-  final double fontScale;
-  final double interfaceScale;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    final scale = interfaceScale;
-    final virtualSize = Size(
-      media.size.width / scale,
-      media.size.height / scale,
-    );
-    final scaledMedia = media.copyWith(
-      size: virtualSize,
-      padding: _unscale(media.padding, scale),
-      viewPadding: _unscale(media.viewPadding, scale),
-      viewInsets: _unscale(media.viewInsets, scale),
-      systemGestureInsets: _unscale(media.systemGestureInsets, scale),
-      textScaler: TextScaler.linear(fontScale),
-    );
-    return AppKeyboardDismissOnTap(
-      child: ClipRect(
-        child: OverflowBox(
-          alignment: Alignment.topLeft,
-          minWidth: virtualSize.width,
-          maxWidth: virtualSize.width,
-          minHeight: virtualSize.height,
-          maxHeight: virtualSize.height,
-          child: Transform.scale(
-            scale: scale,
-            alignment: Alignment.topLeft,
-            child: SizedBox(
-              width: virtualSize.width,
-              height: virtualSize.height,
-              child: MediaQuery(data: scaledMedia, child: child),
-            ),
-          ),
-        ),
-      ),
+    return DetailContentReveal(
+      motionKey: ValueKey((
+        'desktop-standalone-topic',
+        widget.arguments.chatId,
+        _forumTopicId,
+      )),
+      child: chat,
     );
   }
-
-  EdgeInsets _unscale(EdgeInsets insets, double scale) => EdgeInsets.fromLTRB(
-    insets.left / scale,
-    insets.top / scale,
-    insets.right / scale,
-    insets.bottom / scale,
-  );
 }

@@ -16,14 +16,20 @@ import 'package:flutter/rendering.dart';
 import 'package:provider/provider.dart';
 
 import '../app/app_navigator.dart';
+import '../app/bottom_bar_layout.dart';
+import '../app/ipad_window_chrome.dart';
+import '../chat/animated_sticker_view.dart';
 import '../chat/chat_picker_view.dart';
 import '../chat/chat_view.dart';
 import '../chat/custom_emoji.dart';
 import '../chat/forward_options.dart';
 import '../chat/image_preview.dart';
 import '../chat/media_album_layout.dart';
+import '../chat/media_spoiler.dart';
 import '../chat/message_reaction_availability.dart';
+import '../chat/music_player_controller.dart';
 import '../chat/outgoing_attachment.dart';
+import '../chat/pangu_spacing.dart';
 import '../chat/quick_reaction_choice.dart';
 import '../chat/rich_text_composer_view.dart';
 import '../chat/rich_text_format.dart';
@@ -31,6 +37,7 @@ import '../chat/shared_media_view.dart';
 import '../chat/telegram_rich_text.dart';
 import '../chat/video_playback_queue.dart';
 import '../chat/video_player_view.dart';
+import '../chat/video_sticker_view.dart';
 import '../chats/chat_list_view_model.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -44,6 +51,7 @@ import '../platform/adaptive_platform.dart';
 import '../profile/adaptive_profile_launcher.dart';
 import '../settings/accent_color_picker_view.dart';
 import '../tdlib/chat_membership.dart';
+import '../tdlib/display_text.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -130,6 +138,20 @@ class _MomentsFeedScrollAnchor {
 
 final Map<String, double> _channelMomentsScrollOffsets = {};
 
+class _MomentsHistorySnapshot {
+  const _MomentsHistorySnapshot(
+    this.posts,
+    this.offset,
+    this.nonMutedOnly,
+    this.postableChannels,
+  );
+
+  final List<ChannelPost> posts;
+  final double offset;
+  final bool nonMutedOnly;
+  final List<ChatSummary> postableChannels;
+}
+
 String _channelMomentsScrollKey({
   required int accountSlot,
   required bool isRootTab,
@@ -148,7 +170,9 @@ class ChannelPostComment {
     this.entities = const [],
     this.senderPhoto,
     this.date = 0,
+    this.replyToChatId,
     this.replyToMessageId,
+    this.replyToSenderName,
     this.reactionCount = 0,
   });
 
@@ -159,7 +183,9 @@ class ChannelPostComment {
   final List<MessageTextEntity> entities;
   final TdFileRef? senderPhoto;
   final int date;
+  final int? replyToChatId;
   final int? replyToMessageId;
+  final String? replyToSenderName;
   final int reactionCount;
 }
 
@@ -254,6 +280,8 @@ class MomentsView extends StatefulWidget {
 }
 
 class _MomentsViewState extends State<MomentsView> {
+  // Owned by the Moments root, not a process-wide cache of account messages.
+  PageStorageBucket _channelHistory = PageStorageBucket();
   final _channels = ChatListViewModel();
   final _stories = MomentsViewModel();
   late final StoryService _storyService = widget.storyService ?? StoryService();
@@ -269,6 +297,7 @@ class _MomentsViewState extends State<MomentsView> {
     _channels.onAppear();
     _stories.start();
     _accountSub = TdClient.shared.subscribeActiveSlotChanges().listen((_) {
+      _channelHistory = PageStorageBucket();
       if (mounted) setState(() => _canPublishStories = false);
       unawaited(_loadStoryPublishingPermission());
     });
@@ -365,6 +394,7 @@ class _MomentsViewState extends State<MomentsView> {
   void _openChannelMoments() {
     _openDetail(
       ChannelMomentsView(
+        historyStorage: _channelHistory,
         isRootTab: widget.onOpenDetail != null,
         title: widget.onOpenDetail == null
             ? AppStrings.t(AppStringKeys.tabMoments)
@@ -413,7 +443,10 @@ class _MomentsViewState extends State<MomentsView> {
             const NavHeader(title: AppStringKeys.tabMoments),
           Expanded(
             child: ListView(
-              padding: const EdgeInsets.only(top: AppSpacing.md),
+              padding: EdgeInsets.only(
+                top: AppSpacing.md,
+                bottom: BottomBarInset.of(context),
+              ),
               children: [
                 StoryShelf(
                   model: _stories,
@@ -722,12 +755,14 @@ class ChannelMomentsView extends StatefulWidget {
     this.title = AppStringKeys.tabMoments,
     this.initialChannels = const [],
     this.onOpenDetail,
+    this.historyStorage,
   });
 
   final bool isRootTab;
   final String title;
   final List<ChatSummary> initialChannels;
   final ValueChanged<Widget>? onOpenDetail;
+  final PageStorageBucket? historyStorage;
 
   @override
   State<ChannelMomentsView> createState() => _ChannelMomentsViewState();
@@ -737,7 +772,8 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
   final _model = ChatListViewModel();
   final _replyController = TextEditingController();
   final _replyFocus = FocusNode();
-  final _scroll = ScrollController();
+  late final ScrollController _scroll;
+  double _lastScrollOffset = 0;
   late final String _scrollSessionKey;
   final Map<String, GlobalKey> _postWidgetKeys = {};
   double? _pendingScrollOffset;
@@ -782,14 +818,51 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       initialChannels: widget.initialChannels,
     );
     _pendingScrollOffset = _channelMomentsScrollOffsets[_scrollSessionKey];
+    final saved = widget.historyStorage?.readState(
+      context,
+      identifier: _scrollSessionKey,
+    );
+    if (saved is _MomentsHistorySnapshot) {
+      for (final post in saved.posts) {
+        (_postsByChannel[post.channel.id] ??= []).add(post);
+        _oldestMessageByChannel.update(
+          post.channel.id,
+          (id) => math.min(id, post.message.id),
+          ifAbsent: () => post.message.id,
+        );
+      }
+      _nonMutedOnly = saved.nonMutedOnly;
+      _postableChannels = saved.postableChannels;
+      _lastScrollOffset = saved.offset;
+      _pendingScrollOffset = null;
+    }
+    _scroll = ScrollController(initialScrollOffset: _lastScrollOffset);
     _model.addListener(_onModel);
     _scroll.addListener(_onScroll);
-    _tdSub = TdClient.shared.subscribe().listen(_handleTdUpdate);
+    _tdSub = TdClient.shared
+        .updatesOfAny(const [
+          'updateNewMessage',
+          'updateMessageContent',
+          'updateMessageEdited',
+          'updateMessageInteractionInfo',
+          'updateMessageUnreadReactions',
+          'updateDeleteMessages',
+          'updateChatAddedToList',
+          'updateChatRemovedFromList',
+        ])
+        .listen(_handleTdUpdate);
     _model.onAppear();
     _loadMe();
     if (widget.initialChannels.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _loadChannelPosts();
+        if (!mounted) return;
+        if (saved is _MomentsHistorySnapshot) {
+          // The first frame already contains the same rows and metadata. New
+          // history then merges using the existing visible-post anchor.
+          unawaited(_refreshLatest());
+        } else {
+          unawaited(_loadChannelPosts());
+        }
       });
     }
     _scheduleScrollRestore();
@@ -799,7 +872,30 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
   void dispose() {
     if (_scroll.hasClients) {
       _channelMomentsScrollOffsets[_scrollSessionKey] = _scroll.offset;
+      _lastScrollOffset = _scroll.offset;
     }
+    // Retain exactly the rendered feed, including every member of its albums.
+    // Capping raw messages at 500 would truncate a 500-post album-heavy feed.
+    final retainedIds = {
+      for (final post in _posts)
+        for (final message in post.messages) (post.channel.id, message.id),
+    };
+    final retained = _postsByChannel.values
+        .expand((posts) => posts)
+        .where(
+          (post) => retainedIds.contains((post.channel.id, post.message.id)),
+        )
+        .toList();
+    widget.historyStorage?.writeState(
+      context,
+      _MomentsHistorySnapshot(
+        retained,
+        _lastScrollOffset,
+        _nonMutedOnly,
+        List.of(_postableChannels),
+      ),
+      identifier: _scrollSessionKey,
+    );
     _model.removeListener(_onModel);
     _model.dispose();
     _scroll.removeListener(_onScroll);
@@ -814,6 +910,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
 
   void _onScroll() {
     if (!_scroll.hasClients) return;
+    _lastScrollOffset = _scroll.offset;
     _channelMomentsScrollOffsets[_scrollSessionKey] = _scroll.offset;
     if (_scroll.position.extentAfter < 600) _loadChannelPosts(loadOlder: true);
   }
@@ -1367,6 +1464,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       if (!mounted) return;
       final posts = _posts.take(_metadataHydrationLimit).toList();
       _loadAuthors(posts);
+      _loadForwardAttributions(posts);
       _loadReplyQuotes(posts);
       _loadLikeNames(posts);
       _loadThreadTargets(posts);
@@ -1388,6 +1486,41 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     }
   }
 
+  final Map<String, Future<String?>> _forwardNames = {};
+
+  void _loadForwardAttributions(List<ChannelPost> posts) {
+    for (final post in posts) {
+      for (final message in post.messages) {
+        if (message.forwardOrigin?.trim().isNotEmpty == true) continue;
+        final userId = message.forwardFromUserId;
+        final chatId = message.forwardFromChatId;
+        if (userId == null && chatId == null) continue;
+        final key = '${post.accountSlot}:$userId:$chatId';
+        final pending = _forwardNames.putIfAbsent(key, () async {
+          try {
+            final raw = await TdClient.shared.queryForSlot({
+              '@type': userId != null ? 'getUser' : 'getChat',
+              if (userId != null) 'user_id': userId else 'chat_id': chatId,
+            }, post.accountSlot);
+            return userId != null ? TDParse.userName(raw) : raw.str('title');
+          } catch (_) {
+            return null;
+          }
+        });
+        unawaited(
+          pending.then((name) {
+            if (name == null || name.trim().isEmpty) {
+              _forwardNames.remove(key);
+              return;
+            }
+            message.forwardOrigin = name;
+            _notifyPost(post);
+          }),
+        );
+      }
+    }
+  }
+
   Future<void> _resolveReplyQuote(ChannelPost post, String key) async {
     final message = post.message;
     final replyToMessageId = message.replyToMessageId;
@@ -1396,18 +1529,20 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       return;
     }
     try {
-      final raw = await TdClient.shared.query({
+      final raw = await TdClient.shared.queryForSlot({
         '@type': 'getMessage',
         'chat_id': post.channel.id,
         'message_id': replyToMessageId,
-      });
+      }, post.accountSlot);
       final quoted = TDParse.message(raw);
       if (quoted == null) return;
       message.replyToPreview = _replyPreview(quoted);
-      message.replyToImage = quoted.image;
+      message.replyToImage = quoted.previewImage;
       message.replyToImageWidth = quoted.imageWidth;
       message.replyToImageHeight = quoted.imageHeight;
-      message.replyToSender = await _senderName(quoted) ?? post.channel.title;
+      message.replyToSender =
+          await _senderName(quoted, accountSlot: post.accountSlot) ??
+          post.channel.title;
     } catch (_) {
       message.replyToPreview ??= '';
       message.replyToSender ??= post.channel.title;
@@ -1446,25 +1581,15 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     var shouldNotify = false;
     try {
       try {
-        final properties = await TdClient.shared.query({
+        final properties = await TdClient.shared.queryForSlot({
           '@type': 'getMessageProperties',
           'chat_id': post.channel.id,
           'message_id': post.message.id,
-        });
+        }, post.accountSlot);
         if (properties.boolean('can_get_message_thread') == false) return null;
       } catch (_) {}
-      final thread = await TdClient.shared.query({
-        '@type': 'getMessageThread',
-        'chat_id': post.channel.id,
-        'message_id': post.message.id,
-      });
-      final chatId = thread.int64('chat_id');
-      final threadId = thread.int64('message_thread_id');
-      if (chatId == null || threadId == null || threadId == 0) return null;
-      final target = ChannelPostThreadTarget(
-        chatId: chatId,
-        messageThreadId: threadId,
-      );
+      final target = await _fetchChannelPostThreadTarget(post);
+      if (target == null) return null;
       post.threadTarget = target;
       shouldNotify = true;
       return target;
@@ -1479,14 +1604,14 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
   Future<void> _loadCommentsForPost(ChannelPost post, String key) async {
     try {
       final target = await _resolveThreadTarget(post);
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageThreadHistory',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'from_message_id': 0,
         'offset': 0,
         'limit': 5,
-      });
+      }, post.accountSlot);
       final rawMessages =
           response.objects('messages') ?? const <Map<String, dynamic>>[];
       final entries = <_LoadedPostComment>[];
@@ -1510,7 +1635,10 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
       final comments = <ChannelPostComment>[];
       for (final entry in entries.take(4)) {
         final message = entry.message;
-        final senderName = await _senderName(message);
+        final senderName = await _senderName(
+          message,
+          accountSlot: post.accountSlot,
+        );
         comments.add(
           ChannelPostComment(
             chatId: entry.chatId,
@@ -1563,9 +1691,9 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
   }
 
   List<MessageTextEntity> _commentEntities(ChatMessage message) {
-    return message.text == message.text.trim()
-        ? message.textEntities
-        : const [];
+    // The comment text is shown trimmed; keep the formatting by re-addressing
+    // the entities to the trimmed string instead of dropping them all.
+    return trimTextForDisplay(message.text, message.textEntities).entities;
   }
 
   void _appendPosts(int channelId, List<ChannelPost> posts) {
@@ -1584,11 +1712,19 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           post.authorName = previous.authorName;
           post.authorPhoto = previous.authorPhoto;
         }
-        post.message.replyToSender = previous.message.replyToSender;
-        post.message.replyToPreview = previous.message.replyToPreview;
-        post.message.replyToImage = previous.message.replyToImage;
-        post.message.replyToImageWidth = previous.message.replyToImageWidth;
-        post.message.replyToImageHeight = previous.message.replyToImageHeight;
+        if (post.message.replyToMessageId ==
+                previous.message.replyToMessageId &&
+            post.message.replyToChatId == previous.message.replyToChatId) {
+          post.message.replyToSender ??= previous.message.replyToSender;
+          if (!post.message.isContentRestricted) {
+            post.message.replyToPreview ??= previous.message.replyToPreview;
+            post.message.replyToImage ??= previous.message.replyToImage;
+            post.message.replyToImageWidth ??=
+                previous.message.replyToImageWidth;
+            post.message.replyToImageHeight ??=
+                previous.message.replyToImageHeight;
+          }
+        }
         final likesChanged =
             _reactionCount(previous.message) != _reactionCount(post.message);
         final commentsChanged =
@@ -1644,18 +1780,18 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     final previousPhoto = post.authorPhoto;
     try {
       if (senderId != null && senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, post.accountSlot);
         final name = TDParse.userName(user).trim();
         if (name.isNotEmpty) post.authorName = name;
         post.authorPhoto = TDParse.smallPhoto(user.obj('profile_photo'));
       } else if (senderId != null && senderId < 0) {
-        final chat = await TdClient.shared.query({
+        final chat = await TdClient.shared.queryForSlot({
           '@type': 'getChat',
           'chat_id': senderId,
-        });
+        }, post.accountSlot);
         final name = chat.str('title')?.trim();
         if (name != null && name.isNotEmpty) post.authorName = name;
         post.authorPhoto = TDParse.smallPhoto(chat.obj('photo'));
@@ -1675,21 +1811,24 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
 
   Future<void> _loadLikeNamesForPost(ChannelPost post, String key) async {
     try {
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageAddedReactions',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'reaction_type': {'@type': 'reactionTypeEmoji', 'emoji': '👍'},
         'offset': '',
         'limit': 4,
-      });
+      }, post.accountSlot);
       final raw =
           response.objects('added_reactions') ??
           response.objects('reactions') ??
           const <Map<String, dynamic>>[];
       final names = <String>[];
       for (final item in raw) {
-        final name = await _reactionSenderName(item.obj('sender_id'));
+        final name = await _reactionSenderName(
+          item.obj('sender_id'),
+          accountSlot: post.accountSlot,
+        );
         if (name != null && !names.contains(name)) names.add(name);
       }
       post.likeNames = names;
@@ -1701,25 +1840,29 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     }
   }
 
-  Future<String?> _reactionSenderName(Map<String, dynamic>? sender) async {
+  Future<String?> _reactionSenderName(
+    Map<String, dynamic>? sender, {
+    int? accountSlot,
+  }) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     try {
       switch (sender?.type) {
         case 'messageSenderUser':
           final userId = sender?.int64('user_id');
           if (userId == null) return null;
-          final user = await TdClient.shared.query({
+          final user = await TdClient.shared.queryForSlot({
             '@type': 'getUser',
             'user_id': userId,
-          });
+          }, slot);
           final name = TDParse.userName(user).trim();
           return name.isEmpty ? null : name;
         case 'messageSenderChat':
           final chatId = sender?.int64('chat_id');
           if (chatId == null) return null;
-          final chat = await TdClient.shared.query({
+          final chat = await TdClient.shared.queryForSlot({
             '@type': 'getChat',
             'chat_id': chatId,
-          });
+          }, slot);
           final name = chat.str('title')?.trim();
           return name == null || name.isEmpty ? null : name;
       }
@@ -1727,7 +1870,8 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     return null;
   }
 
-  Future<String?> _senderName(ChatMessage message) async {
+  Future<String?> _senderName(ChatMessage message, {int? accountSlot}) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     final senderId = message.senderId;
     if (senderId == null) {
       final title = message.senderTitle?.trim();
@@ -1735,17 +1879,17 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
     }
     try {
       if (senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, slot);
         final name = TDParse.userName(user).trim();
         return name.isEmpty ? null : name;
       }
-      final chat = await TdClient.shared.query({
+      final chat = await TdClient.shared.queryForSlot({
         '@type': 'getChat',
         'chat_id': senderId,
-      });
+      }, slot);
       final name = chat.str('title')?.trim();
       return name == null || name.isEmpty ? null : name;
     } catch (_) {
@@ -1811,7 +1955,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
         }
         return;
       }
-      await _sendThreadReply(target, text);
+      await _sendThreadReply(target, text, accountSlot: post.accountSlot);
       _replyController.clear();
       if (mounted) showToast(context, AppStringKeys.momentsReplied);
     } catch (e) {
@@ -1826,14 +1970,16 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
 
   Future<void> _sendThreadReply(
     ChannelPostThreadTarget target,
-    String text,
-  ) async {
+    String text, {
+    int? accountSlot,
+  }) async {
+    final slot = accountSlot ?? TdClient.shared.activeSlot;
     final content = {
       '@type': 'inputMessageText',
       'text': {'@type': 'formattedText', 'text': text},
     };
     try {
-      await TdClient.shared.query({
+      await TdClient.shared.queryForSlot({
         '@type': 'sendMessage',
         'chat_id': target.chatId,
         'topic_id': {
@@ -1841,9 +1987,9 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           'message_thread_id': target.messageThreadId,
         },
         'input_message_content': content,
-      });
+      }, slot);
     } catch (_) {
-      await TdClient.shared.query({
+      await TdClient.shared.queryForSlot({
         '@type': 'sendMessage',
         'chat_id': target.chatId,
         'reply_to': {
@@ -1851,7 +1997,7 @@ class _ChannelMomentsViewState extends State<ChannelMomentsView> {
           'message_id': target.messageThreadId,
         },
         'input_message_content': content,
-      });
+      }, slot);
     }
   }
 
@@ -2520,7 +2666,7 @@ class _ChannelMomentsSearchViewState extends State<ChannelMomentsSearchView> {
   Widget _header() {
     final c = context.colors;
     return Container(
-      padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
+      padding: EdgeInsets.only(top: topChromeInsetOf(context)),
       decoration: BoxDecoration(
         color: c.navBar,
         border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),
@@ -2796,7 +2942,15 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
   void initState() {
     super.initState();
     _target = post.threadTarget;
-    _tdSub = TdClient.shared.subscribe().listen(_handleTdUpdate);
+    _tdSub = TdClient.shared
+        .updatesOfAny(const [
+          'updateNewMessage',
+          'updateMessageContent',
+          'updateMessageEdited',
+          'updateMessageInteractionInfo',
+          'updateDeleteMessages',
+        ])
+        .listen(_handleTdUpdate);
     _loadMe();
     _loadComments();
   }
@@ -2812,7 +2966,9 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
 
   Future<void> _loadMe() async {
     try {
-      final me = await TdClient.shared.query({'@type': 'getMe'});
+      final me = await TdClient.shared.queryForSlot({
+        '@type': 'getMe',
+      }, post.accountSlot);
       if (!mounted) return;
       final name = TDParse.userName(me).trim();
       setState(() {
@@ -2843,18 +2999,8 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
   Future<ChannelPostThreadTarget?> _resolveThreadTarget() async {
     if (_target != null) return _target;
     try {
-      final thread = await TdClient.shared.query({
-        '@type': 'getMessageThread',
-        'chat_id': post.channel.id,
-        'message_id': post.message.id,
-      });
-      final chatId = thread.int64('chat_id');
-      final threadId = thread.int64('message_thread_id');
-      if (chatId == null || threadId == null || threadId == 0) return null;
-      final target = ChannelPostThreadTarget(
-        chatId: chatId,
-        messageThreadId: threadId,
-      );
+      final target = await _fetchChannelPostThreadTarget(post);
+      if (target == null) return null;
       post.threadTarget = target;
       _target = target;
       return target;
@@ -2872,14 +3018,14 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
         if (mounted) setState(() => _loading = false);
         return;
       }
-      final response = await TdClient.shared.query({
+      final response = await TdClient.shared.queryForSlot({
         '@type': 'getMessageThreadHistory',
         'chat_id': post.channel.id,
         'message_id': post.message.id,
         'from_message_id': 0,
         'offset': 0,
         'limit': 120,
-      });
+      }, post.accountSlot);
       final rawMessages =
           response.objects('messages') ?? const <Map<String, dynamic>>[];
       final kept = <_LoadedPostComment>[];
@@ -2899,6 +3045,45 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
           ),
         );
       }
+      final keptByChatAndId =
+          <({int chatId, int messageId}), _LoadedPostComment>{
+            for (final entry in kept)
+              (chatId: entry.chatId, messageId: entry.message.id): entry,
+          };
+      final missingRepliesByChat = <int, Set<int>>{};
+      for (final entry in kept) {
+        final rid = entry.message.replyToMessageId;
+        final rChatId = entry.message.replyToChatId ?? entry.chatId;
+        final isPostRoot =
+            (rChatId == post.channel.id && rid == post.message.id) ||
+            (rChatId == target.chatId && rid == target.messageThreadId);
+        if (rid == null ||
+            isPostRoot ||
+            keptByChatAndId.containsKey((chatId: rChatId, messageId: rid))) {
+          continue;
+        }
+        missingRepliesByChat.putIfAbsent(rChatId, () => <int>{}).add(rid);
+      }
+      final externalReplyTargets =
+          <({int chatId, int messageId}), ChatMessage>{};
+      for (final batch in missingRepliesByChat.entries) {
+        try {
+          final res = await TdClient.shared.queryForSlot({
+            '@type': 'getMessages',
+            'chat_id': batch.key,
+            'message_ids': batch.value.toList(),
+          }, post.accountSlot);
+          for (final raw
+              in res.objects('messages') ?? const <Map<String, dynamic>>[]) {
+            final quoted = TDParse.message(raw);
+            if (quoted != null) {
+              final qChatId = quoted.chatId ?? batch.key;
+              externalReplyTargets[(chatId: qChatId, messageId: quoted.id)] =
+                  quoted;
+            }
+          }
+        } catch (_) {}
+      }
       // One query per distinct sender, in parallel. Resolving inline below
       // serialized up to 120 getUser/getChat round-trips, mostly repeats.
       final firstBySender = <int, ChatMessage>{};
@@ -2908,18 +3093,34 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
           firstBySender.putIfAbsent(senderId, () => entry.message);
         }
       }
+      for (final quoted in externalReplyTargets.values) {
+        final senderId = quoted.senderId;
+        if (senderId != null) {
+          firstBySender.putIfAbsent(senderId, () => quoted);
+        }
+      }
       final senders = <int, _CommentSender>{};
       await Future.wait(
         firstBySender.entries.map((entry) async {
           senders[entry.key] = await _commentSender(entry.value);
         }),
       );
+      final externalReplySenders = <({int chatId, int messageId}), String>{};
+      for (final entry in externalReplyTargets.entries) {
+        final quoted = entry.value;
+        final senderId = quoted.senderId;
+        final cached = senderId == null ? null : senders[senderId];
+        final sender = cached ?? await _commentSender(quoted);
+        externalReplySenders[entry.key] = sender.name;
+      }
       final comments = <ChannelPostComment>[];
       for (final entry in kept) {
         final message = entry.message;
         final senderId = message.senderId;
         final cached = senderId == null ? null : senders[senderId];
         final sender = cached ?? await _commentSender(message);
+        final rid = message.replyToMessageId;
+        final rChatId = message.replyToChatId ?? entry.chatId;
         comments.add(
           ChannelPostComment(
             chatId: entry.chatId,
@@ -2929,7 +3130,11 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
             text: _commentText(message),
             entities: _commentEntities(message),
             date: message.date,
-            replyToMessageId: message.replyToMessageId,
+            replyToChatId: rid == null ? null : rChatId,
+            replyToMessageId: rid,
+            replyToSenderName: rid == null
+                ? null
+                : externalReplySenders[(chatId: rChatId, messageId: rid)],
             reactionCount: _reactionCount(message),
           ),
         );
@@ -2950,9 +3155,9 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
   }
 
   List<MessageTextEntity> _commentEntities(ChatMessage message) {
-    return message.text == message.text.trim()
-        ? message.textEntities
-        : const [];
+    // The comment text is shown trimmed; keep the formatting by re-addressing
+    // the entities to the trimmed string instead of dropping them all.
+    return trimTextForDisplay(message.text, message.textEntities).entities;
   }
 
   int _reactionCount(ChatMessage message) =>
@@ -2963,10 +3168,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
     final senderId = message.senderId;
     try {
       if (senderId != null && senderId > 0) {
-        final user = await TdClient.shared.query({
+        final user = await TdClient.shared.queryForSlot({
           '@type': 'getUser',
           'user_id': senderId,
-        });
+        }, post.accountSlot);
         final name = TDParse.userName(user).trim();
         return _CommentSender(
           name: name.isNotEmpty
@@ -2976,10 +3181,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
         );
       }
       if (senderId != null && senderId < 0) {
-        final chat = await TdClient.shared.query({
+        final chat = await TdClient.shared.queryForSlot({
           '@type': 'getChat',
           'chat_id': senderId,
-        });
+        }, post.accountSlot);
         final name = chat.str('title')?.trim();
         return _CommentSender(
           name: name == null || name.isEmpty
@@ -3014,7 +3219,7 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
     try {
       final replyMessageId = replyTo?.messageId;
       if (replyMessageId == null) {
-        await TdClient.shared.query({
+        await TdClient.shared.queryForSlot({
           '@type': 'sendMessage',
           'chat_id': target.chatId,
           'topic_id': {
@@ -3022,10 +3227,10 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
             'message_thread_id': target.messageThreadId,
           },
           'input_message_content': content,
-        });
+        }, post.accountSlot);
       } else {
         try {
-          await TdClient.shared.query({
+          await TdClient.shared.queryForSlot({
             '@type': 'sendMessage',
             'chat_id': target.chatId,
             'topic_id': {
@@ -3037,9 +3242,9 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
               'message_id': replyMessageId,
             },
             'input_message_content': content,
-          });
+          }, post.accountSlot);
         } catch (_) {
-          await TdClient.shared.query({
+          await TdClient.shared.queryForSlot({
             '@type': 'sendMessage',
             'chat_id': target.chatId,
             'reply_to': {
@@ -3047,7 +3252,7 @@ class _ChannelPostDetailViewState extends State<ChannelPostDetailView> {
               'message_id': replyMessageId,
             },
             'input_message_content': content,
-          });
+          }, post.accountSlot);
         }
       }
       _replyController.clear();
@@ -3290,12 +3495,17 @@ class _CommentThreadList extends StatelessWidget {
         ),
       );
     }
-    final byId = {for (final comment in comments) comment.messageId: comment};
-    final roots = comments.where((comment) => _isRoot(comment, byId)).toList();
+    final byChatAndId = <({int chatId, int messageId}), ChannelPostComment>{
+      for (final comment in comments)
+        (chatId: comment.chatId, messageId: comment.messageId): comment,
+    };
+    final roots = comments
+        .where((comment) => _isRoot(comment, byChatAndId))
+        .toList();
     final childrenByRoot = <int, List<ChannelPostComment>>{};
     for (final comment in comments) {
-      if (_isRoot(comment, byId)) continue;
-      final rootId = _rootId(comment, byId);
+      if (_isRoot(comment, byChatAndId)) continue;
+      final rootId = _rootId(comment, byChatAndId);
       childrenByRoot.putIfAbsent(rootId, () => []).add(comment);
     }
     // Flattened once per build so the tiles themselves can be built lazily.
@@ -3303,12 +3513,18 @@ class _CommentThreadList extends StatelessWidget {
     for (final root in roots) {
       final children =
           childrenByRoot[root.messageId] ?? const <ChannelPostComment>[];
-      entries.add(_ThreadEntry(comment: root, endsGroup: children.isEmpty));
+      entries.add(
+        _ThreadEntry(
+          comment: root,
+          prefix: _rootReplyPrefix(root),
+          endsGroup: children.isEmpty,
+        ),
+      );
       for (var i = 0; i < children.length; i++) {
         entries.add(
           _ThreadEntry(
             comment: children[i],
-            prefix: _replyPrefix(children[i], root, byId),
+            prefix: _replyPrefix(children[i], root, byChatAndId),
             nested: true,
             endsGroup: i == children.length - 1,
           ),
@@ -3339,38 +3555,76 @@ class _CommentThreadList extends StatelessWidget {
     );
   }
 
-  bool _isRoot(ChannelPostComment comment, Map<int, ChannelPostComment> byId) {
-    final replyTo = comment.replyToMessageId;
-    return replyTo == null ||
-        replyTo == post.message.id ||
-        replyTo == post.threadTarget?.messageThreadId ||
-        !byId.containsKey(replyTo);
+  ({int chatId, int messageId})? _replyKey(ChannelPostComment comment) {
+    final rid = comment.replyToMessageId;
+    if (rid == null) return null;
+    return (chatId: comment.replyToChatId ?? comment.chatId, messageId: rid);
   }
 
-  int _rootId(ChannelPostComment comment, Map<int, ChannelPostComment> byId) {
+  bool _isPostRootReply(ChannelPostComment comment) {
+    final rid = comment.replyToMessageId;
+    if (rid == null) return true;
+    final rChatId = comment.replyToChatId ?? comment.chatId;
+    if (rChatId == post.channel.id && rid == post.message.id) return true;
+    final target = post.threadTarget;
+    if (target != null &&
+        rChatId == target.chatId &&
+        rid == target.messageThreadId) {
+      return true;
+    }
+    return false;
+  }
+
+  bool _isRoot(
+    ChannelPostComment comment,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
+  ) {
+    if (_isPostRootReply(comment)) return true;
+    final key = _replyKey(comment);
+    return key == null || !byChatAndId.containsKey(key);
+  }
+
+  int _rootId(
+    ChannelPostComment comment,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
+  ) {
     var current = comment;
-    final seen = <int>{};
-    while (current.replyToMessageId != null &&
-        byId.containsKey(current.replyToMessageId) &&
-        seen.add(current.messageId)) {
-      final parent = byId[current.replyToMessageId]!;
-      if (_isRoot(parent, byId)) return parent.messageId;
+    final seen = <({int chatId, int messageId})>{};
+    while (seen.add((chatId: current.chatId, messageId: current.messageId))) {
+      final key = _replyKey(current);
+      if (key == null) break;
+      final parent = byChatAndId[key];
+      if (parent == null) break;
+      if (_isRoot(parent, byChatAndId)) return parent.messageId;
       current = parent;
     }
     return current.messageId;
   }
 
+  String? _rootReplyPrefix(ChannelPostComment comment) {
+    if (_isPostRootReply(comment)) return null;
+    final parentName = comment.replyToSenderName?.trim();
+    if (parentName == null || parentName.isEmpty) return null;
+    return AppStrings.t(AppStringKeys.momentsReplyPrefix, {
+      'value1': parentName,
+    });
+  }
+
   String? _replyPrefix(
     ChannelPostComment comment,
     ChannelPostComment root,
-    Map<int, ChannelPostComment> byId,
+    Map<({int chatId, int messageId}), ChannelPostComment> byChatAndId,
   ) {
-    final replyTo = comment.replyToMessageId;
-    if (replyTo == null || replyTo == root.messageId) return null;
-    final parent = byId[replyTo];
-    if (parent == null) return null;
+    final key = _replyKey(comment);
+    if (key == null ||
+        (key.chatId == root.chatId && key.messageId == root.messageId)) {
+      return null;
+    }
+    final parent = byChatAndId[key];
+    final parentName = parent?.senderName ?? comment.replyToSenderName;
+    if (parentName == null || parentName.trim().isEmpty) return null;
     return AppStrings.t(AppStringKeys.momentsReplyPrefix, {
-      'value1': parent.senderName,
+      'value1': parentName,
     });
   }
 }
@@ -3582,12 +3836,11 @@ class _ChannelPostComposerViewState extends State<ChannelPostComposerView> {
     final c = context.colors;
     return Container(
       padding: EdgeInsets.only(
-        top: MediaQuery.of(context).padding.top,
+        top: topChromeInsetOf(context),
         left: AppSpacing.xxl,
         right: AppSpacing.xxl,
       ),
-      height:
-          MediaQuery.of(context).padding.top + AppMetric.composerHeaderHeight,
+      height: topChromeInsetOf(context) + AppMetric.composerHeaderHeight,
       color: c.groupedBackground,
       child: Row(
         children: [
@@ -3972,13 +4225,24 @@ class _ChannelPostComposerViewState extends State<ChannelPostComposerView> {
       return;
     }
     setState(() => _sending = true);
+    // Read the switch before any await: 盘古之白 applies to whatever this
+    // composer posts, body and captions alike.
+    final spaceOutgoing = context.read<ThemeController>().panguOnSend;
     try {
-      final formatted = _richTextPayload?.text.trim() == text
+      final parsed = _richTextPayload?.text.trim() == text
           ? _richTextPayload!
           : await parseTelegramMarkdownWithTdLib(
               text,
               query: TdClient.shared.query,
             );
+      // Spacing lands after Markdown parsing, so the entity offsets TDLib
+      // produced stay valid for the text that goes out.
+      final spaced = PanguSpacing.gated(
+        enabled: spaceOutgoing,
+        text: parsed.text,
+        entities: parsed.entities,
+      );
+      final formatted = FormattedTextPayload(spaced.text, spaced.entities);
       if (_attachments.isEmpty) {
         await _sendTextPost(channel, formatted);
       } else {
@@ -4139,24 +4403,44 @@ class ChannelPostRow extends StatelessWidget {
                 ),
               ],
             ),
+            if (message.hasForwardAttribution) ...[
+              const SizedBox(height: 10),
+              Text(
+                key: const ValueKey('momentsForwardAttribution'),
+                AppStrings.t(AppStringKeys.messageBubbleForwardedFrom, {
+                  'value1': message.forwardDisplayName,
+                }),
+                style: TextStyle(fontSize: 13, color: c.linkBlue),
+              ),
+            ],
             if (text.isNotEmpty) ...[
               const SizedBox(height: 12),
-              TelegramRichText(
-                text: text,
-                entities: _displayTextMessage?.textEntities ?? const [],
-                quoteBackgroundColor: _momentQuoteFill(c),
-                style: TextStyle(
-                  fontSize: 15,
-                  height: 1.35,
-                  color: c.textPrimary,
-                ),
-                onMentionTap: (userId, name) {
-                  unawaited(
-                    openAdaptiveUserProfile(
-                      context,
-                      userId: userId,
-                      name: name,
+              Builder(
+                builder: (context) {
+                  // Trim the raw selected caption and its entities together.
+                  // Passing `_displayText` would discard its original offsets.
+                  final display = trimTextForDisplay(
+                    _displayTextMessage?.text ?? '',
+                    _displayTextMessage?.textEntities ?? const [],
+                  );
+                  return TelegramRichText(
+                    text: display.text,
+                    entities: display.entities,
+                    quoteBackgroundColor: _momentQuoteFill(c),
+                    style: TextStyle(
+                      fontSize: 15,
+                      height: 1.35,
+                      color: c.textPrimary,
                     ),
+                    onMentionTap: (userId, name) {
+                      unawaited(
+                        openAdaptiveUserProfile(
+                          context,
+                          userId: userId,
+                          name: name,
+                        ),
+                      );
+                    },
                   );
                 },
               ),
@@ -4173,6 +4457,19 @@ class ChannelPostRow extends StatelessWidget {
                 accountSlot: post.accountSlot,
               ),
             ],
+            for (final item in messages)
+              if (!item.isContentRestricted && item.music != null) ...[
+                const SizedBox(height: 10),
+                _PostMusicCard(message: item, post: post),
+              ] else if (!item.isContentRestricted &&
+                  _hasStickerMedia(item)) ...[
+                const SizedBox(height: 10),
+                _PostSticker(
+                  key: ValueKey('moments-sticker-${item.id}'),
+                  message: item,
+                  accountSlot: post.accountSlot,
+                ),
+              ],
             const SizedBox(height: 12),
             _PostActions(
               post: post,
@@ -4203,6 +4500,7 @@ class ChannelPostRow extends StatelessWidget {
 
   ChatMessage? get _displayTextMessage {
     for (final message in messages) {
+      if (_hasStickerMedia(message)) continue;
       final text = message.text.trim();
       if (text.isNotEmpty && !(text.startsWith('[') && text.endsWith(']'))) {
         return message;
@@ -4211,8 +4509,20 @@ class ChannelPostRow extends StatelessWidget {
     return null;
   }
 
-  List<ChatMessage> get _imageMessages =>
-      messages.where((message) => message.isAlbumVisualMedia).toList();
+  // Album eligibility excludes animations/video notes and requires a photo
+  // thumbnail. A standalone playable post does not have those restrictions.
+  List<ChatMessage> get _imageMessages => messages
+      .where(
+        (message) =>
+            message.isAlbumVisualMedia ||
+            (message.video != null &&
+                const {
+                  'messageVideo',
+                  'messageAnimation',
+                  'messageVideoNote',
+                }.contains(message.contentType)),
+      )
+      .toList();
 
   bool get _hasInlineComments =>
       message.commentCount > 0 || (post.comments?.isNotEmpty ?? false);
@@ -4222,10 +4532,227 @@ class ChannelPostRow extends StatelessWidget {
   bool get _hasSignedAuthor =>
       !_isChannelSelfPost(post) && post.authorName?.trim().isNotEmpty == true;
 
-  bool get _hasReplyQuote =>
-      message.replyToMessageId != null &&
-      ((message.replyToPreview?.trim().isNotEmpty ?? false) ||
-          message.replyToImage != null);
+  bool get _hasReplyQuote => message.replyToMessageId != null;
+}
+
+bool _hasStickerMedia(ChatMessage message) =>
+    !message.isContentRestricted &&
+    (message.contentType == 'messageSticker' ||
+        message.contentType == 'messageAnimatedEmoji') &&
+    (message.image != null ||
+        message.animatedSticker != null ||
+        message.videoSticker != null);
+
+class _PostMusicCard extends StatelessWidget {
+  const _PostMusicCard({required this.message, required this.post});
+
+  final ChatMessage message;
+  final ChannelPost post;
+
+  @override
+  Widget build(BuildContext context) {
+    final music = message.music!;
+    final player = MusicPlayerController.shared;
+    final colors = context.colors;
+    final duration = math.max(0, music.duration);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 360),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: colors.card,
+          borderRadius: BorderRadius.circular(AppRadius.card),
+          border: Border.all(color: colors.divider, width: 0.5),
+        ),
+        child: Row(
+          children: [
+            AnimatedBuilder(
+              animation: player,
+              builder: (context, _) {
+                final sameAccount =
+                    post.accountSlot == TdClient.shared.activeSlot;
+                final active = sameAccount && player.isActive(music.file);
+                final playing = active && player.isPlaying;
+                final loading = active && player.isLoading;
+                final canPlay = sameAccount && music.file != null;
+                return Semantics(
+                  button: true,
+                  enabled: canPlay,
+                  label:
+                      (playing
+                              ? AppStringKeys.musicPlayerPause
+                              : AppStringKeys.musicPlayerPlay)
+                          .l10n(context),
+                  child: GestureDetector(
+                    key: ValueKey('moments-music-play-${message.id}'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: !canPlay
+                        ? null
+                        : () => unawaited(
+                            player.playChat(
+                              ChatMessage(
+                                id: message.id,
+                                isOutgoing: message.isOutgoing,
+                                text: '',
+                                date: message.date,
+                                chatId: post.channel.id,
+                                senderName: post.channel.title,
+                                music: music,
+                              ),
+                              post.channel.id,
+                              title: post.channel.title,
+                            ),
+                          ),
+                    child: SizedBox.square(
+                      dimension: 52,
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          if (music.cover != null)
+                            TDImage(
+                              photo: music.cover,
+                              accountSlot: post.accountSlot,
+                            ),
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: music.cover == null
+                                  ? AppTheme.brand
+                                  : Colors.black.withValues(alpha: 0.45),
+                              borderRadius: BorderRadius.circular(
+                                AppRadius.control,
+                              ),
+                            ),
+                            child: Center(
+                              child: loading
+                                  ? const SizedBox.square(
+                                      dimension: 20,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : AppIcon(
+                                      playing
+                                          ? HeroAppIcons.pause
+                                          : HeroAppIcons.play,
+                                      size: 24,
+                                      color: Colors.white,
+                                    ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    music.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: colors.textPrimary,
+                    ),
+                  ),
+                  if ((music.performer ?? '').trim().isNotEmpty)
+                    Text(
+                      music.performer!.trim(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: colors.textSecondary,
+                      ),
+                    ),
+                  Text(
+                    '${duration ~/ 60}:${(duration % 60).toString().padLeft(2, '0')}',
+                    style: TextStyle(fontSize: 12, color: colors.textTertiary),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PostSticker extends StatefulWidget {
+  const _PostSticker({
+    super.key,
+    required this.message,
+    required this.accountSlot,
+  });
+
+  final ChatMessage message;
+  final int accountSlot;
+
+  @override
+  State<_PostSticker> createState() => _PostStickerState();
+}
+
+class _PostStickerState extends State<_PostSticker> {
+  bool _ready = false;
+
+  @override
+  void didUpdateWidget(_PostSticker oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.accountSlot != widget.accountSlot ||
+        oldWidget.message.animatedSticker?.id !=
+            widget.message.animatedSticker?.id) {
+      _ready = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final message = widget.message;
+    final width = math.max(1, message.imageWidth ?? 180).toDouble();
+    final height = math.max(1, message.imageHeight ?? 180).toDouble();
+    final scale = 180 / math.max(width, height);
+    final activeAccount = widget.accountSlot == TdClient.shared.activeSlot;
+    return SizedBox(
+      width: width * scale,
+      height: height * scale,
+      child: RepaintBoundary(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (message.image != null &&
+                !_ready &&
+                (!activeAccount || message.videoSticker == null))
+              TDImage(
+                photo: message.image,
+                accountSlot: widget.accountSlot,
+                fit: BoxFit.contain,
+                cornerRadius: 0,
+              ),
+            if (activeAccount && message.animatedSticker != null)
+              AnimatedStickerView(
+                file: message.animatedSticker!,
+                onReady: () {
+                  if (mounted) setState(() => _ready = true);
+                },
+              )
+            else if (activeAccount && message.videoSticker != null)
+              VideoStickerView(
+                file: message.videoSticker!,
+                fallback: message.image,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _PostReplyQuote extends StatelessWidget {
@@ -4237,11 +4764,13 @@ class _PostReplyQuote extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = context.colors;
     final sender = message.replyToSender?.trim();
-    final preview = message.replyToPreview?.trim() ?? '';
+    final preview = message.replyPreviewText?.trim() ?? '';
     final image = message.replyToImage;
     final pixelRatio = MediaQuery.devicePixelRatioOf(context);
-    final hasText = (sender?.isNotEmpty ?? false) || preview.isNotEmpty;
+    final hasText =
+        (sender?.isNotEmpty ?? false) || preview.isNotEmpty || image == null;
     return Container(
+      key: const ValueKey('momentsReplyQuote'),
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(13, 10, 13, 10),
       decoration: BoxDecoration(
@@ -4268,6 +4797,7 @@ class _PostReplyQuote extends StatelessWidget {
           if (hasText)
             Expanded(
               child: RichText(
+                textScaler: MediaQuery.textScalerOf(context),
                 maxLines: 4,
                 overflow: TextOverflow.ellipsis,
                 text: TextSpan(
@@ -4285,7 +4815,11 @@ class _PostReplyQuote extends StatelessWidget {
                           fontWeight: FontWeight.w500,
                         ),
                       ),
-                    TextSpan(text: preview.replaceAll('\n', ' ')),
+                    TextSpan(
+                      text: preview.isEmpty && image == null
+                          ? AppStringKeys.chatInputBarReply.l10n(context)
+                          : preview.replaceAll('\n', ' '),
+                    ),
                   ],
                 ),
               ),
@@ -4493,16 +5027,21 @@ class _PostImageGroup extends StatelessWidget {
     required Widget child,
   }) {
     return GestureDetector(
+      key: ValueKey('moments-media-${messages[index].id}'),
       behavior: HitTestBehavior.opaque,
       onTap: () => _openMedia(context, messages[index]),
-      child: child,
+      child: MessageMediaSpoiler(
+        message: messages[index],
+        accountSlot: accountSlot,
+        child: child,
+      ),
     );
   }
 
   void _openMedia(BuildContext context, ChatMessage message) {
     final video = message.video;
     if (video != null) {
-      Navigator.of(context).push(
+      Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute(
           fullscreenDialog: true,
           builder: (_) => VideoOnDemandPlayerView(queue: _videoQueue(message)),
@@ -4514,7 +5053,13 @@ class _PostImageGroup extends StatelessWidget {
   }
 
   VideoPlaybackQueue _videoQueue(ChatMessage current) {
-    final videos = messages.where((message) => message.video != null).toList();
+    final videos = messages
+        .where(
+          (message) =>
+              message.video != null &&
+              canPreviewMediaAlongside(message, current),
+        )
+        .toList();
     if (!videos.any((message) => message.id == current.id)) videos.add(current);
     final index = videos.indexWhere((message) => message.id == current.id);
     return VideoPlaybackQueue(
@@ -4538,7 +5083,12 @@ class _PostImageGroup extends StatelessWidget {
 
   void _openImage(BuildContext context, ChatMessage startMessage) {
     final photoMessages = messages
-        .where((message) => message.isPhoto && message.image != null)
+        .where(
+          (message) =>
+              message.isPhoto &&
+              message.image != null &&
+              canPreviewMediaAlongside(message, startMessage),
+        )
         .toList();
     final refs = photoMessages.map((message) => message.image!).toList();
     if (refs.isEmpty) return;
@@ -5973,9 +6523,7 @@ class MomentsViewModel extends ChangeNotifier {
     _started = true;
     loading = true;
     notifyListeners();
-    _sub = TdClient.shared.subscribe().listen((update) {
-      if (update.type == 'updateChatActiveStories') _handle(update);
-    });
+    _sub = TdClient.shared.updatesOf('updateChatActiveStories').listen(_handle);
     unawaited(_loadSelf());
     unawaited(_loadAll());
   }
@@ -6101,4 +6649,20 @@ class MomentsViewModel extends ChangeNotifier {
       ..sort((a, b) => b.order.compareTo(a.order));
     notifyListeners();
   }
+}
+
+/// The discussion thread holding [post]'s comments, or null when TDLib
+/// reports none.
+Future<ChannelPostThreadTarget?> _fetchChannelPostThreadTarget(
+  ChannelPost post,
+) async {
+  final thread = await TdClient.shared.queryForSlot({
+    '@type': 'getMessageThread',
+    'chat_id': post.channel.id,
+    'message_id': post.message.id,
+  }, post.accountSlot);
+  final chatId = thread.int64('chat_id');
+  final threadId = thread.int64('message_thread_id');
+  if (chatId == null || threadId == null || threadId == 0) return null;
+  return ChannelPostThreadTarget(chatId: chatId, messageThreadId: threadId);
 }

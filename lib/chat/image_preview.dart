@@ -2,6 +2,7 @@ import 'package:flutter/material.dart' show Brightness, Theme;
 import 'package:flutter/widgets.dart';
 
 import '../app/desktop_image_preview_window.dart';
+import '../media/media_metadata.dart';
 import '../tdlib/td_models.dart';
 import '../theme/app_motion.dart';
 import 'full_image_viewer.dart';
@@ -13,12 +14,21 @@ bool imagePreviewCanUseIndependentWindow({
   String? primaryActionLabel,
   Future<void> Function(int index)? onPrimaryAction,
   Future<void> Function(int index)? onMore,
-}) => primaryActionLabel == null && onPrimaryAction == null && onMore == null;
+  ImageViewerMessageActions? messageActions,
+  List<MediaMetadata?> metadata = const [],
+}) =>
+    primaryActionLabel == null &&
+    onPrimaryAction == null &&
+    onMore == null &&
+    messageActions == null &&
+    // The native window has no menu, so a gallery that carries media facts
+    // would silently drop them there.
+    metadata.isEmpty;
 
 /// Opens the selected image in an independent native window on desktop.
 ///
 /// Mobile/tablet, action-bearing previews, and native-window failures retain
-/// the existing in-app gallery without changing navigation behavior.
+/// an in-app gallery above the tab navigators and their navigation bars.
 Future<void> openImagePreview(
   BuildContext context, {
   required List<TdFileRef> items,
@@ -26,6 +36,8 @@ Future<void> openImagePreview(
   String? primaryActionLabel,
   Future<void> Function(int index)? onPrimaryAction,
   Future<void> Function(int index)? onMore,
+  ImageViewerMessageActions? messageActions,
+  List<MediaMetadata?> metadata = const [],
 }) async {
   if (items.isEmpty) return;
   final index = startIndex.clamp(0, items.length - 1);
@@ -33,6 +45,8 @@ Future<void> openImagePreview(
     primaryActionLabel: primaryActionLabel,
     onPrimaryAction: onPrimaryAction,
     onMore: onMore,
+    messageActions: messageActions,
+    metadata: metadata,
   )) {
     final opened = await DesktopImagePreviewWindowService.instance.open(
       items,
@@ -42,7 +56,7 @@ Future<void> openImagePreview(
     if (opened) return;
   }
   if (!context.mounted) return;
-  await Navigator.of(context).push<void>(
+  await Navigator.of(context, rootNavigator: true).push<void>(
     AppPageRoute<void>(
       fullscreenDialog: true,
       pageBuilder: (_, _, _) => FullImageViewer(
@@ -51,6 +65,8 @@ Future<void> openImagePreview(
         primaryActionLabel: primaryActionLabel,
         onPrimaryAction: onPrimaryAction,
         onMore: onMore,
+        messageActions: messageActions,
+        metadata: metadata,
       ),
     ),
   );

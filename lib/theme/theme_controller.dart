@@ -151,6 +151,34 @@ enum ChatListSwipeMode {
   final AppIconData icon;
 }
 
+/// Where ordinary web links leave the chat surface.
+///
+/// Telegram links still resolve through TDLib and are unaffected by this
+/// device-wide preference.
+enum LinkOpenMode {
+  askEveryTime(
+    AppStringKeys.linkBrowserAskEveryTime,
+    AppStringKeys.linkBrowserAskEveryTimeDescription,
+    HeroAppIcons.questionCircle,
+  ),
+  internalBrowser(
+    AppStringKeys.linkBrowserMithkaBrowser,
+    AppStringKeys.linkBrowserMithkaBrowserDescription,
+    HeroAppIcons.globe,
+  ),
+  defaultBrowser(
+    AppStringKeys.linkBrowserDefaultBrowser,
+    AppStringKeys.linkBrowserDefaultBrowserDescription,
+    HeroAppIcons.arrowTopRight,
+  );
+
+  const LinkOpenMode(this.label, this.description, this.icon);
+
+  final String label;
+  final String description;
+  final AppIconData icon;
+}
+
 enum MobileMessageActionMenuStyle {
   grid(AppStringKeys.appearanceMessageActionMenuGrid, HeroAppIcons.grip),
   dropdown(
@@ -948,24 +976,7 @@ class ThemeController extends ChangeNotifier {
     // the retired opt-out preference so an older `false` value cannot keep a
     // selected theme from applying to the interface.
     _prefs.remove(_scopedThemeKey(_legacyUseTelegramThemeForUiKey));
-    _customMessageBubbleBackground = _decodeCustomMessageBubbleBackground(
-      _scopedThemeKey(_customMessageBubbleBackgroundKey),
-    );
-    _messageBubblesEnabled =
-        _prefs.getBool(_scopedThemeKey(_messageBubblesEnabledKey)) ?? true;
-    _messageBubbleBackground = MessageBubbleBackground.fromStorage(
-      _prefs.getString(_scopedThemeKey(_messageBubbleBackgroundKey)),
-    );
-    _messageBubbleApplicationScope = MessageBubbleApplicationScope.values
-        .firstWhere(
-          (scope) =>
-              scope.name ==
-              _prefs.getString(
-                _scopedThemeKey(_messageBubbleApplicationScopeKey),
-              ),
-          orElse: () => MessageBubbleApplicationScope.allMessages,
-        );
-    _repairMissingCustomMessageBubble();
+    _loadScopedMessageBubbleSettings();
     if (hasCloudTheme &&
         (_prefs.containsKey(_preCloudThemeModeKey) ||
             _prefs.containsKey(_preCloudThemeBrandKey))) {
@@ -1113,10 +1124,25 @@ class ThemeController extends ChangeNotifier {
         );
     _enterToSend = _prefs.getBool(_enterToSendKey) ?? false;
     _openChatsAtLatest = _prefs.getBool(_openChatsAtLatestKey) ?? false;
+    // Wide chats show the group context pane on arrival; this opts out.
+    _hideChatContextPane = _prefs.getBool(_hideChatContextPaneKey) ?? false;
+    _linkOpenMode = LinkOpenMode.values.firstWhere(
+      (mode) => mode.name == _prefs.getString(_linkOpenModeKey),
+      orElse: () => LinkOpenMode.defaultBrowser,
+    );
     _showSavedMessagesIdentity =
         _prefs.getBool(_showSavedMessagesIdentityKey) ?? false;
     _preserveSenderWhenRepeating =
         _prefs.getBool(_preserveSenderWhenRepeatingKey) ?? true;
+    // Markdown detection is heuristic, so rich-text forwarding stays opt-in.
+    _forwardRichMarkdown = _prefs.getBool(_forwardRichMarkdownKey) ?? false;
+    // Viewer media facts are on by default, like the Swift Nagram setting.
+    _mediaMetadataEnabled = _prefs.getBool(_mediaMetadataEnabledKey) ?? true;
+    // 盘古之白 changes how text reads, never what a message says, so all three
+    // directions stay opt-in.
+    _panguOnReceive = _prefs.getBool(_panguOnReceiveKey) ?? false;
+    _panguOnSend = _prefs.getBool(_panguOnSendKey) ?? false;
+    _panguOnEdit = _prefs.getBool(_panguOnEditKey) ?? false;
     _quickRepliesEnabled = _prefs.getBool(_quickRepliesEnabledKey) ?? true;
     final storedQuickReactions = _prefs.getStringList(_quickReactionsKey);
     _quickReactions = storedQuickReactions == null
@@ -1130,10 +1156,17 @@ class ThemeController extends ChangeNotifier {
     _groupImageMessages = _prefs.getBool(_groupImageMessagesKey) ?? true;
     _hideBlockedUserMessages =
         _prefs.getBool(_hideBlockedUserMessagesKey) ?? false;
+    // Restricted media the user wants on screen without confirming per message.
+    _autoRevealRestrictedMedia =
+        _prefs.getBool(_autoRevealRestrictedMediaKey) ?? false;
+    _liquidGlassBottomBar = _prefs.getBool(_liquidGlassBottomBarKey) ?? false;
     _showChannelsTab = _prefs.getBool(_showChannelsTabKey) ?? false;
+    _showContactsTab = _prefs.getBool(_showContactsTabKey) ?? true;
     _showMomentsTab = _prefs.getBool(_showMomentsTabKey) ?? true;
     _showShortVideos = _prefs.getBool(_showShortVideosKey) ?? true;
     _communitiesEnabled = _prefs.getBool(_communitiesEnabledKey) ?? true;
+    _saveCapturedPhotosToAlbum =
+        _prefs.getBool(_saveCapturedPhotosToAlbumKey) ?? false;
     final storedArchivedChatsMode = _prefs.getString(
       _archivedChatsDisplayModeKey,
     );
@@ -1153,6 +1186,8 @@ class ThemeController extends ChangeNotifier {
       (m) => m.name == _prefs.getString(_unreadBadgeOverflowModeKey),
       orElse: () => UnreadBadgeOverflowMode.capped,
     );
+    _showFolderUnreadBadges =
+        _prefs.getBool(_showFolderUnreadBadgesKey) ?? true;
     AppTheme.applyBrand(_brandColor); // before the first MaterialApp build
   }
 
@@ -1221,22 +1256,36 @@ class ThemeController extends ChangeNotifier {
       'mobileMessageActionMenuStyle.v1';
   static const _enterToSendKey = 'enterToSend';
   static const _openChatsAtLatestKey = 'openChatsAtLatest';
+  static const _hideChatContextPaneKey = 'hideChatContextPane';
+  static const _linkOpenModeKey = 'linkOpenMode.v1';
   static const _showSavedMessagesIdentityKey = 'showSavedMessagesIdentity';
   static const _preserveSenderWhenRepeatingKey = 'preserveSenderWhenRepeating';
+  static const _forwardRichMarkdownKey = 'forwardRichMarkdown';
+  static const _mediaMetadataEnabledKey = 'mediaMetadataEnabled';
+  static const _panguOnReceiveKey = 'panguOnReceive';
+  static const _panguOnSendKey = 'panguOnSend';
+  static const _panguOnEditKey = 'panguOnEdit';
   static const _quickRepliesEnabledKey = 'quickRepliesEnabled';
   static const _quickReactionsKey = 'quickReactions';
   static const _groupImageMessagesKey = 'groupImageMessages';
   static const _hideBlockedUserMessagesKey = 'hideBlockedUserMessages';
+  static const _autoRevealRestrictedMediaKey = 'autoRevealRestrictedMedia';
+  static const _liquidGlassBottomBarKey = 'liquidGlassBottomBar';
   static const _showChannelsTabKey = 'showChannelsTab';
+  static const _showContactsTabKey = 'showContactsTab';
   static const _showMomentsTabKey = 'showMomentsTab';
   static const _showShortVideosKey = 'showShortVideos';
   static const _communitiesEnabledKey = 'communitiesEnabled';
+  static const _saveCapturedPhotosToAlbumKey = 'saveCapturedPhotosToAlbum';
   static const _archivedChatsDisplayModeKey = 'archivedChatsDisplayMode';
   static const _unreadBadgeModeKey = 'unreadBadgeMode';
   static const _unreadBadgeOverflowModeKey = 'unreadBadgeOverflowMode';
+  static const _showFolderUnreadBadgesKey = 'showFolderUnreadBadges';
 
   static const double minFontScale = 0.8;
-  static const double maxFontScale = 1.4;
+  // Text reflows inside bubbles and rows that grow with it, so a generous
+  // ceiling is safe: 2.0 covers users the old 1.4 cap left behind.
+  static const double maxFontScale = 2.0;
   static const double minInterfaceScale = 0.66 * 0.66;
   static const double maxInterfaceScale = 1.50 * 1.50;
 
@@ -1299,19 +1348,31 @@ class ThemeController extends ChangeNotifier {
   late MobileMessageActionMenuStyle _mobileMessageActionMenuStyle;
   bool _enterToSend = false;
   bool _openChatsAtLatest = false;
+  bool _hideChatContextPane = false;
+  late LinkOpenMode _linkOpenMode;
   bool _showSavedMessagesIdentity = false;
   bool _preserveSenderWhenRepeating = true;
+  bool _forwardRichMarkdown = false;
+  bool _mediaMetadataEnabled = true;
+  bool _panguOnReceive = false;
+  bool _panguOnSend = false;
+  bool _panguOnEdit = false;
   bool _quickRepliesEnabled = true;
   late List<QuickReactionChoice> _quickReactions;
   bool _groupImageMessages = true;
   bool _hideBlockedUserMessages = false;
+  bool _autoRevealRestrictedMedia = false;
+  bool _liquidGlassBottomBar = false;
   bool _showChannelsTab = false;
+  bool _showContactsTab = true;
   bool _showMomentsTab = true;
   bool _showShortVideos = true;
   bool _communitiesEnabled = true;
+  bool _saveCapturedPhotosToAlbum = false;
   late ArchivedChatsDisplayMode _archivedChatsDisplayMode;
   late UnreadBadgeMode _unreadBadgeMode;
   late UnreadBadgeOverflowMode _unreadBadgeOverflowMode;
+  late bool _showFolderUnreadBadges;
 
   AppearanceMode get mode => _mode;
   bool get themingEnabled => _themingEnabled;
@@ -1530,6 +1591,27 @@ class ThemeController extends ChangeNotifier {
     }
   }
 
+  void _loadScopedMessageBubbleSettings() {
+    _customMessageBubbleBackground = _decodeCustomMessageBubbleBackground(
+      _scopedThemeKey(_customMessageBubbleBackgroundKey),
+    );
+    _messageBubblesEnabled =
+        _prefs.getBool(_scopedThemeKey(_messageBubblesEnabledKey)) ?? true;
+    _messageBubbleBackground = MessageBubbleBackground.fromStorage(
+      _prefs.getString(_scopedThemeKey(_messageBubbleBackgroundKey)),
+    );
+    _messageBubbleApplicationScope = MessageBubbleApplicationScope.values
+        .firstWhere(
+          (scope) =>
+              scope.name ==
+              _prefs.getString(
+                _scopedThemeKey(_messageBubbleApplicationScopeKey),
+              ),
+          orElse: () => MessageBubbleApplicationScope.allMessages,
+        );
+    _repairMissingCustomMessageBubble();
+  }
+
   void _repairMissingCustomMessageBubble() {
     final custom = _customMessageBubbleBackground;
     if (custom == null) {
@@ -1560,24 +1642,7 @@ class ThemeController extends ChangeNotifier {
     _lightCloudTheme = _decodeTheme(_scopedThemeKey(_lightCloudThemeKey));
     _darkCloudTheme = _decodeTheme(_scopedThemeKey(_darkCloudThemeKey));
     _prefs.remove(_scopedThemeKey(_legacyUseTelegramThemeForUiKey));
-    _customMessageBubbleBackground = _decodeCustomMessageBubbleBackground(
-      _scopedThemeKey(_customMessageBubbleBackgroundKey),
-    );
-    _messageBubblesEnabled =
-        _prefs.getBool(_scopedThemeKey(_messageBubblesEnabledKey)) ?? true;
-    _messageBubbleBackground = MessageBubbleBackground.fromStorage(
-      _prefs.getString(_scopedThemeKey(_messageBubbleBackgroundKey)),
-    );
-    _messageBubbleApplicationScope = MessageBubbleApplicationScope.values
-        .firstWhere(
-          (scope) =>
-              scope.name ==
-              _prefs.getString(
-                _scopedThemeKey(_messageBubbleApplicationScopeKey),
-              ),
-          orElse: () => MessageBubbleApplicationScope.allMessages,
-        );
-    _repairMissingCustomMessageBubble();
+    _loadScopedMessageBubbleSettings();
     AppTheme.applyBrand(_brandColor);
   }
 
@@ -1731,6 +1796,7 @@ class ThemeController extends ChangeNotifier {
   bool get hideSidebarPhone => _hideSidebarPhone;
   bool get showMemberTags => _showMemberTags;
   bool get showPlainMemberRoleTags => _showPlainMemberRoleTags;
+
   NameColorAudience get chatListNameColorAudience => _chatListNameColorAudience;
   NameColorAudience get chatNameColorAudience => _chatNameColorAudience;
   StatusEmojiDisplayMode get chatListStatusEmojiMode =>
@@ -1750,17 +1816,47 @@ class ThemeController extends ChangeNotifier {
       _mobileMessageActionMenuStyle;
   bool get enterToSend => _enterToSend;
   bool get openChatsAtLatest => _openChatsAtLatest;
+
+  /// Whether a wide chat keeps its trailing group context pane closed until
+  /// the chat header button opens it.
+  bool get hideChatContextPane => _hideChatContextPane;
+  LinkOpenMode get linkOpenMode => _linkOpenMode;
   bool get showSavedMessagesIdentity => _showSavedMessagesIdentity;
   bool get preserveSenderWhenRepeating => _preserveSenderWhenRepeating;
+  bool get forwardRichMarkdown => _forwardRichMarkdown;
+
+  /// Shows the metadata row in the photo and video viewers' menus.
+  bool get mediaMetadataEnabled => _mediaMetadataEnabled;
+
+  /// Whether received messages render with 盘古之白: a display-only space
+  /// between CJK and half-width text. The stored message never changes.
+  bool get panguOnReceive => _panguOnReceive;
+
+  /// Whether composer text is spaced before it is sent.
+  bool get panguOnSend => _panguOnSend;
+
+  /// Whether an edit rewrites the message with spacing. Editing is separate
+  /// from sending because it changes a message the other side already read.
+  bool get panguOnEdit => _panguOnEdit;
   bool get quickRepliesEnabled => _quickRepliesEnabled;
   List<QuickReactionChoice> get quickReactions =>
       List.unmodifiable(_quickReactions);
   bool get groupImageMessages => _groupImageMessages;
   bool get hideBlockedUserMessages => _hideBlockedUserMessages;
+
+  /// Shows message content Telegram marked as restricted without asking first.
+  ///
+  /// Purely local: unlike the account's sensitive-content option it never writes
+  /// `ignore_sensitive_content_restrictions`, so it cannot lift a restriction
+  /// the server still enforces.
+  bool get autoRevealRestrictedMedia => _autoRevealRestrictedMedia;
+  bool get liquidGlassBottomBar => _liquidGlassBottomBar;
   bool get showChannelsTab => _showChannelsTab;
+  bool get showContactsTab => _showContactsTab;
   bool get showMomentsTab => _showMomentsTab;
   bool get showShortVideos => _showShortVideos;
   bool get communitiesEnabled => _communitiesEnabled;
+  bool get saveCapturedPhotosToAlbum => _saveCapturedPhotosToAlbum;
   ArchivedChatsDisplayMode get archivedChatsDisplayMode =>
       _archivedChatsDisplayMode;
   UnreadBadgeMode get unreadBadgeMode => _unreadBadgeMode;
@@ -1770,6 +1866,7 @@ class ThemeController extends ChangeNotifier {
       _unreadBadgeOverflowMode;
   bool get capUnreadBadgeAt99 =>
       _unreadBadgeOverflowMode == UnreadBadgeOverflowMode.capped;
+  bool get showFolderUnreadBadges => _showFolderUnreadBadges;
 
   NameColorAudience _storedNameColorAudience(
     String key, {
@@ -1801,18 +1898,36 @@ class ThemeController extends ChangeNotifier {
     return value;
   }
 
-  /// App-wide text scale factor, applied at the root via MediaQuery.textScaler.
+  /// App-wide text scale factor, applied at the root via MediaQuery.textScaler
+  /// by the scaled app views. Every surface follows it — chat transcripts,
+  /// chat list, navigation and settings alike.
   double get fontScale => _fontScale;
-  // Font scaling is applied once by the root MediaQuery. Returning an already
-  // scaled size here made chat typography grow twice while navigation text
-  // grew once.
+
+  /// The scale text actually renders at: the user's own font size preference
+  /// on top of the platform accessibility text size, capped at the range the
+  /// app's layouts are tested against so an extreme system setting cannot
+  /// break a fixed layout on its own.
+  ///
+  /// The system size only ever enlarges. This control owns how small the app
+  /// gets — it shows its setting as a percentage, and a device asking for
+  /// text below the platform default would otherwise render 100% smaller than
+  /// the sizes the app is designed at. Enlarging still composes, so a system
+  /// accessibility size carries into the app on its own.
+  double effectiveTextScale(TextScaler systemScaler) =>
+      (_fontScale * math.max(systemScaler.scale(1.0), 1.0)).clamp(
+        minFontScale,
+        maxFontScale,
+      );
+
+  // Font scaling is applied once by the root MediaQuery; Text applies it
+  // implicitly and RichText reads it explicitly. Returning an already scaled
+  // size here made chat typography grow twice.
   double chatTextSize(double base) => base;
 
   /// Squared value shown by the Interface Size control. For example, the
   /// historical 1.5 render scale is presented as 225%.
   double get interfaceScale => _interfaceScale * _interfaceScale;
   double get renderedInterfaceScale => math.sqrt(interfaceScale);
-  double get rowHeight => AppMetric.listRowHeight;
   double get avatarSize => AppMetric.avatarSize;
   double get navHeaderHeight => AppMetric.navHeaderHeight;
   double scaled(double base) => base;
@@ -1970,6 +2085,20 @@ class ThemeController extends ChangeNotifier {
     _mode = value;
     _prefs.setString(_scopedThemeKey(_modeKey), value.name);
     notifyListeners();
+  }
+
+  /// Leave automatic mode by reversing the appearance currently on screen.
+  /// Once explicit, use the selected mode so repeated clicks also work while
+  /// the animated theme or the switch's build callback still has old data.
+  void toggleDayNight(Brightness currentBrightness) {
+    mode = switch (_mode) {
+      AppearanceMode.light => AppearanceMode.dark,
+      AppearanceMode.dark => AppearanceMode.light,
+      AppearanceMode.system =>
+        currentBrightness == Brightness.dark
+            ? AppearanceMode.light
+            : AppearanceMode.dark,
+    };
   }
 
   /// The active scope's accent / brand color.
@@ -2566,6 +2695,20 @@ class ThemeController extends ChangeNotifier {
     notifyListeners();
   }
 
+  set hideChatContextPane(bool value) {
+    if (_hideChatContextPane == value) return;
+    _hideChatContextPane = value;
+    _prefs.setBool(_hideChatContextPaneKey, value);
+    notifyListeners();
+  }
+
+  set linkOpenMode(LinkOpenMode value) {
+    if (_linkOpenMode == value) return;
+    _linkOpenMode = value;
+    _prefs.setString(_linkOpenModeKey, value.name);
+    notifyListeners();
+  }
+
   set showSavedMessagesIdentity(bool value) {
     if (_showSavedMessagesIdentity == value) return;
     _showSavedMessagesIdentity = value;
@@ -2577,6 +2720,41 @@ class ThemeController extends ChangeNotifier {
     if (_preserveSenderWhenRepeating == value) return;
     _preserveSenderWhenRepeating = value;
     _prefs.setBool(_preserveSenderWhenRepeatingKey, value);
+    notifyListeners();
+  }
+
+  set forwardRichMarkdown(bool value) {
+    if (_forwardRichMarkdown == value) return;
+    _forwardRichMarkdown = value;
+    _prefs.setBool(_forwardRichMarkdownKey, value);
+    notifyListeners();
+  }
+
+  set mediaMetadataEnabled(bool value) {
+    if (_mediaMetadataEnabled == value) return;
+    _mediaMetadataEnabled = value;
+    _prefs.setBool(_mediaMetadataEnabledKey, value);
+    notifyListeners();
+  }
+
+  set panguOnReceive(bool value) {
+    if (_panguOnReceive == value) return;
+    _panguOnReceive = value;
+    _prefs.setBool(_panguOnReceiveKey, value);
+    notifyListeners();
+  }
+
+  set panguOnSend(bool value) {
+    if (_panguOnSend == value) return;
+    _panguOnSend = value;
+    _prefs.setBool(_panguOnSendKey, value);
+    notifyListeners();
+  }
+
+  set panguOnEdit(bool value) {
+    if (_panguOnEdit == value) return;
+    _panguOnEdit = value;
+    _prefs.setBool(_panguOnEditKey, value);
     notifyListeners();
   }
 
@@ -2625,9 +2803,29 @@ class ThemeController extends ChangeNotifier {
     notifyListeners();
   }
 
+  set autoRevealRestrictedMedia(bool value) {
+    if (_autoRevealRestrictedMedia == value) return;
+    _autoRevealRestrictedMedia = value;
+    _prefs.setBool(_autoRevealRestrictedMediaKey, value);
+    notifyListeners();
+  }
+
+  set liquidGlassBottomBar(bool value) {
+    if (_liquidGlassBottomBar == value) return;
+    _liquidGlassBottomBar = value;
+    _prefs.setBool(_liquidGlassBottomBarKey, value);
+    notifyListeners();
+  }
+
   set showChannelsTab(bool value) {
     _showChannelsTab = value;
     _prefs.setBool(_showChannelsTabKey, value);
+    notifyListeners();
+  }
+
+  set showContactsTab(bool value) {
+    _showContactsTab = value;
+    _prefs.setBool(_showContactsTabKey, value);
     notifyListeners();
   }
 
@@ -2647,6 +2845,13 @@ class ThemeController extends ChangeNotifier {
     if (_communitiesEnabled == value) return;
     _communitiesEnabled = value;
     _prefs.setBool(_communitiesEnabledKey, value);
+    notifyListeners();
+  }
+
+  set saveCapturedPhotosToAlbum(bool value) {
+    if (_saveCapturedPhotosToAlbum == value) return;
+    _saveCapturedPhotosToAlbum = value;
+    _prefs.setBool(_saveCapturedPhotosToAlbumKey, value);
     notifyListeners();
   }
 
@@ -2676,5 +2881,12 @@ class ThemeController extends ChangeNotifier {
     unreadBadgeOverflowMode = value
         ? UnreadBadgeOverflowMode.capped
         : UnreadBadgeOverflowMode.exact;
+  }
+
+  set showFolderUnreadBadges(bool value) {
+    if (_showFolderUnreadBadges == value) return;
+    _showFolderUnreadBadges = value;
+    _prefs.setBool(_showFolderUnreadBadgesKey, value);
+    notifyListeners();
   }
 }

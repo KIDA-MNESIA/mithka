@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mithka/chat/link_preview_fixer.dart';
 import 'package:mithka/components/ui_components.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/settings/general_settings_view.dart';
@@ -21,10 +22,14 @@ void main() {
       'showSavedMessagesIdentity': false,
       'preserveSenderWhenRepeating': true,
       'quickRepliesEnabled': true,
+      'linkOpenMode.v1': LinkOpenMode.defaultBrowser.name,
     });
     final prefs = await SharedPreferences.getInstance();
     final theme = ThemeController(prefs);
     addTearDown(theme.dispose);
+    // The row reads the shared fixer, which the app initializes at startup.
+    LinkPreviewFixer.shared.initialize(prefs);
+    addTearDown(() async => LinkPreviewFixer.shared.setEnabled(false));
 
     await tester.pumpWidget(_app(theme, const ChatBehaviorSettingsView()));
     await tester.pump();
@@ -40,7 +45,12 @@ void main() {
       'chat-behavior-open-at-latest',
       'chat-behavior-saved-messages-identity',
       'chat-behavior-preserve-sender',
+      'chat-behavior-forward-rich-markdown',
+      'chat-behavior-media-metadata',
+      'chat-behavior-fix-link-previews',
+      'chat-behavior-save-captured-photos',
       'chat-behavior-quick-replies',
+      'chat-behavior-link-browser',
     ]) {
       expect(find.byKey(ValueKey(key)), findsOneWidget);
     }
@@ -60,9 +70,15 @@ void main() {
       find.text(AppStrings.tForLocale('en', AppStringKeys.generalStorage)),
       findsNothing,
     );
+    // The group context pane is a per-session toggle in the chat header now,
+    // so the behavior page no longer carries a row for it.
+    expect(
+      find.byKey(const ValueKey('chat-behavior-context-pane')),
+      findsNothing,
+    );
     expect(
       find.byType(SettingsLeadingIcon),
-      findsNWidgets(6),
+      findsNWidgets(11),
       reason: 'detail rows use the shared accent line-icon treatment',
     );
     expect(
@@ -86,6 +102,20 @@ void main() {
     await tester.pump();
     expect(theme.openChatsAtLatest, isTrue);
 
+    // The controller still carries the preference saved by older versions;
+    // it is simply no longer surfaced as a settings row or applied to the
+    // shell. Reading and writing it must not throw or write anything new.
+    expect(
+      theme.hideChatContextPane,
+      isFalse,
+      reason: 'an older install default reads back as false',
+    );
+    theme.hideChatContextPane = true;
+    expect(theme.hideChatContextPane, isTrue);
+    expect(prefs.getBool('hideChatContextPane'), isTrue);
+    theme.hideChatContextPane = false;
+    expect(prefs.getBool('hideChatContextPane'), isFalse);
+
     await tester.tap(
       find.byKey(const ValueKey('chat-behavior-saved-messages-identity')),
     );
@@ -103,9 +133,88 @@ void main() {
     await tester.pump();
     expect(theme.preserveSenderWhenRepeating, isFalse);
 
-    await tester.tap(find.byKey(const ValueKey('chat-behavior-quick-replies')));
+    // One row longer than before, so the tail of the list needs a scroll
+    // before its switches are hittable.
+    final quickRepliesRow = find.byKey(
+      const ValueKey('chat-behavior-quick-replies'),
+    );
+    await tester.ensureVisible(quickRepliesRow);
+    await tester.pump();
+    await tester.tap(quickRepliesRow);
     await tester.pump();
     expect(theme.quickRepliesEnabled, isFalse);
+
+    final metadataRow = find.byKey(
+      const ValueKey('chat-behavior-media-metadata'),
+    );
+    await tester.ensureVisible(metadataRow);
+    await tester.pump();
+    expect(theme.mediaMetadataEnabled, isTrue);
+    await tester.tap(metadataRow);
+    await tester.pump();
+    expect(theme.mediaMetadataEnabled, isFalse);
+    expect(prefs.getBool('mediaMetadataEnabled'), isFalse);
+    // The preview fix keeps its own preference store, so the row is the only
+    // thing that can flip it.
+    final previewRow = find.byKey(
+      const ValueKey('chat-behavior-fix-link-previews'),
+    );
+    await tester.ensureVisible(previewRow);
+    await tester.pump();
+    expect(LinkPreviewFixer.shared.enabled, isFalse);
+    await tester.tap(previewRow);
+    await tester.pump();
+    expect(LinkPreviewFixer.shared.enabled, isTrue);
+    expect(prefs.getBool(LinkPreviewFixer.preferenceKey), isTrue);
+
+    LinkPreviewFixer.shared.initialize(prefs);
+    expect(
+      LinkPreviewFixer.shared.enabled,
+      isTrue,
+      reason: 'a later surface reads the same stored choice back',
+    );
+
+    final browserRow = find.byKey(const ValueKey('chat-behavior-link-browser'));
+    await tester.ensureVisible(browserRow);
+    // The jump needs a frame before the row's on-screen position is real.
+    await tester.pump();
+    expect(
+      find.descendant(
+        of: browserRow,
+        matching: find.text(
+          AppStrings.tForLocale('en', AppStringKeys.linkBrowserDefaultBrowser),
+        ),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(browserRow);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey('link-browser-mode-internalBrowser')),
+    );
+    await tester.pumpAndSettle();
+    expect(theme.linkOpenMode, LinkOpenMode.internalBrowser);
+    expect(prefs.getString('linkOpenMode.v1'), 'internalBrowser');
+
+    final restoredLinkModeTheme = ThemeController(prefs);
+    addTearDown(restoredLinkModeTheme.dispose);
+    expect(restoredLinkModeTheme.linkOpenMode, LinkOpenMode.internalBrowser);
+
+    expect(
+      theme.saveCapturedPhotosToAlbum,
+      isFalse,
+      reason: 'sending a photo does not grow the album until the user asks',
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('chat-behavior-save-captured-photos')),
+    );
+    await tester.pump();
+    expect(theme.saveCapturedPhotosToAlbum, isTrue);
+    expect(prefs.getBool('saveCapturedPhotosToAlbum'), isTrue);
+
+    final restoredCaptureTheme = ThemeController(prefs);
+    addTearDown(restoredCaptureTheme.dispose);
+    expect(restoredCaptureTheme.saveCapturedPhotosToAlbum, isTrue);
   });
 
   testWidgets('chat behavior keeps video playback navigation', (tester) async {
@@ -116,9 +225,12 @@ void main() {
 
     await tester.pumpWidget(_app(theme, const ChatBehaviorSettingsView()));
     await tester.pump();
-    await tester.tap(
-      find.byKey(const ValueKey('chat-behavior-video-playback')),
+    final playbackRow = find.byKey(
+      const ValueKey('chat-behavior-video-playback'),
     );
+    await tester.ensureVisible(playbackRow);
+    await tester.pump();
+    await tester.tap(playbackRow);
     await tester.pumpAndSettle();
 
     expect(find.byType(VideoPlaybackSettingsView), findsOneWidget);

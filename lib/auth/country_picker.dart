@@ -20,7 +20,7 @@ import 'telegram_country_names.dart';
 
 class Country {
   const Country(this.name, this.iso, this.dial);
-  final String name; // Chinese display name
+  final String name; // Offline localized display-name key
   final String iso; // ISO 3166-1 alpha-2
   final String dial; // dial code, digits only
 
@@ -39,10 +39,9 @@ class Country {
 
   static const Country china = Country(AppStringKeys.countryCN, 'CN', '86');
 
-  /// Every dialable region we ship (names localized to Chinese). Comprehensive
-  /// across distinct country calling codes; shared calling codes use
-  /// libphonenumber leading-digit metadata before falling back to a canonical
-  /// display country.
+  /// Every geographical region in the bundled libphonenumber metadata.
+  /// Shared calling codes use libphonenumber leading-digit metadata before
+  /// falling back to a canonical display country.
   static const List<Country> all = [
     // East Asia
     Country(AppStringKeys.countryCN, 'CN', '86'),
@@ -220,6 +219,86 @@ class Country {
     Country(AppStringKeys.countryTO, 'TO', '676'),
     Country(AppStringKeys.countryVU, 'VU', '678'),
     Country(AppStringKeys.countrySB, 'SB', '677'),
+    // Remaining geographical regions from the bundled libphonenumber metadata.
+    Country(AppStringKeys.countryAC, 'AC', '247'),
+    Country(AppStringKeys.countryAG, 'AG', '1'),
+    Country(AppStringKeys.countryAI, 'AI', '1'),
+    Country(AppStringKeys.countryAS, 'AS', '1'),
+    Country(AppStringKeys.countryAW, 'AW', '297'),
+    Country(AppStringKeys.countryAX, 'AX', '358'),
+    Country(AppStringKeys.countryBB, 'BB', '1'),
+    Country(AppStringKeys.countryBI, 'BI', '257'),
+    Country(AppStringKeys.countryBL, 'BL', '590'),
+    Country(AppStringKeys.countryBM, 'BM', '1'),
+    Country(AppStringKeys.countryBQ, 'BQ', '599'),
+    Country(AppStringKeys.countryBS, 'BS', '1'),
+    Country(AppStringKeys.countryCC, 'CC', '61'),
+    Country(AppStringKeys.countryCF, 'CF', '236'),
+    Country(AppStringKeys.countryCK, 'CK', '682'),
+    Country(AppStringKeys.countryCV, 'CV', '238'),
+    Country(AppStringKeys.countryCW, 'CW', '599'),
+    Country(AppStringKeys.countryCX, 'CX', '61'),
+    Country(AppStringKeys.countryDJ, 'DJ', '253'),
+    Country(AppStringKeys.countryDM, 'DM', '1'),
+    Country(AppStringKeys.countryDO, 'DO', '1'),
+    Country(AppStringKeys.countryEH, 'EH', '212'),
+    Country(AppStringKeys.countryER, 'ER', '291'),
+    Country(AppStringKeys.countryFK, 'FK', '500'),
+    Country(AppStringKeys.countryFM, 'FM', '691'),
+    Country(AppStringKeys.countryFO, 'FO', '298'),
+    Country(AppStringKeys.countryGD, 'GD', '1'),
+    Country(AppStringKeys.countryGF, 'GF', '594'),
+    Country(AppStringKeys.countryGG, 'GG', '44'),
+    Country(AppStringKeys.countryGI, 'GI', '350'),
+    Country(AppStringKeys.countryGL, 'GL', '299'),
+    Country(AppStringKeys.countryGM, 'GM', '220'),
+    Country(AppStringKeys.countryGP, 'GP', '590'),
+    Country(AppStringKeys.countryGQ, 'GQ', '240'),
+    Country(AppStringKeys.countryGU, 'GU', '1'),
+    Country(AppStringKeys.countryGW, 'GW', '245'),
+    Country(AppStringKeys.countryIM, 'IM', '44'),
+    Country(AppStringKeys.countryIO, 'IO', '246'),
+    Country(AppStringKeys.countryJE, 'JE', '44'),
+    Country(AppStringKeys.countryJM, 'JM', '1'),
+    Country(AppStringKeys.countryKI, 'KI', '686'),
+    Country(AppStringKeys.countryKM, 'KM', '269'),
+    Country(AppStringKeys.countryKN, 'KN', '1'),
+    Country(AppStringKeys.countryKY, 'KY', '1'),
+    Country(AppStringKeys.countryLC, 'LC', '1'),
+    Country(AppStringKeys.countryLR, 'LR', '231'),
+    Country(AppStringKeys.countryLS, 'LS', '266'),
+    Country(AppStringKeys.countryMF, 'MF', '590'),
+    Country(AppStringKeys.countryMH, 'MH', '692'),
+    Country(AppStringKeys.countryMP, 'MP', '1'),
+    Country(AppStringKeys.countryMQ, 'MQ', '596'),
+    Country(AppStringKeys.countryMS, 'MS', '1'),
+    Country(AppStringKeys.countryNC, 'NC', '687'),
+    Country(AppStringKeys.countryNF, 'NF', '672'),
+    Country(AppStringKeys.countryNR, 'NR', '674'),
+    Country(AppStringKeys.countryNU, 'NU', '683'),
+    Country(AppStringKeys.countryPF, 'PF', '689'),
+    Country(AppStringKeys.countryPM, 'PM', '508'),
+    Country(AppStringKeys.countryPR, 'PR', '1'),
+    Country(AppStringKeys.countryPW, 'PW', '680'),
+    Country(AppStringKeys.countryRE, 'RE', '262'),
+    Country(AppStringKeys.countrySC, 'SC', '248'),
+    Country(AppStringKeys.countrySH, 'SH', '290'),
+    Country(AppStringKeys.countrySJ, 'SJ', '47'),
+    Country(AppStringKeys.countrySL, 'SL', '232'),
+    Country(AppStringKeys.countryST, 'ST', '239'),
+    Country(AppStringKeys.countrySX, 'SX', '1'),
+    Country(AppStringKeys.countrySZ, 'SZ', '268'),
+    Country(AppStringKeys.countryTA, 'TA', '290'),
+    Country(AppStringKeys.countryTC, 'TC', '1'),
+    Country(AppStringKeys.countryTK, 'TK', '690'),
+    Country(AppStringKeys.countryTT, 'TT', '1'),
+    Country(AppStringKeys.countryTV, 'TV', '688'),
+    Country(AppStringKeys.countryVA, 'VA', '39'),
+    Country(AppStringKeys.countryVC, 'VC', '1'),
+    Country(AppStringKeys.countryVG, 'VG', '1'),
+    Country(AppStringKeys.countryVI, 'VI', '1'),
+    Country(AppStringKeys.countryWF, 'WF', '681'),
+    Country(AppStringKeys.countryYT, 'YT', '262'),
   ];
 
   /// `all`, sorted by localized display name for presentation.
@@ -232,7 +311,21 @@ class Country {
   /// Longest dial wins. Shared codes use libphonenumber's leading-digit
   /// metadata, which matches Telegram's country detection behavior for ranges
   /// such as +76/+77 Kazakhstan under the shared +7 country code.
-  static const _mainForCode = {'1': 'US', '7': 'RU', '44': 'GB', '86': 'CN'};
+  static const _mainForCode = {
+    '1': 'US',
+    '7': 'RU',
+    '39': 'IT',
+    '44': 'GB',
+    '47': 'NO',
+    '61': 'AU',
+    '86': 'CN',
+    '212': 'MA',
+    '262': 'RE',
+    '290': 'SH',
+    '358': 'FI',
+    '590': 'GP',
+    '599': 'CW',
+  };
 
   static Country? match(String digits) {
     if (digits.isEmpty) return null;
@@ -430,14 +523,18 @@ class _CountryPickerViewState extends State<CountryPickerView> {
                         children: [
                           CountryFlag(iso: country.iso),
                           const SizedBox(width: 12),
-                          Text(
-                            _displayName(country),
-                            style: TextStyle(
-                              fontSize: 17,
-                              color: c.textPrimary,
+                          Expanded(
+                            child: Text(
+                              _displayName(country),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 17,
+                                color: c.textPrimary,
+                              ),
                             ),
                           ),
-                          const Spacer(),
+                          const SizedBox(width: 8),
                           Text(
                             '+${country.dial}',
                             style: TextStyle(

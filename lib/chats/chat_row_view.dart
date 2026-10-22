@@ -2,8 +2,9 @@
 //  chat_row_view.dart
 //
 //  Reusable chat-list row: avatar with the unread count badged on its top-right
-//  corner; title + preview; and a right column holding the timestamp (top) and
-//  the mute bell at the row's bottom-right. Port of the Swift `ChatRowView`.
+//  corner and an optional marker on its bottom-right one; title + preview; and
+//  a right column holding the timestamp (top) and the mute bell at the row's
+//  bottom-right. Port of the Swift `ChatRowView`.
 //
 
 import 'package:flutter/material.dart';
@@ -20,6 +21,7 @@ import '../tdlib/td_models.dart';
 import '../theme/app_theme.dart';
 import '../theme/date_text.dart';
 import '../theme/theme_controller.dart';
+import 'chat_folder_tag_controller.dart';
 
 const List<Color> _telegramAccentColors = [
   Color(0xFFCC5049),
@@ -39,6 +41,7 @@ class ChatRowView extends StatelessWidget {
     this.selected = false,
     this.onClearUnread,
     this.avatarBuilder,
+    this.avatarBadge,
     this.titleTrailing,
     this.trailingIndicator,
   });
@@ -47,6 +50,10 @@ class ChatRowView extends StatelessWidget {
   final bool selected;
   final VoidCallback? onClearUnread;
   final Widget Function(double size)? avatarBuilder;
+
+  /// Marker pinned to the avatar's bottom-right corner. It lives inside the
+  /// avatar box, so its own gesture wins over the row's.
+  final Widget? avatarBadge;
   final Widget? titleTrailing;
   final Widget? trailingIndicator;
 
@@ -65,7 +72,10 @@ class ChatRowView extends StatelessWidget {
               ) ??
               chat.title
         : chat.title;
-    final rowHeight = AppMetric.chatListRowHeight();
+    final rowHeight = chatListRowExtentFor(context);
+    final folderTags =
+        context.watch<ChatFolderTagController?>()?.tagsFor(chat.folderIds) ??
+        const <ChatFolderTag>[];
     final avatarSize = AppMetric.chatListAvatarSize();
     final titleFontSize = AppTextSize.chatListTitle();
     final previewFontSize = AppTextSize.chatListPreview();
@@ -154,11 +164,49 @@ class ChatRowView extends StatelessWidget {
                         message: chat.lastMessage,
                         fontSize: previewFontSize,
                       ),
+                if (folderTags.isNotEmpty) ...[
+                  const SizedBox(height: AppSpacing.xxs),
+                  _folderTags(context, folderTags),
+                ],
               ],
             ),
           ),
           const SizedBox(width: AppSpacing.md),
           _rightColumn(context, rowHeight, timestampFontSize),
+        ],
+      ),
+    );
+  }
+
+  /// 文件夹标签, on their own line along the bottom of the row, under the
+  /// message preview. Names only, in each folder's own colour — a chat in five
+  /// folders would turn the row into a wall of chips otherwise.
+  Widget _folderTags(BuildContext context, List<ChatFolderTag> tags) {
+    final fontSize = AppTextSize.chatListFolderTag();
+    return SizedBox(
+      key: const ValueKey('chat-row-folder-tags'),
+      height: fontSize * 1.35,
+      child: Row(
+        children: [
+          for (final tag in tags) ...[
+            if (tag != tags.first) const SizedBox(width: AppSpacing.sm),
+            // Loose flex rather than a fixed width: a row of short folder
+            // names draws at its natural size, and only a set too wide for
+            // the row starts ellipsizing.
+            Flexible(
+              child: Text(
+                tag.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: fontSize,
+                  height: 1.0,
+                  fontWeight: AppTextWeight.medium,
+                  color: tag.color ?? AppTheme.brand,
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -232,6 +280,8 @@ class ChatRowView extends StatelessWidget {
                 ),
               ),
             ),
+          if (avatarBadge case final badge?)
+            Positioned(right: 0, bottom: 0, child: badge),
         ],
       ),
     );
@@ -262,10 +312,34 @@ class ChatRowView extends StatelessWidget {
             ),
             const Spacer(),
             SizedBox(
-              height: AppIconSize.sm,
+              height:
+                  chat.unreadMentionCount > 0 || chat.unreadReactionCount > 0
+                  ? AppMetric.unreadBadgeMin
+                  : AppIconSize.sm,
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  if (chat.unreadMentionCount > 0)
+                    _UnreadActivityBadge(
+                      key: const ValueKey('chat-row-unread-mention'),
+                      icon: HeroAppIcons.at,
+                      count: chat.unreadMentionCount,
+                      label: AppStrings.t(AppStringKeys.notificationMentions),
+                    ),
+                  if (chat.unreadMentionCount > 0 &&
+                      chat.unreadReactionCount > 0)
+                    const SizedBox(width: AppSpacing.xs),
+                  if (chat.unreadReactionCount > 0)
+                    _UnreadActivityBadge(
+                      key: const ValueKey('chat-row-unread-reaction'),
+                      icon: HeroAppIcons.heart,
+                      count: chat.unreadReactionCount,
+                      label: AppStrings.t(AppStringKeys.notificationReactions),
+                    ),
+                  if ((chat.unreadMentionCount > 0 ||
+                          chat.unreadReactionCount > 0) &&
+                      (chat.isPinned || chat.isMuted))
+                    const SizedBox(width: AppSpacing.xs),
                   if (chat.isPinned)
                     AppPinIcon(
                       key: const ValueKey('chat-row-pinned'),
@@ -287,6 +361,52 @@ class ChatRowView extends StatelessWidget {
                     const SizedBox(width: AppSpacing.xs),
                   if (showTrailingIndicator) ?trailingIndicator,
                 ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _UnreadActivityBadge extends StatelessWidget {
+  const _UnreadActivityBadge({
+    super.key,
+    required this.icon,
+    required this.count,
+    required this.label,
+  });
+
+  final AppIconData icon;
+  final int count;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final countLabel = count > 99 ? '99+' : '$count';
+    final colors = context.colors;
+    return Semantics(
+      label: '$label: $countLabel',
+      child: Container(
+        height: AppMetric.unreadBadgeMin,
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+        decoration: BoxDecoration(
+          color: colors.badgeBackground,
+          borderRadius: BorderRadius.circular(AppRadius.pill),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AppIcon(icon, size: 11, color: colors.badgeText),
+            const SizedBox(width: AppSpacing.xxs),
+            Text(
+              countLabel,
+              style: TextStyle(
+                color: colors.badgeText,
+                fontSize: 10,
+                fontWeight: AppTextWeight.semibold,
+                height: 1,
               ),
             ),
           ],

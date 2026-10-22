@@ -276,6 +276,85 @@ void main() {
     );
   });
 
+  for (final contentType in [
+    'messagePhoto',
+    'messageVideo',
+    'messageAnimation',
+  ]) {
+    for (final outgoing in [false, true]) {
+      for (final dimensions in [(600, 800), (900, 1600)]) {
+        testWidgets(
+          '$contentType ${dimensions.$1}x${dimensions.$2} '
+          '${outgoing ? "outgoing" : "incoming"} captions keep the media width',
+          (tester) async {
+            await tester.binding.setSurfaceSize(const Size(393, 852));
+            addTearDown(() => tester.binding.setSurfaceSize(null));
+            final message = ChatMessage(
+              id: 950,
+              isOutgoing: outgoing,
+              text: '',
+              date: 1,
+              contentType: contentType,
+              image: TdFileRef(
+                id: 1950,
+                miniThumb: base64Decode(
+                  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+                ),
+              ),
+              imageWidth: dimensions.$1,
+              imageHeight: dimensions.$2,
+              video: contentType == 'messagePhoto' ? null : TdFileRef(id: 1951),
+              videoFileSize: 100 * 1024 * 1024,
+            );
+            final bubble = find.byKey(const ValueKey('messageTapTarget-950'));
+            await pumpBubble(tester, message);
+            final originalSize = tester.getSize(bubble);
+
+            const caption = '我的煎饼果子启动了 反火腿肠机制，鸡柳和火腿肠掉出来了';
+            message.text = caption;
+            await pumpBubble(tester, message);
+
+            expect(
+              tester.getSize(bubble).width,
+              closeTo(originalSize.width, 0.01),
+            );
+            expect(
+              tester.getSize(bubble).height,
+              greaterThan(originalSize.height),
+            );
+            final captionRect = tester.getRect(
+              find.text(caption, findRichText: true),
+            );
+            final bubbleRect = tester.getRect(bubble);
+            expect(captionRect.left, greaterThanOrEqualTo(bubbleRect.left + 6));
+            expect(captionRect.right, lessThanOrEqualTo(bubbleRect.right - 6));
+
+            message.translationText =
+                'My pancake started shedding its filling: '
+                'the chicken and sausage have fallen out.';
+            message.translationLanguageCode = 'en';
+            message.forwardOrigin =
+                'A forwarded channel with a long display name';
+            message.replyToPreview =
+                'An earlier message with a long reply quote';
+            message.replyToSender = 'Original sender';
+            for (final style in TranslationDisplayStyle.values) {
+              await pumpBubble(tester, message, translationDisplayStyle: style);
+              expect(
+                tester.getSize(bubble).width,
+                closeTo(originalSize.width, 0.01),
+              );
+              expect(tester.takeException(), isNull);
+            }
+
+            // Expire the mocked TDLib file lookup timeouts before teardown.
+            await tester.pump(const Duration(minutes: 3, seconds: 1));
+          },
+        );
+      }
+    }
+  }
+
   testWidgets('grouped photo captions render their translation', (
     tester,
   ) async {
@@ -869,10 +948,14 @@ void main() {
       (replyDecoration.border! as Border).left.color,
       messageColors.outgoingReplyLine,
     );
-    expect(
-      tester.widget<Text>(find.text('Outgoing earlier message')).style?.color,
-      messageColors.outgoingReplyText,
-    );
+    final replyPreview = tester
+        .widgetList<RichText>(
+          find.descendant(of: reply, matching: find.byType(RichText)),
+        )
+        .singleWhere(
+          (widget) => widget.text.toPlainText() == 'Outgoing earlier message',
+        );
+    expect(replyPreview.text.style?.color, messageColors.outgoingReplyText);
     expect(
       tester
           .widgetList<Text>(
@@ -1077,10 +1160,14 @@ void main() {
       (replyDecoration.border! as Border).left.color,
       messageColors.incomingReplyLine,
     );
-    expect(
-      tester.widget<Text>(find.text('Earlier message')).style?.color,
-      messageColors.incomingReplyText,
-    );
+    final replyPreview = tester
+        .widgetList<RichText>(
+          find.descendant(of: reply, matching: find.byType(RichText)),
+        )
+        .singleWhere(
+          (widget) => widget.text.toPlainText() == 'Earlier message',
+        );
+    expect(replyPreview.text.style?.color, messageColors.incomingReplyText);
     final replyLabels = tester.widgetList<Text>(
       find.descendant(of: reply, matching: find.byType(Text)),
     );
@@ -1145,11 +1232,10 @@ void main() {
 
     await pumpBubble(tester, message, messageColors: messageColors);
 
-    final openOriginal = find.byKey(const ValueKey('messageReplyOpenOriginal'));
     expect(
       tester
-          .widget<AppIcon>(
-            find.descendant(of: openOriginal, matching: find.byType(AppIcon)),
+          .widget<AppArrowUpToLineIcon>(
+            find.byKey(const ValueKey('messageReplyNavigateUpIcon')),
           )
           .color,
       messageColors.incomingReplyMediaText,

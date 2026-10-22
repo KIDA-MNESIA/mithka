@@ -18,6 +18,7 @@ void main() {
 
   late int historyCalls;
   late List<Map<String, dynamic>> requests;
+  late int newestMessage;
 
   setUpAll(() {
     TdClient.shared.configureProxy(
@@ -49,8 +50,7 @@ void main() {
             case 'getChatHistory':
               final from = request['from_message_id'] as int? ?? 0;
               historyCalls++;
-              final newest = historyCalls >= 3 ? 1001 : 1000;
-              final start = from > 0 ? from - 1 : newest;
+              final start = from > 0 ? from - 1 : newestMessage;
               return {'@type': 'messages', 'messages': _historyPage(start)};
             case 'loadChats':
               return {'@type': 'ok'};
@@ -72,6 +72,7 @@ void main() {
 
   setUp(() {
     historyCalls = 0;
+    newestMessage = 1000;
     requests = [];
   });
 
@@ -82,6 +83,7 @@ void main() {
   ) async {
     final theme = ThemeController(await SharedPreferences.getInstance());
     addTearDown(theme.dispose);
+    final historyStorage = PageStorageBucket();
     final channel = ChatSummary(
       id: _channelId,
       title: 'History channel',
@@ -105,7 +107,10 @@ void main() {
           GlobalCupertinoLocalizations.delegate,
         ],
         theme: ThemeData(extensions: [AppColors.light]),
-        home: ChannelMomentsView(initialChannels: [channel]),
+        home: ChannelMomentsView(
+          initialChannels: [channel],
+          historyStorage: historyStorage,
+        ),
       ),
     );
 
@@ -119,19 +124,28 @@ void main() {
     firstController.jumpTo(400);
     await tester.pump();
     final savedOffset = firstController.offset;
+    final visiblePost = find.byWidgetPredicate(
+      (widget) => widget is ChannelPostRow && widget.post.message.id == 999,
+    );
+    final savedPostY = tester.getTopLeft(visiblePost).dy;
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
 
+    newestMessage = 1001;
     await tester.pumpWidget(view());
+    // History is present before the asynchronous refresh/route transition.
+    expect(tester.getTopLeft(visiblePost).dy, closeTo(savedPostY, 1));
     await tester.pumpAndSettle();
     expect(historyCalls, 2);
     final restoredController = tester
         .widget<ListView>(find.byType(ListView).first)
         .controller!;
-    expect(restoredController.offset, closeTo(savedOffset, 1));
+    expect(tester.getTopLeft(visiblePost).dy, closeTo(savedPostY, 1));
+    expect(restoredController.offset, greaterThan(savedOffset + 50));
 
     final callsBeforeRefresh = historyCalls;
+    newestMessage = 1002;
     await tester.tap(find.byKey(const ValueKey('moments-refresh-latest')));
     await tester.pumpAndSettle();
     expect(historyCalls, greaterThan(callsBeforeRefresh));
@@ -146,7 +160,7 @@ void main() {
       find.byWidgetPredicate(
         (widget) =>
             widget is RichText &&
-            widget.text.toPlainText().contains('Post 1001'),
+            widget.text.toPlainText().contains('Post 1002'),
       ),
       findsOneWidget,
     );

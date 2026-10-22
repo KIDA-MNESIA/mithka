@@ -4,7 +4,9 @@ import 'dart:ui' show SemanticsAction;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mithka/chat/media_spoiler.dart';
 import 'package:mithka/chat/shared_media_view.dart';
+import 'package:mithka/components/photo_avatar.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:mithka/tdlib/td_client.dart';
 
@@ -83,6 +85,34 @@ void main() {
   tearDownAll(() async {
     await TdClient.shared.closeProxy();
     await updates.close();
+  });
+
+  testWidgets('video browser masks spoiler thumbnails until clicked', (
+    tester,
+  ) async {
+    _configureView(tester, const Size(1024, 768), TargetPlatform.macOS);
+    messages = [_videoMessage(1, 501, 'Hidden video', 30)];
+    (messages.single['content'] as Map<String, dynamic>)['has_spoiler'] = true;
+    await tester.pumpWidget(
+      _app(
+        const SharedMediaView(
+          chatId: 101,
+          title: 'Videos',
+          initialTab: 4,
+          lockedTab: true,
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.byType(MediaSpoiler), findsOneWidget);
+    expect(find.byType(TDImage), findsNothing);
+    await tester.tap(find.byType(MediaSpoiler));
+    await tester.pump();
+    expect(find.bySemanticsLabel('Spoiler. Tap to reveal'), findsNothing);
+    expect(find.byType(SharedMediaView), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    debugDefaultTargetPlatformOverride = null;
   });
 
   testWidgets('wide macOS hides the inner header for Video and Music', (
@@ -305,8 +335,8 @@ void main() {
 
       expect(find.byKey(const ValueKey('shared-video-grid')), findsOneWidget);
       final first = find.byKey(const ValueKey('shared-video-card-101-1'));
-      final second = find.byKey(const ValueKey('shared-video-card-101-4'));
-      final fourth = find.byKey(const ValueKey('shared-video-card-101-2'));
+      final second = find.byKey(const ValueKey('shared-video-card-101-2'));
+      final fourth = find.byKey(const ValueKey('shared-video-card-101-4'));
       expect(first, findsOneWidget);
       expect(second, findsOneWidget);
       expect(fourth, findsOneWidget);
@@ -374,6 +404,38 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     },
   );
+
+  testWidgets('all videos keeps message order when a download completes', (
+    tester,
+  ) async {
+    _configureView(tester, const Size(760, 720), TargetPlatform.macOS);
+    messages = [
+      _videoMessage(2, 502, 'Night train', 142),
+      _videoMessage(1, 501, 'Alpine lake', 95),
+    ];
+
+    await tester.pumpWidget(
+      _app(
+        const SharedMediaView(
+          chatId: 101,
+          title: 'Videos',
+          initialTab: 4,
+          displayTitle: AppStringKeys.sharedMediaVideos,
+          lockedTab: true,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final first = tester.getTopLeft(
+      find.byKey(const ValueKey('shared-video-card-101-2')),
+    );
+    final completed = tester.getTopLeft(
+      find.byKey(const ValueKey('shared-video-card-101-1')),
+    );
+    expect(first.dx, lessThan(completed.dx));
+    debugDefaultTargetPlatformOverride = null;
+  });
 
   testWidgets('wide Video keeps loading and empty states in the grid surface', (
     tester,
@@ -447,7 +509,7 @@ void main() {
 
     await tester.drag(
       find.byKey(const ValueKey('shared-video-grid')),
-      const Offset(0, -12000),
+      const Offset(0, -20000),
     );
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 80));

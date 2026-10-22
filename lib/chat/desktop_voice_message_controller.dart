@@ -4,7 +4,7 @@
 /// behavior testable without requesting microphone access from widget tests.
 enum DesktopVoiceMessageAction { none, start, stop, cancel }
 
-/// Waits for macOS microphone permission and recorder creation before starting
+/// Waits for microphone permission and recorder creation before starting
 /// the press that requested it. Releasing while the system permission sheet is
 /// open cancels that pending start instead of recording after the gesture ends.
 Future<void> prepareDesktopVoiceRecording({
@@ -22,10 +22,19 @@ DesktopVoiceMessageAction desktopVoiceMessageAction({
   required bool isEscape,
   required bool isKeyDown,
   required bool isRecording,
+  bool spaceHeld = false,
+  bool hasModifiers = false,
 }) {
-  if (isEscape && isKeyDown) return DesktopVoiceMessageAction.cancel;
+  // Finish the exact held press even if a modifier was pressed afterward, or
+  // microphone permission/recorder setup has not completed yet.
+  if (!isKeyDown) {
+    return isSpace && spaceHeld
+        ? DesktopVoiceMessageAction.stop
+        : DesktopVoiceMessageAction.none;
+  }
+  if (hasModifiers) return DesktopVoiceMessageAction.none;
+  if (isEscape) return DesktopVoiceMessageAction.cancel;
   if (!isSpace) return DesktopVoiceMessageAction.none;
-  if (isKeyDown && !isRecording) return DesktopVoiceMessageAction.start;
-  if (!isKeyDown && isRecording) return DesktopVoiceMessageAction.stop;
+  if (!isRecording && !spaceHeld) return DesktopVoiceMessageAction.start;
   return DesktopVoiceMessageAction.none;
 }

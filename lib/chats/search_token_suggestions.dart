@@ -10,6 +10,8 @@
 //
 
 import '../chat/chat_search_query.dart';
+import '../chat/telegram_link.dart';
+import '../l10n/app_localizations.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
@@ -53,10 +55,29 @@ class ChatSearchTokenSuggester {
   Future<List<ChatSearchTokenSuggestion>> suggest(
     ChatSearchActiveToken token, {
     int? scopeChatId,
-  }) => switch (token.kind) {
-    ChatSearchTokenKind.chat => _chats(token.value),
-    ChatSearchTokenKind.from => _senders(token.value, scopeChatId),
+  }) async => switch (token.kind) {
+    ChatSearchTokenKind.chat => await _chats(token.value),
+    ChatSearchTokenKind.from => await _senders(token.value, scopeChatId),
+    ChatSearchTokenKind.has => _hasValues(token.value),
   };
+
+  /// The closed vocabulary of `has:`.
+  ///
+  /// Every kind the field understands; the needle keeps the aliases whose
+  /// token text matches what has been typed.
+  List<ChatSearchTokenSuggestion> _hasValues(String query) {
+    final needle = query.toLowerCase();
+    return [
+      for (final (:alias, :filter) in chatSearchHasSuggestions)
+        if (needle.isEmpty || alias.toLowerCase().contains(needle))
+          ChatSearchTokenSuggestion(
+            id: filter.index,
+            title: AppStrings.t(filter.labelKey),
+            token: alias,
+            subtitle: alias,
+          ),
+    ];
+  }
 
   /// Chats for `in:`. An empty token offers the top of the chat list, so the
   /// affordance is useful before anything is typed.
@@ -121,6 +142,11 @@ class ChatSearchTokenSuggester {
     String query,
     int? scopeChatId,
   ) async {
+    final lookupUserId = telegramUserIdFromQuery(query);
+    if (lookupUserId != null) {
+      final resolved = await _user(lookupUserId, showUserId: true);
+      if (resolved != null) return [resolved];
+    }
     if (query.startsWith('@') && query.length > 1) {
       final resolved = await _username(query.substring(1));
       if (resolved != null) return [resolved];
@@ -255,18 +281,28 @@ class ChatSearchTokenSuggester {
     }
   }
 
-  Future<ChatSearchTokenSuggestion?> _user(int userId) async {
+  Future<ChatSearchTokenSuggestion?> _user(
+    int userId, {
+    bool showUserId = false,
+  }) async {
     try {
       final user = await _client.query({'@type': 'getUser', 'user_id': userId});
+      if (user.obj('type')?.type == 'userTypeDeleted') return null;
       final name = TDParse.userName(user);
       final username = TDParse.activeUsernames(user).firstOrNull;
+      final hasUsername = username != null && username.isNotEmpty;
+      final baseSubtitle = hasUsername ? '@$username' : null;
       return ChatSearchTokenSuggestion(
         id: userId,
         title: name,
         // A username is stable and unambiguous; a display name is neither, so
         // it is only the token when there is nothing better.
-        token: username == null || username.isEmpty ? name : '@$username',
-        subtitle: username == null || username.isEmpty ? null : '@$username',
+        token: hasUsername ? '@$username' : (showUserId ? '$userId' : name),
+        subtitle: showUserId
+            ? (baseSubtitle == null
+                  ? 'ID: $userId'
+                  : '$baseSubtitle · ID: $userId')
+            : baseSubtitle,
         photo: TDParse.smallPhoto(user.obj('profile_photo')),
       );
     } catch (_) {

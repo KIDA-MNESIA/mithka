@@ -6,12 +6,12 @@
 //  edit, or a typing notice arriving in a conversation with thousands of
 //  messages already loaded, folded on the same isolate that is trying to draw.
 //
-//  Most of these updates address exactly one message, but the view model finds
-//  that message by scanning the transcript, so the work grows with the
-//  conversation rather than with the update. The figure that matters is
-//  therefore not the cost of one update but the scaling column: the same burst
-//  against 500 and against 5000 loaded messages. A ratio near x1 is a lookup
-//  that ignores transcript length; a ratio near x10 is one that walks it.
+//  Most of these updates address exactly one message. The view model indexes
+//  those lookups and localizes several notification types, while structural
+//  arrivals still copy or republish transcript state. The scaling column shows
+//  which work remains sensitive to transcript size: the same burst against 500
+//  and against 5000 loaded messages. A ratio near x1 ignores transcript length;
+//  a ratio near x10 usually indicates a walk or full-list copy.
 //
 //  There is no timing assertion: absolute numbers depend on the machine, so a
 //  threshold would only be flaky elsewhere. It asserts the shape of the run
@@ -55,6 +55,7 @@ enum _Kind {
   chatAction('updateChatAction (typing)'),
   user('updateUser (sender changed)'),
   newMessage('updateNewMessage'),
+  newReply('updateNewMessage (reply)'),
   readReceipt('read receipts');
 
   const _Kind(this.label);
@@ -161,6 +162,17 @@ List<Map<String, dynamic>> _burst(_Kind kind, int count) => [
         '@type': 'updateNewMessage',
         'message': _rawMessage(count + step, 'arriving $step'),
       },
+      _Kind.newReply => {
+        '@type': 'updateNewMessage',
+        'message': {
+          ..._rawMessage(count + step, 'reply $step'),
+          'reply_to': {
+            '@type': 'messageReplyToMessage',
+            'chat_id': _chatId,
+            'message_id': _targetId(step, count),
+          },
+        },
+      },
       _Kind.readReceipt =>
         step.isEven
             ? {
@@ -254,6 +266,12 @@ void main() {
         );
       case _Kind.newMessage:
         expect(viewModel.messages.length, count + _burstSize);
+      case _Kind.newReply:
+        expect(viewModel.messages.length, count + _burstSize);
+        expect(
+          viewModel.messages.skip(count).where((m) => m.replyToPreview != null),
+          hasLength(_burstSize),
+        );
       case _Kind.readReceipt:
         expect(viewModel.lastReadInboxId, greaterThan(0));
         expect(viewModel.lastReadOutboxId, greaterThan(0));

@@ -15,8 +15,10 @@ import 'package:provider/provider.dart';
 
 import '../app/adaptive_split_layout.dart';
 import '../app/app_version.dart';
+import '../app/ipad_window_chrome.dart';
 import '../auth/account_store.dart';
 import '../auth/auth_manager.dart';
+import '../chat/chat_sticker_packs_view.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/ui_components.dart';
@@ -141,10 +143,13 @@ class _SettingsViewState extends State<SettingsView> {
 
     return CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
-        const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
-            _searchFocusNode.requestFocus,
-        const SingleActivator(LogicalKeyboardKey.keyF, control: true):
-            _searchFocusNode.requestFocus,
+        if (defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.iOS)
+          const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+              _searchFocusNode.requestFocus
+        else
+          const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+              _searchFocusNode.requestFocus,
       },
       child: LayoutBuilder(
         builder: (context, constraints) {
@@ -278,11 +283,13 @@ class _SettingsViewState extends State<SettingsView> {
   Widget _splitSidebarHeader(BuildContext context) {
     final c = context.colors;
     final desktopDense = !kIsWeb && isDesktopTargetPlatform();
+    // The enclosing SafeArea only clears the system inset; iPadOS floating
+    // windows additionally need clearance for the traffic-light controls.
     return Container(
       constraints: BoxConstraints(minHeight: desktopDense ? 48 : 58),
       padding: EdgeInsets.fromLTRB(
         desktopDense ? 14 : AppSpacing.lg,
-        desktopDense ? 8 : AppSpacing.md,
+        (desktopDense ? 8 : AppSpacing.md) + iPadWindowChromeInsetOf(context),
         desktopDense ? 14 : AppSpacing.lg,
         desktopDense ? 4 : AppSpacing.xs,
       ),
@@ -736,6 +743,23 @@ class _SettingsViewState extends State<SettingsView> {
         searchTerms: const ['folders', 'tabs', 'chat lists', 'organize'],
       ),
       _SettingsDestination(
+        id: 'telegram-sticker-finder',
+        owner: _SettingsOwner.telegram,
+        group: 3,
+        order: 15,
+        titleKey: AppStringKeys.chatStickerPacksFinderTitle,
+        icon: HeroAppIcons.solidFaceSmile,
+        color: const Color(0xFFF2A516),
+        destination: () => const ChatStickerPacksView(),
+        searchTerms: const [
+          'stickers',
+          'emoji',
+          'custom emoji',
+          'sticker packs',
+          'add stickers',
+        ],
+      ),
+      _SettingsDestination(
         id: 'telegram-language',
         owner: _SettingsOwner.telegram,
         group: 4,
@@ -869,6 +893,10 @@ class _SettingsViewState extends State<SettingsView> {
           'repeat sender',
           'quick replies',
           'video playback',
+          'browser',
+          'links',
+          'internal browser',
+          'default browser',
         ],
       ),
       _SettingsDestination(

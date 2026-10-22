@@ -7,7 +7,9 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../chat/link_handler.dart';
 import '../components/app_icons.dart';
+import '../components/scanner_circle_button.dart';
 import '../components/toast.dart';
+import '../platform/camera_permission.dart';
 import '../theme/app_theme.dart';
 
 class QrScanCandidate {
@@ -62,30 +64,155 @@ class QrScannerView extends StatefulWidget {
     this.returnAnyValue = false,
     this.onScan,
     this.hint,
+    this.cameraPermission = const SystemCameraPermissionGateway(),
+    this.scannerBuilder,
+    this.scannerController,
   });
 
   final bool returnAnyValue;
   final FutureOr<void> Function(String value)? onScan;
   final String? hint;
+  final CameraPermissionGateway cameraPermission;
+
+  @visibleForTesting
+  final MobileScannerController? scannerController;
+
+  @visibleForTesting
+  final Widget Function(
+    BuildContext,
+    MobileScannerController,
+    void Function(BarcodeCapture),
+  )?
+  scannerBuilder;
 
   @override
   State<QrScannerView> createState() => _QrScannerViewState();
 }
 
-class _QrScannerViewState extends State<QrScannerView> {
-  late final MobileScannerController _controller = MobileScannerController(
-    formats: const [BarcodeFormat.qrCode],
-  );
+class _QrScannerViewState extends State<QrScannerView>
+    with WidgetsBindingObserver {
+  late final MobileScannerController _controller =
+      widget.scannerController ??
+      MobileScannerController(formats: const [BarcodeFormat.qrCode]);
   List<QrScanCandidate> _choices = const [];
   QrScanCandidate? _detail;
   bool _paused = false;
   double _panelDrag = 0;
+  CameraPermissionAccess? _cameraAccess;
+  bool _permissionBusy = false;
+  Future<void> _cameraLifecycle = Future<void>.value();
 
   bool get _hasPanel => _choices.isNotEmpty || _detail != null;
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_resolveCameraPermission(request: true));
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _cameraLifecycle = _cameraLifecycle.then((_) async {
+        if (!mounted) return;
+        final wasGranted = _cameraAccess == CameraPermissionAccess.granted;
+        await _resolveCameraPermission(request: false);
+        if (!mounted ||
+            !wasGranted ||
+            _cameraAccess != CameraPermissionAccess.granted ||
+            WidgetsBinding.instance.lifecycleState !=
+                AppLifecycleState.resumed ||
+            _controller.value.isRunning ||
+            _controller.value.isStarting) {
+          return;
+        }
+        try {
+          await _controller.start();
+        } catch (_) {
+          // The scanner renders its controller error state.
+        }
+      });
+    } else if (state == AppLifecycleState.inactive) {
+      _cameraLifecycle = _cameraLifecycle.then((_) async {
+        if (!mounted || !_controller.value.isRunning) return;
+        try {
+          await _controller.stop();
+        } catch (_) {}
+      });
+    }
+  }
+
+  Future<void> _resolveCameraPermission({required bool request}) async {
+    if (_permissionBusy) return;
+    _permissionBusy = true;
+    CameraPermissionAccess access;
+    try {
+      access = request
+          ? await widget.cameraPermission.request()
+          : await widget.cameraPermission.check();
+    } catch (_) {
+      access = CameraPermissionAccess.denied;
+    } finally {
+      _permissionBusy = false;
+    }
+    if (mounted) setState(() => _cameraAccess = access);
+  }
+
+  Future<void> _retryCameraPermission() async {
+    if (_cameraAccess == CameraPermissionAccess.blocked) {
+      await widget.cameraPermission.openSettings();
+      if (mounted) await _resolveCameraPermission(request: false);
+    } else {
+      await _resolveCameraPermission(request: true);
+    }
+  }
+
+  Widget _cameraPermissionView() => ColoredBox(
+    color: Colors.black,
+    child: Center(
+      child: GestureDetector(
+        key: const ValueKey('qr-scanner-camera-retry'),
+        behavior: HitTestBehavior.opaque,
+        onTap: _retryCameraPermission,
+        child: Padding(
+          padding: const EdgeInsets.all(36),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                AppStrings.t(AppStringKeys.qrScannerCameraUnavailable),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                AppStrings.t(
+                  _cameraAccess == CameraPermissionAccess.blocked
+                      ? AppStringKeys.storyOpenSettings
+                      : AppStringKeys.callsRetry,
+                ),
+                style: TextStyle(
+                  color: AppTheme.brand,
+                  fontSize: 15,
+                  decoration: TextDecoration.none,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  @override
   void dispose() {
-    _controller.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_controller.dispose());
     super.dispose();
   }
 
@@ -195,37 +322,50 @@ class _QrScannerViewState extends State<QrScannerView> {
       child: Stack(
         children: [
           Positioned.fill(
-            child: MobileScanner(
-              controller: _controller,
-              onDetect: _handleCapture,
-              placeholderBuilder: (_) => const ColoredBox(
-                color: Colors.black,
-                child: Center(
-                  child: AppIcon(
-                    HeroAppIcons.qrcode,
-                    size: 44,
-                    color: Color(0x99FFFFFF),
-                  ),
-                ),
-              ),
-              errorBuilder: (_, _) => ColoredBox(
-                color: Colors.black,
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 36),
-                    child: Text(
-                      AppStrings.t(AppStringKeys.qrScannerCameraUnavailable),
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Color(0xFFFFFFFF),
-                        fontSize: 15,
-                        decoration: TextDecoration.none,
+            child: _cameraAccess == null
+                ? const ColoredBox(color: Colors.black)
+                : _cameraAccess != CameraPermissionAccess.granted
+                ? _cameraPermissionView()
+                : widget.scannerBuilder?.call(
+                        context,
+                        _controller,
+                        _handleCapture,
+                      ) ??
+                      MobileScanner(
+                        controller: _controller,
+                        onDetect: _handleCapture,
+                        placeholderBuilder: (_) => const ColoredBox(
+                          color: Colors.black,
+                          child: Center(
+                            child: AppIcon(
+                              HeroAppIcons.qrcode,
+                              size: 44,
+                              color: Color(0x99FFFFFF),
+                            ),
+                          ),
+                        ),
+                        errorBuilder: (_, _) => ColoredBox(
+                          color: Colors.black,
+                          child: Center(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 36,
+                              ),
+                              child: Text(
+                                AppStrings.t(
+                                  AppStringKeys.qrScannerCameraUnavailable,
+                                ),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: Color(0xFFFFFFFF),
+                                  fontSize: 15,
+                                  decoration: TextDecoration.none,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
           ),
           Positioned.fill(
             child: BarcodeOverlay(
@@ -241,14 +381,14 @@ class _QrScannerViewState extends State<QrScannerView> {
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
               child: Row(
                 children: [
-                  _ScannerCircleButton(
+                  ScannerCircleButton(
                     icon: HeroAppIcons.xmark,
                     onTap: () => Navigator.of(context).pop(),
                   ),
                   const Spacer(),
                   ValueListenableBuilder<MobileScannerState>(
                     valueListenable: _controller,
-                    builder: (context, state, _) => _ScannerCircleButton(
+                    builder: (context, state, _) => ScannerCircleButton(
                       icon: HeroAppIcons.arrowsRotate,
                       onTap: state.isInitialized && state.isRunning
                           ? _switchCamera
@@ -258,7 +398,7 @@ class _QrScannerViewState extends State<QrScannerView> {
                   const SizedBox(width: 12),
                   ValueListenableBuilder<MobileScannerState>(
                     valueListenable: _controller,
-                    builder: (context, state, _) => _ScannerCircleButton(
+                    builder: (context, state, _) => ScannerCircleButton(
                       icon: HeroAppIcons.flash,
                       active: state.torchState == TorchState.on,
                       onTap:
@@ -277,7 +417,7 @@ class _QrScannerViewState extends State<QrScannerView> {
             Positioned(
               left: 28,
               right: 28,
-              bottom: MediaQuery.of(context).padding.bottom + 34,
+              bottom: MediaQuery.paddingOf(context).bottom + 34,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -311,7 +451,7 @@ class _QrScannerViewState extends State<QrScannerView> {
             left: 12,
             right: 12,
             bottom: _hasPanel
-                ? MediaQuery.of(context).padding.bottom + 12 - _panelDrag
+                ? MediaQuery.paddingOf(context).bottom + 12 - _panelDrag
                 : -420,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
@@ -373,45 +513,6 @@ class _QrScannerFrame extends StatelessWidget {
           ),
         );
       },
-    );
-  }
-}
-
-class _ScannerCircleButton extends StatelessWidget {
-  const _ScannerCircleButton({
-    required this.icon,
-    required this.onTap,
-    this.active = false,
-  });
-
-  final AppIconData icon;
-  final VoidCallback? onTap;
-  final bool active;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 160),
-        width: 44,
-        height: 44,
-        decoration: BoxDecoration(
-          color: active ? AppTheme.brand : const Color(0x66000000),
-          shape: BoxShape.circle,
-          border: Border.all(color: const Color(0x33FFFFFF)),
-        ),
-        child: Center(
-          child: AppIcon(
-            icon,
-            size: 22,
-            color: onTap == null
-                ? const Color(0x66FFFFFF)
-                : const Color(0xFFFFFFFF),
-          ),
-        ),
-      ),
     );
   }
 }

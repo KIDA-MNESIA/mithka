@@ -10,15 +10,19 @@ import 'package:flutter/material.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:provider/provider.dart';
 
+import '../app/ipad_window_chrome.dart';
 import '../chats/chat_list_view_model.dart';
 import '../components/app_icons.dart';
 import '../components/photo_avatar.dart';
-import '../tdlib/json_helpers.dart';
+import '../contacts/contact_users.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_models.dart';
 import '../theme/app_theme.dart';
 import '../theme/theme_controller.dart';
+import 'forward_markdown.dart';
 import 'forward_options.dart';
+import 'internal_chat_link_router.dart';
+import 'telegram_link.dart';
 
 class ChatPickerResult {
   const ChatPickerResult({required this.chat, required this.forwardOptions});
@@ -32,26 +36,47 @@ class ChatPickerView extends StatefulWidget {
     super.key,
     this.title = AppStringKeys.chatPickerChooseChat,
     this.showForwardOptions = false,
+    this.markdownOffer = const ForwardMarkdownOffer.none(),
     this.allowChannels = true,
     this.allowedKinds,
     this.allowedChatIds,
     this.allowContacts = true,
     this.emptyText,
+    this.accountSlot,
   });
   final String title;
   final bool showForwardOptions;
+
+  /// Markdown detected in the forwarded text: the picker offers a "render
+  /// Markdown" chip, pre-checked only when the offer is strong.
+  final ForwardMarkdownOffer markdownOffer;
   final bool allowChannels;
   final Set<ChatKind>? allowedKinds;
   final Set<int>? allowedChatIds;
   final bool allowContacts;
   final String? emptyText;
 
+  /// The account this picker lists chats for.
+  ///
+  /// Chat ids are only meaningful inside the account that produced them, and a
+  /// picker launched from a transcript keeps running on that transcript's
+  /// account even if the foreground account switches while its list loads.
+  /// Contact rows — and the private chats they create — follow the same owner.
+  /// Null falls back to the enclosing [InternalChatLinkScope]'s account, and
+  /// only then to the active account.
+  final int? accountSlot;
+
   @override
   State<ChatPickerView> createState() => _ChatPickerViewState();
 }
 
 class _ChatPickerViewState extends State<ChatPickerView> {
-  final ChatListViewModel _vm = ChatListViewModel();
+  late final ChatListViewModel _vm;
+
+  /// The account every id on this screen belongs to, resolved once so the
+  /// chat list, the contact rows, and the private-chat creation they trigger
+  /// all stay on the same owner even if the foreground account switches.
+  late final int? _accountSlot;
   final TdClient _client = TdClient.shared;
   final _controller = TextEditingController();
   final List<Contact> _contacts = [];
@@ -59,10 +84,15 @@ class _ChatPickerViewState extends State<ChatPickerView> {
   String _query = '';
   bool _removeCaption = false;
   bool _removeSender = false;
+  late bool _renderMarkdown = widget.markdownOffer.suggested;
 
   @override
   void initState() {
     super.initState();
+    _accountSlot =
+        widget.accountSlot ??
+        InternalChatLinkScope.targetOf(context)?.accountSlot;
+    _vm = ChatListViewModel(accountSlot: _accountSlot);
     _vm.addListener(_onModel);
     _vm.onAppear();
     _loadContacts();
@@ -98,8 +128,19 @@ class _ChatPickerViewState extends State<ChatPickerView> {
           _PickerEntry.contact(contact),
     ];
     if (_query.trim().isEmpty) return all;
-    final q = _query.toLowerCase();
-    return all.where((entry) => entry.matches(q)).toList();
+    final q = _query.trim().toLowerCase();
+    final lookupUserId = telegramUserIdFromQuery(_query);
+    return all
+        .where((entry) => entry.matches(q, lookupUserId: lookupUserId))
+        .toList();
+  }
+
+  /// Routes a picker request to the account this screen was opened for.
+  Future<Map<String, dynamic>> _queryAccount(Map<String, dynamic> request) {
+    final slot = _accountSlot;
+    return slot == null
+        ? _client.query(request)
+        : _client.queryForSlot(request, slot);
   }
 
   Future<void> _loadContacts() async {
@@ -107,26 +148,10 @@ class _ChatPickerViewState extends State<ChatPickerView> {
     if (_contactsLoading) return;
     setState(() => _contactsLoading = true);
     try {
-      final result = await _client.query({'@type': 'getContacts'});
-      final ids = result.int64Array('user_ids') ?? const <int>[];
-      final loaded = <Contact>[];
-      for (final id in ids.take(500)) {
-        try {
-          final user = await _client.query({'@type': 'getUser', 'user_id': id});
-          loaded.add(
-            Contact(
-              id: id,
-              name: TDParse.userName(user),
-              username: user.obj('usernames')?.str('editable_username'),
-              statusText: TDParse.userStatus(user),
-              photo: TDParse.smallPhoto(user.obj('profile_photo')),
-              isOnline: TDParse.isUserOnline(user),
-            ),
-          );
-        } catch (_) {}
-      }
-      loaded.sort(
-        (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+      final loaded = await fetchSortedContacts(
+        _client,
+        limit: 500,
+        accountSlot: _accountSlot,
       );
       if (!mounted) return;
       setState(() {
@@ -155,7 +180,7 @@ class _ChatPickerViewState extends State<ChatPickerView> {
     final contact = entry.contact;
     if (contact == null) return;
     try {
-      final raw = await _client.query({
+      final raw = await _queryAccount({
         '@type': 'createPrivateChat',
         'user_id': contact.id,
         'force': false,
@@ -168,12 +193,14 @@ class _ChatPickerViewState extends State<ChatPickerView> {
 
   void _popPickedChat(ChatSummary chat) {
     if (widget.showForwardOptions) {
+      final renderMarkdown = widget.markdownOffer.available && _renderMarkdown;
       Navigator.of(context).pop(
         ChatPickerResult(
           chat: chat,
           forwardOptions: ForwardOptions(
             removeCaption: _removeCaption,
             removeSender: _removeSender,
+            richText: renderMarkdown,
           ),
         ),
       );
@@ -220,7 +247,7 @@ class _ChatPickerViewState extends State<ChatPickerView> {
   Widget _header() {
     final c = context.colors;
     return Container(
-      padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
+      padding: EdgeInsets.only(top: topChromeInsetOf(context)),
       decoration: BoxDecoration(
         color: c.navBar,
         border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),
@@ -309,33 +336,47 @@ class _ChatPickerViewState extends State<ChatPickerView> {
           borderRadius: BorderRadius.circular(AppRadius.control),
           border: Border.all(color: c.divider, width: 0.5),
         ),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(
-              child: _forwardOption(
-                label: AppStringKeys.chatForwardRemoveCaption,
-                selected: _removeCaption,
-                onTap: () {
-                  setState(() {
-                    _removeCaption = !_removeCaption;
-                    if (_removeCaption) _removeSender = true;
-                  });
-                },
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: _forwardOption(
+                    label: AppStringKeys.chatForwardRemoveCaption,
+                    selected: _removeCaption,
+                    onTap: () {
+                      setState(() {
+                        _removeCaption = !_removeCaption;
+                        if (_removeCaption) _removeSender = true;
+                      });
+                    },
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _forwardOption(
+                    label: AppStringKeys.chatForwardRemoveSender,
+                    selected: _removeSender,
+                    onTap: () {
+                      setState(() {
+                        _removeSender = !_removeSender;
+                        if (!_removeSender) _removeCaption = false;
+                      });
+                    },
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: _forwardOption(
-                label: AppStringKeys.chatForwardRemoveSender,
-                selected: _removeSender,
-                onTap: () {
-                  setState(() {
-                    _removeSender = !_removeSender;
-                    if (!_removeSender) _removeCaption = false;
-                  });
-                },
+            if (widget.markdownOffer.available) ...[
+              const SizedBox(height: 8),
+              _forwardOption(
+                label: AppStringKeys.chatForwardRenderMarkdown,
+                selected: _renderMarkdown,
+                onTap: () => setState(() => _renderMarkdown = !_renderMarkdown),
               ),
-            ),
+            ],
           ],
         ),
       ),
@@ -462,13 +503,20 @@ class _PickerEntry {
         : '@$username';
   }
 
-  bool matches(String query) {
+  bool matches(String query, {int? lookupUserId}) {
+    final chat = this.chat;
     final contact = this.contact;
+    final peerUserId = contact?.id ?? chat?.peerUserId;
+    if (lookupUserId != null &&
+        (peerUserId == lookupUserId || chat?.id == lookupUserId)) {
+      return true;
+    }
     final fields = [
       title,
       subtitle,
       chat?.lastMessage ?? '',
       contact?.username ?? '',
+      if (peerUserId != null) '$peerUserId',
     ].join(' ').toLowerCase();
     return fields.contains(query);
   }

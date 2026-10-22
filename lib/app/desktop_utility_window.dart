@@ -14,11 +14,13 @@ import '../call/call_overlay_host.dart';
 import '../call/calls_view.dart';
 import '../chat/audio_search_view.dart';
 import '../chat/chat_info_view.dart';
+import '../chat/chat_sticker_packs_view.dart';
 import '../chat/chat_view.dart';
 import '../chat/chat_view_model.dart';
 import '../chat/checklist_composer_view.dart';
 import '../chat/contact_share_picker_view.dart';
 import '../chat/group_remark_controller.dart';
+import '../chat/link_preview_fixer.dart';
 import '../chat/location_picker_view.dart';
 import '../chat/music_player_controller.dart';
 import '../chat/outgoing_attachment.dart';
@@ -31,9 +33,9 @@ import '../chat/shared_media_view.dart';
 import '../chat/telegram_ai_editor_view.dart';
 import '../chat/telegram_ai_service.dart';
 import '../chat/video_playback_preferences.dart';
+import '../chats/chat_folder_tag_controller.dart';
 import '../chats/search_view.dart';
 import '../components/confirm_dialog.dart';
-import '../components/keyboard_dismiss_on_tap.dart';
 import '../components/toast.dart';
 import '../l10n/app_locale_controller.dart';
 import '../l10n/app_localizations.dart';
@@ -50,6 +52,7 @@ import '../settings/country_message_filter.dart';
 import '../settings/desktop_hotkey_controller.dart';
 import '../settings/developer_mode_controller.dart';
 import '../settings/edit_profile_view.dart';
+import '../settings/hidden_sender_store.dart';
 import '../settings/keyword_blocker.dart';
 import '../settings/rich_message_relay_config.dart';
 import '../settings/safety_notice_controller.dart';
@@ -70,6 +73,7 @@ import 'desktop_utility_window_stub.dart'
     if (dart.library.io) 'desktop_utility_window_io.dart'
     as implementation;
 import 'global_video_split_host.dart';
+import 'scaled_app_view.dart';
 
 export 'desktop_utility_window_models.dart';
 
@@ -120,6 +124,12 @@ class DesktopUtilityWindowService {
 
   Future<void> notifySettingsChanged(DesktopUtilityWindowArguments arguments) =>
       implementation.notifyDesktopUtilitySettingsChanged(arguments);
+
+  Future<void> notifyHiddenSendersChanged() =>
+      implementation.notifyDesktopUtilityHiddenSendersChanged();
+
+  Future<void> setHotkeyRecording(bool recording) =>
+      implementation.setDesktopUtilityHotkeyRecording(recording);
 }
 
 /// Secondary-engine shell for production utility, chat-info, and profile
@@ -157,6 +167,9 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
     widget.prefs,
     initialAccountUserId: widget.arguments.accountUserId,
   );
+  late final ChatFolderTagController _folderTags = ChatFolderTagController(
+    widget.prefs,
+  );
   late final MithkaProService _mithkaPro = MithkaProService.shared;
   late final AppIconController _appIcons = AppIconController(widget.prefs);
   late final AutoDownloadMediaController _autoDownload =
@@ -187,20 +200,30 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
 
   ChatViewModel get _pickerViewModel {
     final existing = _composerPickerViewModel;
-    if (existing != null) return existing;
+    if (existing != null) return _withPanguPreferences(existing);
     final created = ChatViewModel(
       chatId: widget.arguments.chatId!,
       title: widget.arguments.title,
       markReadOnOpen: false,
     )..onAppear();
     _composerPickerViewModel = created;
-    return created;
+    return _withPanguPreferences(created);
   }
+
+  /// The picker window has no chat view to mirror 盘古之白 from, so its model
+  /// reads the switches straight off this window's theme controller.
+  ChatViewModel _withPanguPreferences(ChatViewModel model) => model
+    ..panguOnSend = _theme.panguOnSend
+    ..panguOnEdit = _theme.panguOnEdit;
 
   @override
   void initState() {
     super.initState();
     KeywordBlocker.shared.initialize(widget.prefs);
+    LinkPreviewFixer.shared.initialize(widget.prefs);
+    HiddenSenderStore.shared
+      ..initialize(widget.prefs)
+      ..addListener(_handleHiddenSendersChanged);
     CountryMessageFilter.shared.initialize(widget.prefs);
     MusicPlayerController.shared.initialize(widget.prefs);
     _autoDownload.initialize(widget.prefs);
@@ -285,6 +308,15 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
     if (callback != null) source.removeListener(callback);
   }
 
+  /// Hid or showed a member in this window: the primary window re-reads the
+  /// list and passes it on. A reload from the primary is not echoed back.
+  void _handleHiddenSendersChanged() {
+    if (_applyingPresentationReload) return;
+    unawaited(
+      DesktopUtilityWindowService.instance.notifyHiddenSendersChanged(),
+    );
+  }
+
   Future<void> _reloadPresentationPreferences() async {
     if (_presentationReloading) {
       _presentationReloadQueued = true;
@@ -299,6 +331,8 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
           await widget.prefs.reload();
           final desktopHotkeys = DesktopHotkeyController.maybeShared;
           if (desktopHotkeys != null) await desktopHotkeys.reload();
+          // Inside the reload, so the listener does not echo it back.
+          HiddenSenderStore.shared.initialize(widget.prefs);
         } on Object {
           // A transient platform-preferences failure must not unregister an
           // otherwise healthy TD proxy window from the primary bridge.
@@ -379,6 +413,7 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
 
   @override
   void dispose() {
+    HiddenSenderStore.shared.removeListener(_handleHiddenSendersChanged);
     DesktopUtilityWindowService.instance.detachChildPresentationReload();
     _settingsSyncDebounce?.cancel();
     for (final entry in _settingsSyncSources.entries) {
@@ -392,6 +427,7 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
     _calls.dispose();
     _performance.dispose();
     _groupRemarks.dispose();
+    _folderTags.dispose();
     _appIcons.dispose();
     _developer.dispose();
     _safetyNotice.dispose();
@@ -658,6 +694,9 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
       displayTitle: AppStringKeys.topicPostContentFile,
       showBackButton: false,
     ),
+    DesktopUtilityWindowKind.stickerFinder => const ChatStickerPacksView(
+      showBackButton: false,
+    ),
     DesktopUtilityWindowKind.videos => SharedMediaView(
       chatId: 0,
       title: widget.arguments.title,
@@ -755,6 +794,7 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
       ChangeNotifierProvider.value(value: _ai),
       ChangeNotifierProvider.value(value: _locale),
       ChangeNotifierProvider.value(value: _groupRemarks),
+      ChangeNotifierProvider.value(value: _folderTags),
       ChangeNotifierProvider.value(value: _mithkaPro),
       ChangeNotifierProvider.value(value: _appIcons),
       ChangeNotifierProvider.value(value: _autoDownload),
@@ -788,10 +828,14 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
           builder: (context, child) {
             final media = MediaQuery.of(context);
             final currentTheme = Theme.of(context);
+            // An installed theme names its own on-accent ink; a colour the
+            // user picked in 外观 has none, and derives one.
+            final usesCloudTheme = _theme.usesCloudThemeForUi(
+              currentTheme.brightness,
+            );
             AppTheme.applyBrand(
-              _theme.usesCloudThemeForUi(currentTheme.brightness)
-                  ? context.colors.linkBlue
-                  : _theme.brandColor,
+              usesCloudTheme ? context.colors.linkBlue : _theme.brandColor,
+              onAccent: usesCloudTheme ? context.colors.onAccent : null,
             );
             final themedChild = Theme(
               data: currentTheme.copyWith(
@@ -832,8 +876,10 @@ class _DesktopUtilityWindowAppState extends State<DesktopUtilityWindowApp> {
             if (!desktopUtilityWindowHasUsableMetrics(media.size)) {
               return ColoredBox(color: currentTheme.scaffoldBackgroundColor);
             }
-            return _DesktopUtilityScaledView(
-              fontScale: _theme.fontScale,
+            return ScaledAppView(
+              textScale: _theme.effectiveTextScale(
+                MediaQuery.textScalerOf(context),
+              ),
               interfaceScale: _theme.renderedInterfaceScale,
               child: appSurface,
             );
@@ -979,62 +1025,5 @@ class _DesktopLocationPickerRootState
         onSend: widget.onSend,
       );
     },
-  );
-}
-
-class _DesktopUtilityScaledView extends StatelessWidget {
-  const _DesktopUtilityScaledView({
-    required this.fontScale,
-    required this.interfaceScale,
-    required this.child,
-  });
-
-  final double fontScale;
-  final double interfaceScale;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    final scale = interfaceScale;
-    final virtualSize = Size(
-      media.size.width / scale,
-      media.size.height / scale,
-    );
-    final scaledMedia = media.copyWith(
-      size: virtualSize,
-      padding: _unscale(media.padding, scale),
-      viewPadding: _unscale(media.viewPadding, scale),
-      viewInsets: _unscale(media.viewInsets, scale),
-      systemGestureInsets: _unscale(media.systemGestureInsets, scale),
-      textScaler: TextScaler.linear(fontScale),
-    );
-    return AppKeyboardDismissOnTap(
-      child: ClipRect(
-        child: OverflowBox(
-          alignment: Alignment.topLeft,
-          minWidth: virtualSize.width,
-          maxWidth: virtualSize.width,
-          minHeight: virtualSize.height,
-          maxHeight: virtualSize.height,
-          child: Transform.scale(
-            scale: scale,
-            alignment: Alignment.topLeft,
-            child: SizedBox(
-              width: virtualSize.width,
-              height: virtualSize.height,
-              child: MediaQuery(data: scaledMedia, child: child),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  EdgeInsets _unscale(EdgeInsets insets, double scale) => EdgeInsets.fromLTRB(
-    insets.left / scale,
-    insets.top / scale,
-    insets.right / scale,
-    insets.bottom / scale,
   );
 }

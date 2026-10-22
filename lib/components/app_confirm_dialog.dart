@@ -24,6 +24,7 @@ Future<bool> showAppConfirmDialog(
     barrierColor: const Color(0x99000000),
     transitionDuration: AppMotion.duration(context, AppMotion.responsive),
     pageBuilder: (dialogContext, _, _) => Semantics(
+      key: const ValueKey('app-confirm-dialog'),
       scopesRoute: true,
       namesRoute: true,
       explicitChildNodes: true,

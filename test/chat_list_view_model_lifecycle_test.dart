@@ -2,9 +2,67 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/chats/chat_list_view_model.dart';
+import 'package:mithka/communities/community_models.dart';
 import 'package:mithka/tdlib/json_helpers.dart';
+import 'package:mithka/tdlib/td_models.dart';
 
 void main() {
+  test('folder updates retain configured icons and refresh changes', () {
+    final model = ChatListViewModel();
+    addTearDown(model.dispose);
+    void update(String icon) => model.applyUpdateForTesting({
+      '@type': 'updateChatFolders',
+      'chat_folders': [
+        {
+          'id': 7,
+          'title': 'Business',
+          'icon': {'name': icon},
+        },
+        {'id': 8, 'title': 'Other'},
+      ],
+    });
+    update('Work');
+    expect(model.filters[1].iconName, 'Work');
+    expect(model.filters[2].iconName, 'Custom');
+    update('Money');
+    expect(model.filters[1].iconName, 'Money');
+  });
+
+  test('message-level updates keep mention and reaction counters current', () {
+    final model = ChatListViewModel();
+    addTearDown(model.dispose);
+    final chat = ChatSummary(
+      id: 42,
+      title: 'Group',
+      lastMessage: 'Message',
+      lastMessageId: 10,
+      date: 1,
+      unreadCount: 1,
+      unreadMentionCount: 2,
+      unreadReactionCount: 3,
+      order: 1,
+      isMuted: false,
+    );
+    model.seedChatForTesting(chat);
+
+    model.applyUpdateForTesting({
+      '@type': 'updateMessageMentionRead',
+      'chat_id': 42,
+      'message_id': 10,
+      'unread_mention_count': 1,
+    });
+    model.applyUpdateForTesting({
+      '@type': 'updateMessageUnreadReactions',
+      'chat_id': 42,
+      'message_id': 10,
+      'unread_reactions': <Object>[],
+      'unread_reaction_count': 2,
+    });
+
+    expect(chat.unreadMentionCount, 1);
+    expect(chat.unreadReactionCount, 2);
+  });
+
   testWidgets('chat-list update bursts produce one batched notification', (
     tester,
   ) async {
@@ -54,6 +112,12 @@ void main() {
             'chat_ids': const <int>[42],
           }),
           'getChat' => Future.value(currentChat),
+          'getUser' => Future.value({
+            '@type': 'user',
+            'id': 7,
+            'first_name': 'Peer',
+            'last_name': '',
+          }),
           _ => Future.value({'@type': 'ok'}),
         };
       },
@@ -74,7 +138,9 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
 
     expect(
-      requestTypes,
+      // Peer hydration runs through the model's own query so it stays pinned
+      // to the list's account; it is irrelevant to the ordering under test.
+      requestTypes.where((type) => type != 'getUser'),
       ['loadChats', 'getChats', 'getChat'],
       reason: 'the local page should render without waiting on loadChats',
     );
@@ -87,7 +153,7 @@ void main() {
     await tester.pump();
     await tester.pump();
 
-    expect(requestTypes, [
+    expect(requestTypes.where((type) => type != 'getUser'), [
       'loadChats',
       'getChats',
       'getChat',
@@ -166,6 +232,74 @@ void main() {
     expect(model.chats.single.date, 20);
     expect(model.chats.single.order, 200);
   });
+
+  testWidgets(
+    'stale community snapshot cannot restore an unread badge after read',
+    (tester) async {
+      final model = ChatListViewModel(
+        membershipForTesting: (_, _) async => true,
+      );
+      addTearDown(model.dispose);
+
+      final staleUnreadSnapshot = _groupChat(
+        order: 100,
+        messageId: 10,
+        messageDate: 10,
+        text: 'community message',
+        unreadCount: 4,
+      );
+      await model.ingestRawChatForTesting(staleUnreadSnapshot);
+      model.applyUpdateForTesting({
+        '@type': 'updateChatReadInbox',
+        'chat_id': 42,
+        'last_read_inbox_message_id': 10,
+        'unread_count': 0,
+      });
+      await tester.pump(const Duration(milliseconds: 50));
+
+      model.applyUpdateForTesting({
+        '@type': 'updateChatReadInbox',
+        'chat_id': 42,
+        'last_read_inbox_message_id': 5,
+        'unread_count': 2,
+      });
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(model.chats.single.unreadCount, 0);
+
+      // A community catalogue getChat that started before the read update can
+      // return afterwards with the same last message and its old unread count.
+      await model.ingestRawChatForTesting(staleUnreadSnapshot);
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(model.chats.single.unreadCount, 0);
+      expect(model.chats.single.lastReadInboxMessageId, 10);
+      final community = CommunityGroupEntry(
+        community: CommunitySummary(
+          id: 7,
+          name: 'Community',
+          haveAccess: true,
+          isAdministrator: false,
+          canEditChatList: false,
+        ),
+        chats: model.chats,
+      );
+      expect(community.unreadCount, 0);
+
+      // A genuinely newer message still creates a new unread count.
+      await model.ingestRawChatForTesting(
+        _groupChat(
+          order: 200,
+          messageId: 20,
+          messageDate: 20,
+          text: 'new community message',
+          unreadCount: 1,
+          lastReadInboxMessageId: 10,
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(model.chats.single.unreadCount, 1);
+    },
+  );
 }
 
 Map<String, dynamic> _privateChat({
@@ -195,11 +329,15 @@ Map<String, dynamic> _groupChat({
   required int messageId,
   required int messageDate,
   required String text,
+  int unreadCount = 0,
+  int lastReadInboxMessageId = 0,
 }) => {
   '@type': 'chat',
   'id': 42,
   'title': 'Current group',
   'view_as_topics': true,
+  'unread_count': unreadCount,
+  'last_read_inbox_message_id': lastReadInboxMessageId,
   'type': {
     '@type': 'chatTypeSupergroup',
     'supergroup_id': 7,

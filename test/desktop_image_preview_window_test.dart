@@ -1,14 +1,46 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/app/desktop_image_preview_window.dart';
 import 'package:mithka/chat/image_edit_view.dart';
 import 'package:mithka/chat/image_preview.dart';
 
 void main() {
+  testWidgets('image navigation ignores modified arrow keys', (tester) async {
+    await tester.pumpWidget(
+      const DesktopImagePreviewWindowApp(
+        arguments: DesktopImagePreviewWindowArguments(
+          title: 'Image preview',
+          localeTag: 'en',
+          dark: true,
+          items: [
+            DesktopImagePreviewItemArguments(path: '/tmp/missing-one.png'),
+            DesktopImagePreviewItemArguments(path: '/tmp/missing-two.png'),
+          ],
+        ),
+      ),
+    );
+    await tester.pump();
+    for (final modifier in [
+      LogicalKeyboardKey.metaLeft,
+      LogicalKeyboardKey.controlLeft,
+      LogicalKeyboardKey.altLeft,
+      LogicalKeyboardKey.shiftLeft,
+    ]) {
+      await tester.sendKeyDownEvent(modifier);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.sendKeyUpEvent(modifier);
+      await tester.pump();
+      expect(find.text('1 / 2'), findsOneWidget);
+    }
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+    await tester.pump();
+    expect(find.text('2 / 2'), findsOneWidget);
+  });
+
   testWidgets('desktop preview builds a routed gallery shell with toolbar', (
     tester,
   ) async {
@@ -156,6 +188,65 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'macOS preview Copy Image sends image bytes instead of the local path',
+    (tester) async {
+      final directory = Directory.systemTemp.createTempSync(
+        'mithka-image-preview-copy-',
+      );
+      addTearDown(() => directory.deleteSync(recursive: true));
+      final bytes = base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC'
+        'AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      );
+      final image = File('${directory.path}/one-pixel.png')
+        ..writeAsBytesSync(bytes);
+      expect(image.existsSync(), isTrue);
+      const channel = MethodChannel('mithka/clipboard');
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      var copies = 0;
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        expect(call.method, 'writeImage');
+        expect(call.arguments, bytes);
+        copies++;
+        return true;
+      });
+      addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+      await tester.pumpWidget(
+        DesktopImagePreviewWindowApp(
+          arguments: DesktopImagePreviewWindowArguments(
+            title: 'Image preview',
+            localeTag: 'en',
+            dark: true,
+            items: [DesktopImagePreviewItemArguments(path: image.path)],
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.tap(
+        find.byKey(const ValueKey('desktop-image-preview-more')),
+      );
+      await tester.pump();
+      await tester.runAsync(() async {
+        await tester.tap(find.text('Copy image'));
+        for (var attempt = 0; attempt < 20 && copies == 0; attempt++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      });
+      await tester.pump();
+
+      expect(
+        find.byKey(const ValueKey('desktop-image-preview-more-menu')),
+        findsNothing,
+      );
+      expect(copies, 1);
+      expect(find.text('Copied'), findsOneWidget);
+    },
+    skip: !Platform.isMacOS,
+  );
+
   test('desktop image arguments contain presentation-only local data', () {
     final arguments = DesktopImagePreviewWindowArguments(
       title: 'Image preview',
@@ -264,7 +355,10 @@ void main() {
     expect(shell, contains('desktop-image-preview-toolbar'));
     expect(shell, contains('pageRouteBuilder:'));
     expect(helper, contains('if (opened) return'));
-    expect(helper, contains('Navigator.of(context).push<void>'));
+    expect(
+      helper,
+      contains('Navigator.of(context, rootNavigator: true).push<void>'),
+    );
     expect(
       main,
       contains('DesktopImagePreviewWindowArguments.tryParseLaunchArguments'),

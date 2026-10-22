@@ -33,6 +33,22 @@ void main() {
       ),
       isFalse,
     );
+    // A gallery carrying a motion variant opens in the in-app viewer, because
+    // the preview window renders still files only.
+    expect(
+      profileFeaturedPhotosUseDesktopWindow(
+        TargetPlatform.macOS,
+        hasAnimation: true,
+      ),
+      isFalse,
+    );
+    expect(
+      profileFeaturedPhotosUseDesktopWindow(
+        TargetPlatform.iOS,
+        hasAnimation: true,
+      ),
+      isFalse,
+    );
 
     final source = File(
       'lib/profile/profile_detail_view.dart',
@@ -43,6 +59,22 @@ void main() {
   });
 
   test('desktop story shortcuts preserve reply-field editing', () {
+    for (final key in [
+      LogicalKeyboardKey.keyM,
+      LogicalKeyboardKey.space,
+      LogicalKeyboardKey.arrowLeft,
+      LogicalKeyboardKey.arrowRight,
+      LogicalKeyboardKey.escape,
+    ]) {
+      expect(
+        storyViewerDesktopCommandForKey(
+          key,
+          replyHasFocus: false,
+          hasModifiers: true,
+        ),
+        isNull,
+      );
+    }
     expect(
       storyViewerDesktopCommandForKey(
         LogicalKeyboardKey.escape,
@@ -199,6 +231,18 @@ void main() {
       'StoryViewerDesktopKeyboard',
     );
 
+    for (final modifier in [
+      LogicalKeyboardKey.metaLeft,
+      LogicalKeyboardKey.controlLeft,
+      LogicalKeyboardKey.altLeft,
+      LogicalKeyboardKey.shiftLeft,
+    ]) {
+      await tester.sendKeyDownEvent(modifier);
+      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+      await tester.sendKeyUpEvent(modifier);
+      await tester.pump();
+      expect(find.byType(StoryViewerView), findsOneWidget);
+    }
     final handled = await tester.sendKeyEvent(LogicalKeyboardKey.escape);
     expect(handled, isTrue);
     await tester.pump();

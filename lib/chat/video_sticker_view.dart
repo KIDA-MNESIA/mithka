@@ -16,6 +16,7 @@ import 'package:video_player/video_player.dart';
 
 import '../components/photo_avatar.dart';
 import '../media/looping_media_playback.dart';
+import '../media/video_playback_reporting.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_image_loader.dart';
 import '../tdlib/td_models.dart';
@@ -56,6 +57,8 @@ class _VideoStickerViewState extends State<VideoStickerView>
   LoopingMediaPlayerLease? _lease;
   LoopingMediaPlayerWaiter? _leaseWaiter;
   VideoPlayerController? _initializingController;
+  VideoPlaybackDiagnostics? _playbackDiagnostics;
+  Timer? _loopReplayTimer;
 
   static Future<bool>? _androidNeedsStaticFallback;
 
@@ -109,6 +112,10 @@ class _VideoStickerViewState extends State<VideoStickerView>
     }
     if (!_isEligible) return;
     if (sourceChanged) {
+      _playbackDiagnostics = VideoPlaybackDiagnostics(
+        location: VideoPlaybackLocation.sticker,
+        mimeType: 'video/webm',
+      );
       _loadedId = widget.file.id;
       _loadedLocalPath = widget.file.localPath;
       _loadedSlot = slot;
@@ -205,19 +212,36 @@ class _VideoStickerViewState extends State<VideoStickerView>
       videoPlayerOptions: mutedLoopingVideoPlayerOptions(),
     );
     _initializingController = c;
+    final diagnostics = _playbackDiagnostics!;
+    diagnostics.beginAttempt(
+      source: VideoPlaybackSource.file,
+      viewType: c.viewType,
+    );
     try {
-      await c.initialize();
+      // MDK (via fvp) may ignore a loop flag applied once the media is
+      // prepared (wang-bin/fvp#394), so record it first; video_player applies
+      // it while handling the initialized event. A completed clip is also
+      // replayed from the value listener below, so the sticker loops even on
+      // backends that still ignore the flag.
       await c.setLooping(true);
+      await c.initialize();
+      diagnostics.initialized(value: c.value);
       await c.setVolume(0);
       disableLoopingMediaAudioTracks(c);
+      applyWebmLoopingDecoderOverride(c);
       if (!_ownsLoad(generation, ref, slot, lease)) {
         await _disposeInitializingLoad(c, lease);
         return;
       }
       await c.play();
-    } catch (_) {
+    } catch (error) {
       final ownsCurrentSource = _ownsLoad(generation, ref, slot, lease);
       if (ownsCurrentSource) {
+        diagnostics.recordFailure(
+          error,
+          stage: VideoFailureStage.initialization,
+        );
+        diagnostics.reportTerminal();
         _fallbackOnly = true;
       }
       await _disposeInitializingLoad(c, lease);
@@ -235,8 +259,54 @@ class _VideoStickerViewState extends State<VideoStickerView>
       _initializingController = null;
     }
     _loadPending = false;
+    c.addListener(() {
+      if (!_ownsAttempt(generation, ref, slot)) return;
+      final value = c.value;
+      if (value.hasError) {
+        diagnostics.recordFailure(
+          value.errorDescription,
+          stage: VideoFailureStage.playback,
+        );
+        diagnostics.reportTerminal();
+        return;
+      }
+      // A backend that ignored setLooping completes the clip once and stops
+      // on its last frame; a video sticker must loop forever. Replay it from
+      // the start, but only after video_player's own `completed` handler has
+      // paused and parked the clip on its last frame, or the sticker briefly
+      // flashes that frame at every wrap.
+      if (value.isCompleted && !value.isPlaying) {
+        _loopReplayTimer ??= Timer(_loopReplayDelay, () {
+          _loopReplayTimer = null;
+          unawaited(_replayCompletedSticker(c, generation, ref, slot));
+        });
+      }
+    });
     setState(() => _controller = c);
     widget.onReady?.call();
+  }
+
+  static const _loopReplayDelay = Duration(milliseconds: 50);
+
+  Future<void> _replayCompletedSticker(
+    VideoPlayerController controller,
+    int generation,
+    TdFileRef ref,
+    int slot,
+  ) async {
+    if (!mounted ||
+        !identical(_controller, controller) ||
+        !_ownsAttempt(generation, ref, slot)) {
+      return;
+    }
+    final value = controller.value;
+    if (!value.isCompleted || value.isPlaying || value.hasError) return;
+    try {
+      await controller.seekTo(Duration.zero);
+      await controller.play();
+    } catch (_) {
+      // A failed replay leaves the last frame up; the next reconcile retries.
+    }
   }
 
   bool _ownsAttempt(int generation, TdFileRef ref, int slot) =>
@@ -254,13 +324,7 @@ class _VideoStickerViewState extends State<VideoStickerView>
     int slot,
     LoopingMediaPlayerLease lease,
   ) =>
-      mounted &&
-      _isEligible &&
-      generation == _generation &&
-      _loadedId == ref.id &&
-      _loadedLocalPath == ref.localPath &&
-      _loadedSlot == slot &&
-      slot == TdClient.shared.activeSlot &&
+      _ownsAttempt(generation, ref, slot) &&
       identical(_lease, lease) &&
       !lease.isReleased;
 
@@ -301,6 +365,8 @@ class _VideoStickerViewState extends State<VideoStickerView>
     _leaseWaiter?.cancel();
     _leaseWaiter = null;
     _loadPending = false;
+    _loopReplayTimer?.cancel();
+    _loopReplayTimer = null;
     final controller = _controller;
     final initializingController = _initializingController;
     final lease = _lease;

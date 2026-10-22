@@ -24,6 +24,7 @@ void main() {
       'lib/settings/chat_folder_management_view.dart',
       'lib/settings/business_tools_views.dart',
       'lib/components/app_dialog.dart',
+      'lib/components/app_date_picker.dart',
       'lib/chat/full_image_viewer.dart',
     ];
     final forbiddenControls = RegExp(
@@ -45,5 +46,17 @@ void main() {
       expect(source.contains('CupertinoIcons'), isFalse, reason: path);
       expect(source.contains(' child: Icon('), isFalse, reason: path);
     }
+  });
+
+  test('the calendar does not depend on framework design-system pickers', () {
+    final source = File(
+      'lib/components/app_date_picker.dart',
+    ).readAsStringSync();
+    expect(source, isNot(contains('package:flutter/material.dart')));
+    expect(source, isNot(contains('package:flutter/cupertino.dart')));
+    expect(
+      RegExp(r'\b(showDatePicker|CupertinoDatePicker)\b').hasMatch(source),
+      isFalse,
+    );
   });
 }

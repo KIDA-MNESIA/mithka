@@ -12,13 +12,14 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:logger/logger.dart' show Level;
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -35,8 +36,11 @@ import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
 import '../media/app_asset_picker.dart';
+import '../media/camera_capture.dart';
+import '../media/media_metadata.dart';
 import '../platform/desktop_clipboard_images.dart';
 import '../platform/desktop_screenshot.dart';
+import '../platform/keyboard_modifiers.dart';
 import '../settings/ai_settings_controller.dart';
 import '../settings/ai_settings_view.dart';
 import '../settings/apple_pcc_api.dart';
@@ -50,6 +54,7 @@ import '../tdlib/td_image_loader.dart';
 import '../tdlib/td_models.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
+import '../theme/theme_controller.dart';
 import 'ai_reply_service.dart';
 import 'audio_search_view.dart';
 import 'bot_button_presentation.dart';
@@ -62,7 +67,10 @@ import 'contact_share_picker_view.dart';
 import 'custom_emoji.dart';
 import 'desktop_composer_height.dart';
 import 'desktop_voice_message_controller.dart';
-import 'emoji_catalog.dart';
+import 'desktop_voice_waveform.dart';
+import 'emoji_panel.dart';
+import 'emoji_panel_layout.dart';
+import 'emoji_recents_store.dart';
 import 'emoji_store.dart';
 import 'emoji_text_controller.dart';
 import 'gif_item.dart';
@@ -71,6 +79,7 @@ import 'gif_store.dart';
 import 'image_edit_view.dart';
 import 'link_handler.dart';
 import 'location_picker_view.dart';
+import 'media_library_saver.dart';
 import 'media_send_preview_view.dart';
 import 'message_send_options.dart';
 import 'outgoing_attachment.dart';
@@ -89,8 +98,14 @@ import 'telegram_mini_app_view.dart';
 import 'video_note_preview_view.dart';
 import 'video_note_recorder_view.dart';
 import 'voice_note_preview_view.dart';
+import 'voice_recording_clock.dart';
 
 enum _Panel { none, function, emoji, sticker, voice }
+
+/// The kind of media the unified composer panel is showing. Both
+/// `_Panel.emoji` and `_Panel.sticker` render the same unified media panel;
+/// this picks which segment (and secondary strip) is active.
+enum _MediaKind { emoji, sticker, gif }
 
 enum _RichTextSendMode { direct, botRelay }
 
@@ -381,8 +396,10 @@ bool isComposerImeEnterFallback(
   TextEditingValue newValue, {
   required bool shiftPressed,
   required bool controlPressed,
+  bool altPressed = false,
+  bool metaPressed = false,
 }) {
-  if (shiftPressed || controlPressed) return false;
+  if (shiftPressed || controlPressed || altPressed || metaPressed) return false;
   if (!oldValue.selection.isValid || !oldValue.selection.isCollapsed) {
     return false;
   }
@@ -415,12 +432,48 @@ class _ComposerEnterToSendFormatter extends TextInputFormatter {
       newValue,
       shiftPressed: keyboard.isShiftPressed,
       controlPressed: keyboard.isControlPressed,
+      altPressed: keyboard.isAltPressed,
+      metaPressed: keyboard.isMetaPressed,
     )) {
       return newValue;
     }
     onSend();
     return oldValue;
   }
+}
+
+/// The view-model state the composer draws itself. See
+/// [_ChatInputBarState._renderedVmState].
+typedef _ComposerVmState = ({
+  int autoDeleteTime,
+  Object? selectedSender,
+  bool canChooseSender,
+  bool peerIsBot,
+});
+
+/// Incoming chat updates are frequent while a user is typing. Rebuilding the
+/// editable field for each one can make Flutter tear down and recreate the
+/// platform input connection, which presents as a blinking keyboard (and is
+/// especially visible with third-party IMEs). While focused, only rebuild for
+/// state that actually affects the composer; when unfocused, keep the previous
+/// revision-driven refresh behavior.
+@visibleForTesting
+bool shouldRebuildComposerForVmUpdate({
+  required bool revisionChanged,
+  required bool localChanged,
+  required bool hasFocus,
+}) => localChanged || (revisionChanged && !hasFocus);
+
+/// Whether the attachment strip offers the camera entry beside the image one.
+///
+/// The camera entry (which opens the in-app camera, and whose capture is sent
+/// as a photo) is rendered on Android and iOS only; a desktop or web composer
+/// shows the screenshot entry instead. Exposed as a pure predicate so a widget
+/// test can pin the strip order on any host without overriding the target
+/// platform.
+bool composerShowsCameraIcon([TargetPlatform? platform]) {
+  final target = platform ?? defaultTargetPlatform;
+  return target == TargetPlatform.android || target == TargetPlatform.iOS;
 }
 
 class ChatInputBar extends StatefulWidget {
@@ -440,6 +493,9 @@ class ChatInputBar extends StatefulWidget {
     this.quickReplyLoader,
     this.quickReplySender,
     this.onVoicePanelOpenedForTesting,
+    this.desktopVoiceRecorderFactory,
+    this.mobileVoiceRecorderFactory,
+    this.microphonePermissionForTesting,
     this.desktopScreenshotCapture,
     this.desktopClipboardAttachmentReader,
     this.desktopUtilityWindowLauncher,
@@ -450,6 +506,7 @@ class ChatInputBar extends StatefulWidget {
     this.desktopComposerHeightLoader,
     this.desktopComposerHeightSaver,
     this.botPlatformForTesting,
+    this.phoneStripForTesting = false,
   });
   final ChatViewModel vm;
   final FutureOr<void> Function(bool isVideo) onStartCall;
@@ -469,6 +526,12 @@ class ChatInputBar extends StatefulWidget {
   final Future<void> Function(int chatId, int shortcutId)? quickReplySender;
   @visibleForTesting
   final VoidCallback? onVoicePanelOpenedForTesting;
+  @visibleForTesting
+  final desktop_record.AudioRecorder Function()? desktopVoiceRecorderFactory;
+  @visibleForTesting
+  final FlutterSoundRecorder Function()? mobileVoiceRecorderFactory;
+  @visibleForTesting
+  final Future<PermissionStatus> Function()? microphonePermissionForTesting;
   @visibleForTesting
   final DesktopScreenshotCapture? desktopScreenshotCapture;
   @visibleForTesting
@@ -490,11 +553,18 @@ class ChatInputBar extends StatefulWidget {
   @visibleForTesting
   final BotPlatformService? botPlatformForTesting;
 
+  /// Renders the phone attachment strip (which includes the camera entry)
+  /// even when the widget test runs on a desktop host. Defaults to the
+  /// [defaultTargetPlatform] behaviour.
+  @visibleForTesting
+  final bool phoneStripForTesting;
+
   @override
   State<ChatInputBar> createState() => _ChatInputBarState();
 }
 
-class _ChatInputBarState extends State<ChatInputBar> {
+class _ChatInputBarState extends State<ChatInputBar>
+    with WidgetsBindingObserver {
   static const _clipboardChannel = MethodChannel('mithka/clipboard');
   static const _maximumPendingClipboardAttachments = 10;
   static const _gifTabId = -2;
@@ -516,18 +586,21 @@ class _ChatInputBarState extends State<ChatInputBar> {
   final _desktopActionOwner = Object();
   DesktopHotkeyRegistration? _desktopScreenshotHotkeyRegistration;
   final _desktopSenderPopoverLink = LayerLink();
-  final _desktopEmojiPopoverLink = LayerLink();
-  final _desktopStickerPopoverLink = LayerLink();
+  final _desktopSendOptionsLink = LayerLink();
+  final _desktopSendOptionsTargetKey = GlobalKey();
+  // Single anchor for the unified emoji/sticker/GIF media popover.
+  final _desktopMediaPopoverLink = LayerLink();
   final _desktopSenderPopoverController = OverlayPortalController();
-  final _desktopEmojiPopoverController = OverlayPortalController();
-  final _desktopStickerPopoverController = OverlayPortalController();
+  final _desktopMediaPopoverController = OverlayPortalController();
+  MessageSendOptionsContextMenuHandle? _desktopSendOptionsMenu;
   bool _desktopSenderPopoverVisible = false;
-  bool _desktopEmojiPopoverVisible = false;
-  bool _desktopStickerPopoverVisible = false;
+  bool _desktopMediaPopoverVisible = false;
   bool _wasEditingMessage = false;
   int? _syncedEditingMessageId;
   int _syncedComposerRevision = -1;
+  int _syncedComposerFocusTick = 0;
   _Panel _panel = _Panel.none;
+  _MediaKind _mediaKind = _MediaKind.emoji;
   String _emojiTab = 'standard'; // 'standard' or a custom-emoji pack id
   int? _stickerPack; // active sticker pack id
   Timer? _panelSearchTimer;
@@ -540,15 +613,26 @@ class _ChatInputBarState extends State<ChatInputBar> {
   String _gifSearchNextOffset = '';
   bool _gifSearchLoadingMore = false;
 
-  // Mobile voice recording uses flutter_sound/Opus; macOS uses record/AAC.
+  // Mobile uses flutter_sound/Opus; all native desktops use record/AAC.
   FlutterSoundRecorder? _recorder;
   desktop_record.AudioRecorder? _desktopRecorder;
+  Future<void>? _recorderPreparation;
   Future<void>? _desktopRecorderPreparation;
+  Future<void>? _voiceStart;
+  Future<void>? _voiceStop;
+  bool _voiceDisposed = false;
+  bool _voiceUsesDesktopRecorder = false;
+  bool _startingRecording = false;
+  bool _stoppingRecording = false;
+  bool _sendingVoice = false;
+  bool _changingRecordingPause = false;
+  bool _mobilePointerHeld = false;
+  int? _voicePointerId;
+  VoiceNotePreviewResult? _desktopVoiceDraft;
   StreamSubscription<desktop_record.Amplitude>? _desktopRecProgress;
   final _desktopVoiceFocus = FocusNode(debugLabel: 'desktopVoiceMessage');
   bool _desktopSpaceHeld = false;
   bool _desktopPointerHeld = false;
-  bool _desktopStopAfterStart = false;
   bool _recording = false;
   bool _recordingPaused = false;
   bool _recordingLocked = false;
@@ -565,6 +649,11 @@ class _ChatInputBarState extends State<ChatInputBar> {
   ));
   String? _recPath;
   late bool _hasText = vm.draft.trim().isNotEmpty;
+
+  /// Assigned in [initState], never lazily: a `late` initializer would first
+  /// run inside the very [_syncFromVm] call it exists to compare against, and
+  /// so record the new value as the old one.
+  late _ComposerVmState _syncedVmState;
   late bool _aiDraftEligible = isTelegramAiDraftEligible(vm.draft);
   bool _replyKeyboardVisible = false;
   Timer? _mentionSearchTimer;
@@ -581,6 +670,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
   Timer? _inlineBotTimer;
   int _inlineBotGeneration = 0;
   bool _inlineBotLoading = false;
+  bool _inlineBotLoadingMore = false;
   BotPlatformCapabilities? _inlineBot;
   BotInlineResultsPage? _inlineBotResults;
   bool _quickRepliesLoaded = false;
@@ -613,10 +703,25 @@ class _ChatInputBarState extends State<ChatInputBar> {
 
   bool get _canSendVoiceNotes => vm.canSendMessages && vm.canSendVoiceNotes;
 
+  /// The one surface colour every panel docked to the composer bar paints, so
+  /// a panel reads as a continuation of the bar instead of a recessed block.
+  /// The bar itself paints `AppColors.inputBarBackground`; the darker
+  /// `AppColors.panelBackground` is for surfaces that sit on an opaque pane
+  /// (settings lists, desk panes), not for anything attached to the composer.
+  Color get _composerDockedSurfaceColor => context.colors.inputBarBackground;
+
   @override
   void initState() {
     super.initState();
-    _botPlatform = widget.botPlatformForTesting ?? BotPlatformService();
+    WidgetsBinding.instance.addObserver(this);
+    _syncedVmState = _renderedVmState;
+    _botPlatform =
+        widget.botPlatformForTesting ??
+        // The composer belongs to one transcript, and every inline query it
+        // sends is scoped to that chat's account: a foreground switch while a
+        // result page or an inline send is in flight must not retarget the
+        // request at the replacement account's chat id.
+        BotPlatformService(queryForSlot: vm.accountSlot);
     DesktopChatComposerActions._register(
       _desktopActionOwner,
       captureScreenshot: _captureDesktopScreenshot,
@@ -627,10 +732,14 @@ class _ChatInputBarState extends State<ChatInputBar> {
         .register(
           DesktopHotkeyAction.screenshot,
           _captureDesktopScreenshot,
-          isEnabled: _isDesktopComposerVisible,
+          isEnabled: () =>
+              _isDesktopComposerVisible() &&
+              vm.canSendMessages &&
+              vm.editingMessage == null,
         );
     _wasEditingMessage = vm.editingMessage != null;
     _syncedEditingMessageId = vm.editingMessage?.id;
+    _syncedComposerFocusTick = vm.composerFocusTick;
     _controller.setFormattedText(
       vm.composerFormattedDraft,
       vm.composerDraftEntities,
@@ -641,6 +750,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
       var needsRebuild = false;
       var panelChanged = false;
       if (_focus.hasFocus && _panel != _Panel.none) {
+        if (_panel == _Panel.voice) _cancelVoiceRecording();
         _panel = _Panel.none;
         needsRebuild = true;
         panelChanged = true;
@@ -662,6 +772,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
     });
     vm.addListener(_syncFromVm);
     EmojiStore.shared.addListener(_onStore);
+    EmojiRecentsStore.shared.addListener(_onStore);
     StickerStore.shared.addListener(_onStore);
     GifStore.shared.addListener(_onStore);
     _botPlatformUpdates = TdClient.shared
@@ -673,6 +784,12 @@ class _ChatInputBarState extends State<ChatInputBar> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _requestInitialFocusIfReady();
+      if (mounted &&
+          !_controller.startsWithIdBackedMention &&
+          BotInlineInvocation.fromText(_controller.text) != null) {
+        _focus.requestFocus();
+        _queueInlineBotResults();
+      }
       unawaited(_restoreDesktopComposerHeight());
       if (mounted && _canUseQuickReplies) {
         unawaited(_loadQuickReplies(userInitiated: false));
@@ -795,6 +912,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
       _botCommandQuery = null;
       _botCommandCandidates = const [];
       _inlineBotLoading = false;
+      _inlineBotLoadingMore = false;
       _inlineBotResults = null;
       if (hadSuggestions && mounted) setState(() {});
       return;
@@ -812,7 +930,11 @@ class _ChatInputBarState extends State<ChatInputBar> {
 
   void _updateMentionSuggestions() {
     final query = activeMentionQuery(_controller.text, _controller.selection);
-    if (!_focus.hasFocus || query == null || !vm.isGroup) {
+    final includeInlineBots =
+        query != null && query.start == 0 && !vm.isSecretChat;
+    if (!_focus.hasFocus ||
+        query == null ||
+        (!vm.isGroup && !includeInlineBots)) {
       _mentionSearchTimer?.cancel();
       _mentionSearchGeneration++;
       if (_mentionQuery != null || _mentionCandidates.isNotEmpty) {
@@ -833,7 +955,12 @@ class _ChatInputBarState extends State<ChatInputBar> {
     _mentionSearchTimer?.cancel();
     final generation = ++_mentionSearchGeneration;
     _mentionSearchTimer = Timer(const Duration(milliseconds: 120), () async {
-      final candidates = await vm.searchMentionCandidates(query.query);
+      final candidates = includeInlineBots
+          ? await vm.searchMentionCandidates(
+              query.query,
+              includeInlineBots: true,
+            )
+          : await vm.searchMentionCandidates(query.query);
       if (!mounted || generation != _mentionSearchGeneration) return;
       final active = activeMentionQuery(
         _controller.text,
@@ -864,6 +991,33 @@ class _ChatInputBarState extends State<ChatInputBar> {
     _mentionSearchGeneration++;
     _mentionQuery = null;
     _mentionCandidates = const [];
+    if (candidate.isInlineBot &&
+        query.start == 0 &&
+        candidate.username.trim().isNotEmpty) {
+      final cleanUsername = candidate.username.trim().replaceFirst(
+        RegExp(r'^@+'),
+        '',
+      );
+      final replacement = '@$cleanUsername ';
+      final replaceEnd =
+          query.end < _controller.text.length &&
+              _controller.text[query.end].trim().isEmpty
+          ? query.end + 1
+          : query.end;
+      final newText = _controller.text.replaceRange(
+        query.start,
+        replaceEnd,
+        replacement,
+      );
+      _controller.value = TextEditingValue(
+        text: newText,
+        selection: TextSelection.collapsed(
+          offset: query.start + replacement.length,
+        ),
+      );
+      _focus.requestFocus();
+      return;
+    }
     _controller.insertTextMention(
       start: query.start,
       end: query.end,
@@ -946,17 +1100,22 @@ class _ChatInputBarState extends State<ChatInputBar> {
     final generation = ++_inlineBotGeneration;
     if (invocation == null) {
       if (_inlineBotLoading ||
+          _inlineBotLoadingMore ||
           _inlineBotResults != null ||
           _inlineBot != null) {
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
         _inlineBotResults = null;
         _inlineBot = null;
         if (mounted) setState(() {});
       }
       return;
     }
-    if (!_inlineBotLoading || _inlineBotResults != null) {
+    if (!_inlineBotLoading ||
+        _inlineBotLoadingMore ||
+        _inlineBotResults != null) {
       _inlineBotLoading = true;
+      _inlineBotLoadingMore = false;
       _inlineBotResults = null;
       if (mounted) setState(() {});
     }
@@ -993,13 +1152,85 @@ class _ChatInputBarState extends State<ChatInputBar> {
         _inlineBot = bot;
         _inlineBotResults = page;
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
       });
     } catch (_) {
       if (!mounted || generation != _inlineBotGeneration) return;
       setState(() {
         _inlineBotResults = null;
         _inlineBotLoading = false;
+        _inlineBotLoadingMore = false;
       });
+    }
+  }
+
+  Future<void> _loadMoreInlineBotResults() async {
+    final page = _inlineBotResults;
+    final bot = _inlineBot;
+    if (page == null ||
+        bot == null ||
+        !page.hasMore ||
+        _inlineBotLoading ||
+        _inlineBotLoadingMore) {
+      return;
+    }
+    final invocation = _controller.startsWithIdBackedMention
+        ? null
+        : BotInlineInvocation.fromText(_controller.text);
+    if (invocation == null ||
+        invocation.username.toLowerCase() != bot.username.toLowerCase()) {
+      return;
+    }
+    final generation = _inlineBotGeneration;
+    setState(() => _inlineBotLoadingMore = true);
+    try {
+      final location = bot.needsLocation ? await _inlineBotLocation() : null;
+      final response = await _botPlatform.inlineResults(
+        botUserId: bot.userId,
+        chatId: vm.chatId,
+        query: invocation.query,
+        offset: page.nextOffset,
+        location: location,
+      );
+      final nextPage = BotInlineResultsPage.fromJson(response);
+      if (!mounted || generation != _inlineBotGeneration) return;
+      final current = _inlineBotResults;
+      if (current == null) return;
+      setState(() {
+        _inlineBotResults = current.mergeNextPage(nextPage);
+        _inlineBotLoadingMore = false;
+      });
+    } catch (_) {
+      if (!mounted || generation != _inlineBotGeneration) return;
+      setState(() => _inlineBotLoadingMore = false);
+    }
+  }
+
+  Future<void> _activateInlineResultsButton(
+    BotInlineResultsButton button,
+  ) async {
+    final bot = _inlineBot;
+    if (bot == null) return;
+    if (button.isWebApp && button.webAppUrl.isNotEmpty) {
+      final opened = await openTelegramMiniApp(
+        context,
+        chatId: vm.chatId,
+        botUserId: bot.userId,
+        url: button.webAppUrl,
+        title: button.text,
+      );
+      if (!mounted) return;
+      if (!opened) {
+        showToast(context, AppStrings.t(AppStringKeys.miniAppCannotStart));
+      }
+      return;
+    }
+    final parameter = button.startParameter;
+    if (parameter.isNotEmpty) {
+      final link = 'https://t.me/${bot.username}?start=$parameter';
+      await openLink(context, link);
+    } else {
+      await openLink(context, 'https://t.me/${bot.username}');
     }
   }
 
@@ -1023,21 +1254,43 @@ class _ChatInputBarState extends State<ChatInputBar> {
     };
   }
 
+  /// The view-model state the composer draws itself.
+  ///
+  /// [shouldRebuildComposerForVmUpdate] stops rebuilding on bare revision
+  /// bumps while the field has focus, so anything rendered from the view model
+  /// has to be compared here or it silently stops updating mid-typing — which
+  /// is how the auto-delete indicator got stuck on screen after the chat's
+  /// timer was turned off. Add to this record when the composer starts drawing
+  /// another view-model value.
+  _ComposerVmState get _renderedVmState => (
+    autoDeleteTime: vm.messageAutoDeleteTime,
+    selectedSender: vm.selectedMessageSender,
+    canChooseSender: vm.canChooseMessageSender,
+    peerIsBot: vm.peerIsBot,
+  );
+
   void _syncFromVm() {
     // A notification that changed only the typing subtitle or the peer's
     // online status leaves the revision alone; nothing here renders either.
     final revision = vm.composerRevision;
     final revisionChanged = revision != _syncedComposerRevision;
     _syncedComposerRevision = revision;
+    final focusTick = vm.composerFocusTick;
+    final focusRequested = focusTick != _syncedComposerFocusTick;
+    if (focusRequested) {
+      _syncedComposerFocusTick = focusTick;
+      _focusComposerForTranscriptReply();
+    }
     final hadText = _hasText;
+    final previousVmState = _syncedVmState;
+    _syncedVmState = _renderedVmState;
     final wasAiDraftEligible = _aiDraftEligible;
     final hadQuickReplyContext = _quickReplyContextVisible;
-    final voicePanelWasClosed = !_canSendVoiceNotes && _panel == _Panel.voice;
+    final voicePanelWasClosed =
+        (!_canSendVoiceNotes || vm.editingMessage != null) &&
+        _panel == _Panel.voice;
     if (voicePanelWasClosed) {
-      if (_recording) {
-        _recordCancelled = true;
-        unawaited(_stopRec());
-      }
+      _cancelVoiceRecording();
       _desktopVoiceFocus.unfocus();
       _panel = _Panel.none;
     }
@@ -1090,7 +1343,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
     } else {
       final composing = _controller.value.composing;
       final composingLocally = _focus.hasFocus || composing.isValid;
-      if (!composingLocally && vm.draft != _controller.text) {
+      if ((!composingLocally || focusRequested) &&
+          vm.draft != _controller.text) {
         _controller.value = TextEditingValue(
           text: vm.draft,
           selection: TextSelection.collapsed(offset: vm.draft.length),
@@ -1113,9 +1367,30 @@ class _ChatInputBarState extends State<ChatInputBar> {
         hadText != _hasText ||
         wasAiDraftEligible != _aiDraftEligible ||
         hadQuickReplyContext != _quickReplyContextVisible ||
+        previousVmState != _syncedVmState ||
         !identical(previousBotCommandQuery, _botCommandQuery) ||
         !identical(previousBotCommandCandidates, _botCommandCandidates);
-    if (mounted && (revisionChanged || localChanged)) setState(() {});
+    if (mounted &&
+        shouldRebuildComposerForVmUpdate(
+          revisionChanged: revisionChanged,
+          localChanged: localChanged,
+          hasFocus: _focus.hasFocus,
+        )) {
+      setState(() {});
+    }
+  }
+
+  /// Raises the caret for a reply target picked on the transcript. Skipped
+  /// where nothing can be sent: a keyboard over a composer that cannot speak
+  /// only hides the conversation.
+  void _focusComposerForTranscriptReply() {
+    final owner = vm;
+    if (!mounted || !owner.canSendMessages) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && identical(vm, owner) && owner.canSendMessages) {
+        _focus.requestFocus();
+      }
+    });
   }
 
   void _requestInitialFocusIfReady() {
@@ -1154,6 +1429,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
   void didUpdateWidget(ChatInputBar oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.vm, widget.vm)) {
+      _syncedComposerFocusTick = widget.vm.composerFocusTick;
+      _cancelVoiceRecording();
+      _discardDesktopVoiceDraft();
+      if (_panel == _Panel.voice) _panel = _Panel.none;
       _hideDesktopPopovers(rebuild: false);
       _invalidateAiReplyGeneration(discardGeneratedDraft: true);
       _discardPendingClipboardAttachments();
@@ -1193,6 +1472,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _voiceDisposed = true;
+    _recordCancelled = true;
+    _clearVoicePresses();
     _desktopComposerHeightLoadGeneration++;
     _desktopScreenshotHotkeyRegistration?.dispose();
     DesktopChatComposerActions._unregister(_desktopActionOwner);
@@ -1200,8 +1483,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
     // while the portal is already being unmounted asserts because it no
     // longer has a z-order slot, so only clear our logical state here.
     _desktopSenderPopoverVisible = false;
-    _desktopEmojiPopoverVisible = false;
-    _desktopStickerPopoverVisible = false;
+    _desktopMediaPopoverVisible = false;
+    _desktopSendOptionsMenu?.dismiss();
+    _desktopSendOptionsMenu = null;
     _discardPendingClipboardAttachments();
     _aiReplyGeneration++;
     if (_activeAiReplyProvider case final HostedAiReplyProvider hosted) {
@@ -1214,6 +1498,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
     _aiReplyWorkingContextSnapshot = null;
     vm.removeListener(_syncFromVm);
     EmojiStore.shared.removeListener(_onStore);
+    EmojiRecentsStore.shared.removeListener(_onStore);
     StickerStore.shared.removeListener(_onStore);
     GifStore.shared.removeListener(_onStore);
     if (widget.quickReplyLoader == null) {
@@ -1234,8 +1519,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
     _inlineBotTimer?.cancel();
     _botPlatformUpdates?.cancel();
     _hideRelayProgress();
-    _recorder?.closeRecorder();
-    _desktopRecorder?.dispose();
+    unawaited(_disposeVoiceRecorders());
     super.dispose();
   }
 
@@ -1287,7 +1571,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
     var gifs = const <GifItem>[];
     var gifNextOffset = '';
     try {
-      if ((_panel == _Panel.emoji || _desktopEmojiPopoverVisible) &&
+      if (_mediaPanelOpen &&
+          _mediaKind == _MediaKind.emoji &&
           _emojiTab == _emojiSearchTab) {
         final results = await Future.wait([
           TdClient.shared.query({
@@ -1316,7 +1601,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
         }
         emoji = values;
         customEmoji = parseStickers(results.last.objects('stickers'));
-      } else if ((_panel == _Panel.sticker || _desktopStickerPopoverVisible) &&
+      } else if (_mediaPanelOpen &&
+          _mediaKind == _MediaKind.sticker &&
           _stickerPack == _stickerSearchTabId) {
         final results = await Future.wait<dynamic>([
           TdClient.shared.query({
@@ -1328,11 +1614,13 @@ class _ChatInputBarState extends State<ChatInputBar> {
             'offset': 0,
             'limit': 100,
           }),
-          _searchGifs(query),
         ]);
         final result = results.first as Map<String, dynamic>;
-        final gifPage = results.last as (List<GifItem>, String);
         stickers = parseStickers(result.objects('stickers'));
+      } else if (_mediaPanelOpen &&
+          _mediaKind == _MediaKind.gif &&
+          _gifSearchSelected) {
+        final gifPage = await _searchGifs(query);
         gifs = gifPage.$1;
         gifNextOffset = gifPage.$2;
       }
@@ -1412,14 +1700,45 @@ class _ChatInputBarState extends State<ChatInputBar> {
     }
   }
 
-  bool get _isPanelSearchSelected =>
-      ((_panel == _Panel.emoji || _desktopEmojiPopoverVisible) &&
-          _emojiTab == _emojiSearchTab) ||
-      ((_panel == _Panel.sticker || _desktopStickerPopoverVisible) &&
-          _stickerPack == _stickerSearchTabId);
+  /// True when the unified emoji/sticker/GIF panel is open, either inline or
+  /// as the desktop media popover.
+  bool get _mediaPanelOpen =>
+      _panel == _Panel.emoji ||
+      _panel == _Panel.sticker ||
+      _desktopMediaPopoverVisible;
+
+  /// The GIF segment's secondary strip is a search bar plus the saved-GIFs
+  /// tab, mirroring the emoji and sticker search tabs.
+  bool get _gifSearchSelected => _stickerPack == _stickerSearchTabId;
+
+  bool get _isPanelSearchSelected {
+    if (!_mediaPanelOpen) return false;
+    return switch (_mediaKind) {
+      _MediaKind.emoji => _emojiTab == _emojiSearchTab,
+      _MediaKind.sticker => _stickerPack == _stickerSearchTabId,
+      _MediaKind.gif => _gifSearchSelected,
+    };
+  }
+
+  /// The sticker tab to show: an explicit pick while it still names a tab in
+  /// the loaded list, otherwise the first installed set, and recents when no
+  /// set is installed at all.
+  int get _activeStickerTab {
+    final selected = _stickerPack;
+    if (selected == _stickerSearchTabId) return _stickerSearchTabId;
+    if (selected != null) {
+      for (final pack in StickerStore.shared.packs) {
+        if (pack.id == selected) return selected;
+      }
+    }
+    return StickerStore.shared.defaultPackId;
+  }
 
   void _setPanel(_Panel next) {
     if (_panel == next && !_quickReplyContextVisible) return;
+    if (_panel == _Panel.voice && next != _Panel.voice) {
+      _cancelVoiceRecording();
+    }
     if (next != _Panel.none) _hideDesktopPopovers(rebuild: false);
     setState(() {
       _panel = next;
@@ -1450,10 +1769,67 @@ class _ChatInputBarState extends State<ChatInputBar> {
     }
   }
 
+  void _selectMediaKind(_MediaKind kind) {
+    if (_mediaKind == kind) return;
+    var stickerPack = _stickerPack;
+    if (kind == _MediaKind.sticker && _stickerPack == _gifTabId) {
+      // The saved-GIFs tab belongs to the GIF segment; dropping it lets the
+      // sticker segment resolve its own default tab.
+      stickerPack = null;
+    }
+    setState(() {
+      _mediaKind = kind;
+      _stickerPack = stickerPack;
+    });
+    switch (kind) {
+      case _MediaKind.emoji:
+        EmojiStore.shared.loadIfNeeded();
+        EmojiRecentsStore.shared.loadIfNeeded();
+      case _MediaKind.sticker:
+        final activeId = _activeStickerTab;
+        if (activeId == StickerStore.recentPackId ||
+            activeId == _stickerSearchTabId) {
+          StickerStore.shared.loadIfNeeded();
+        } else {
+          StickerStore.shared.loadPack(activeId);
+        }
+      case _MediaKind.gif:
+        GifStore.shared.loadIfNeeded();
+    }
+    if (_isPanelSearchSelected && _panelSearch.text.trim().isNotEmpty) {
+      _queuePanelSearch();
+    }
+  }
+
+  /// Toggles the unified media panel from the composer's media button.
+  ///
+  /// Opening keeps the last-used segment (emoji until the user picks
+  /// another); tapping again closes the panel. Switching segments inside an
+  /// open panel goes through [_selectMediaKind] instead.
+  void _toggleMediaPanel() {
+    if (_mediaPanelOpen) {
+      _toggle(_Panel.none);
+      return;
+    }
+    switch (_mediaKind) {
+      case _MediaKind.emoji:
+        EmojiStore.shared.loadIfNeeded();
+        EmojiRecentsStore.shared.loadIfNeeded();
+      case _MediaKind.sticker:
+        StickerStore.shared.loadIfNeeded();
+      case _MediaKind.gif:
+        GifStore.shared.loadIfNeeded();
+    }
+    _toggle(_mediaKind == _MediaKind.emoji ? _Panel.emoji : _Panel.sticker);
+    if (_mediaPanelOpen &&
+        _isPanelSearchSelected &&
+        _panelSearch.text.trim().isNotEmpty) {
+      _queuePanelSearch();
+    }
+  }
+
   void _finishPanelSend() {
-    if (_desktopSenderPopoverVisible ||
-        _desktopEmojiPopoverVisible ||
-        _desktopStickerPopoverVisible) {
+    if (_desktopSenderPopoverVisible || _desktopMediaPopoverVisible) {
       _hideDesktopPopovers();
     } else {
       _setPanel(_Panel.none);
@@ -1468,9 +1844,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
   void _toggleVoice() {
     _focus.unfocus();
     final opening = _panel != _Panel.voice;
-    if (!opening && _recording) {
-      _recordCancelled = true;
-      unawaited(_stopRec());
+    if (opening) {
+      _voiceUsesDesktopRecorder = _usesNativeDesktopComposer(context);
     }
     _setPanel(opening ? _Panel.voice : _Panel.none);
     if (opening) {
@@ -1491,40 +1866,64 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Future<void> _prepareRecorder() async {
-    if (Platform.isMacOS) {
+    if (_voiceUsesDesktopRecorder) {
       await _prepareDesktopRecorder();
       return;
     }
     if (_recorder != null) return;
-    var status = await Permission.microphone.status;
-    if (!status.isGranted && !status.isPermanentlyDenied) {
-      status = await Permission.microphone.request();
-    }
-    if (!status.isGranted) {
-      if (!mounted) return;
-      showToast(
-        context,
-        status.isPermanentlyDenied
-            ? AppStrings.t(AppStringKeys.composerMicrophonePermissionSettings)
-            : AppStrings.t(AppStringKeys.composerMicrophonePermissionRequired),
-      );
-      if (status.isPermanentlyDenied) unawaited(openAppSettings());
-      return;
-    }
-    final r = FlutterSoundRecorder();
+    final pending = _recorderPreparation;
+    if (pending != null) return pending;
+    late final Future<void> preparation;
+    preparation = _createMobileRecorder().whenComplete(() {
+      if (identical(_recorderPreparation, preparation)) {
+        _recorderPreparation = null;
+      }
+    });
+    _recorderPreparation = preparation;
+    await preparation;
+  }
+
+  Future<void> _createMobileRecorder() async {
+    FlutterSoundRecorder? recorder;
     try {
-      await r.openRecorder();
-      await r.setSubscriptionDuration(const Duration(milliseconds: 100));
+      final permission = widget.microphonePermissionForTesting;
+      var status = permission != null
+          ? await permission()
+          : await Permission.microphone.status;
+      if (permission == null &&
+          !status.isGranted &&
+          !status.isPermanentlyDenied) {
+        status = await Permission.microphone.request();
+      }
+      if (_voiceDisposed || !mounted) return;
+      if (!status.isGranted) {
+        showToast(
+          context,
+          AppStrings.t(
+            status.isPermanentlyDenied
+                ? AppStringKeys.composerMicrophonePermissionSettings
+                : AppStringKeys.composerMicrophonePermissionRequired,
+          ),
+        );
+        if (status.isPermanentlyDenied) unawaited(openAppSettings());
+        return;
+      }
+      recorder =
+          widget.mobileVoiceRecorderFactory?.call() ??
+          FlutterSoundRecorder(logLevel: Level.warning);
+      await recorder.openRecorder();
+      await recorder.setSubscriptionDuration(const Duration(milliseconds: 100));
+      if (_voiceDisposed || !mounted) {
+        await recorder.closeRecorder();
+        return;
+      }
+      setState(() => _recorder = recorder);
     } catch (_) {
-      return;
+      try {
+        await recorder?.closeRecorder();
+      } catch (_) {}
+      _showRecordingError();
     }
-    if (!mounted) {
-      await r.closeRecorder();
-      return;
-    }
-    // setState so the panel rebuilds with the recorder ready — otherwise the
-    // press handlers keep seeing a stale `granted == false` and never record.
-    setState(() => _recorder = r);
   }
 
   Future<void> _prepareDesktopRecorder() async {
@@ -1545,12 +1944,15 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Future<void> _createDesktopRecorder() async {
-    final recorder = desktop_record.AudioRecorder();
+    final recorder =
+        widget.desktopVoiceRecorderFactory?.call() ??
+        desktop_record.AudioRecorder();
     bool allowed;
     try {
       allowed = await recorder.hasPermission();
     } catch (_) {
       await recorder.dispose();
+      _showRecordingError();
       return;
     }
     if (!allowed) {
@@ -1562,75 +1964,115 @@ class _ChatInputBarState extends State<ChatInputBar> {
       );
       return;
     }
-    if (!mounted) {
+    if (_voiceDisposed || !mounted) {
       await recorder.dispose();
       return;
     }
     setState(() => _desktopRecorder = recorder);
   }
 
-  Future<void> _beginDesktopVoiceRecording() => prepareDesktopVoiceRecording(
-    prepare: _prepareDesktopRecorder,
-    shouldStart: () =>
-        mounted &&
-        _desktopRecorder != null &&
-        !_recording &&
-        (_desktopSpaceHeld || _desktopPointerHeld),
-    start: _startDesktopRec,
-  );
+  bool get _voicePressHeld => _voiceUsesDesktopRecorder
+      ? _desktopSpaceHeld || _desktopPointerHeld
+      : _mobilePointerHeld;
 
-  /// Telegram voice notes want OGG/Opus, but not every Android encoder supports
-  /// it — pick the first codec the device can actually record.
-  Future<(Codec, String)?> _pickRecordCodec(
-    FlutterSoundRecorder r,
-    String dir,
-  ) async {
-    const candidates = [
-      (Codec.opusOGG, 'ogg'),
-      (Codec.opusWebM, 'webm'),
-      (Codec.aacADTS, 'aac'),
-      (Codec.aacMP4, 'm4a'),
-    ];
-    for (final (codec, ext) in candidates) {
-      if (await r.isEncoderSupported(codec)) {
-        return (
-          codec,
-          '$dir/voice_${DateTime.now().millisecondsSinceEpoch}.$ext',
-        );
-      }
-    }
-    return null;
-  }
+  bool get _canStartHeldRecording =>
+      mounted &&
+      !_voiceDisposed &&
+      _panel == _Panel.voice &&
+      _canSendVoiceNotes &&
+      !_recordCancelled &&
+      _voicePressHeld;
 
-  Future<void> _startRec() async {
-    if (Platform.isMacOS) {
-      await _startDesktopRec();
-      return;
+  Future<void> _beginVoiceRecording() {
+    if (_voiceDisposed ||
+        _voiceStop != null ||
+        _recording ||
+        _desktopVoiceDraft != null) {
+      return Future<void>.value();
     }
-    final r = _recorder;
-    if (r == null || _recording) return;
-    final dir = await getTemporaryDirectory();
-    final picked = await _pickRecordCodec(r, dir.path);
-    if (picked == null) return;
-    final (codec, path) = picked;
-    _recPath = path;
+    final pending = _voiceStart;
+    if (pending != null) return pending;
     _recordCancelled = false;
     _recordingPaused = false;
     _recordingLocked = false;
     _elapsed = 0;
     _recLevels.clear();
     _recTick.value = (elapsed: 0.0, levels: const <double>[]);
-    try {
-      await r.startRecorder(toFile: _recPath, codec: codec, sampleRate: 48000);
-    } catch (_) {
+    setState(() => _startingRecording = true);
+    late final Future<void> start;
+    start =
+        prepareDesktopVoiceRecording(
+              prepare: _prepareRecorder,
+              shouldStart: () => _canStartHeldRecording,
+              start: _startRec,
+            )
+            .catchError((Object _) {
+              _showRecordingError();
+            })
+            .whenComplete(() {
+              if (identical(_voiceStart, start)) _voiceStart = null;
+              _startingRecording = false;
+              if (mounted && !_voiceDisposed) setState(() {});
+            });
+    _voiceStart = start;
+    return start;
+  }
+
+  void _showRecordingError() {
+    if (mounted && !_voiceDisposed && _panel == _Panel.voice) {
+      showToast(context, AppStrings.t(AppStringKeys.composerRecordingFailed));
+    }
+  }
+
+  Future<void> _startRec() async {
+    if (_voiceUsesDesktopRecorder) {
+      await _startDesktopRec();
       return;
     }
-    if (!mounted) return;
+    final r = _recorder;
+    if (r == null || _recording) return;
+    final dir = await getTemporaryDirectory();
+    const candidates = [
+      (Codec.opusOGG, 'ogg'),
+      (Codec.opusWebM, 'webm'),
+      (Codec.aacADTS, 'aac'),
+      (Codec.aacMP4, 'm4a'),
+    ];
+    var started = false;
+    for (final (codec, extension) in candidates) {
+      if (!_canStartHeldRecording) return;
+      try {
+        if (!await r.isEncoderSupported(codec)) continue;
+        if (!_canStartHeldRecording) return;
+        final path =
+            '${dir.path}/voice_${DateTime.now().microsecondsSinceEpoch}.$extension';
+        _recPath = path;
+        await r.startRecorder(toFile: path, codec: codec, sampleRate: 48000);
+        started = true;
+        break;
+      } catch (_) {
+        // Some devices claim Opus support but fail when opening the encoder.
+        // Close that attempt before trying the next supported container.
+        try {
+          await r.stopRecorder();
+        } catch (_) {}
+        final path = _recPath;
+        _recPath = null;
+        if (path != null) await _deleteTempFile(path);
+      }
+    }
+    if (!started) {
+      _showRecordingError();
+      return;
+    }
+    if (_voiceDisposed || !mounted) return;
     setState(() => _recording = true);
     await _recProgress?.cancel();
+    final clock = VoiceRecordingClock();
     _recProgress = r.onProgress?.listen((event) {
-      if (!mounted) return;
-      _elapsed = event.duration.inMilliseconds / 1000;
+      if (!mounted || _voiceDisposed || !_recording || _recordingPaused) return;
+      clock.update(event.duration);
+      _elapsed = clock.seconds;
       final level = event.decibels;
       if (level != null && level.isFinite) {
         _recLevels.add((level >= 0 ? level - 120 : level).clamp(-120.0, 0.0));
@@ -1641,16 +2083,16 @@ class _ChatInputBarState extends State<ChatInputBar> {
       );
     });
     _recTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (!mounted) return;
+      if (!mounted || _voiceDisposed || !_recording) return;
       // Only here to move the clock until the recorder's own progress stream
       // reports; once it has, the timer has nothing left to do.
-      if (_elapsed != 0) {
+      if (clock.hasRecorderProgress) {
         timer.cancel();
         _recTimer = null;
         return;
       }
-      if (_recordingPaused) return;
-      _elapsed += 0.1;
+      clock.tick(const Duration(milliseconds: 100), paused: _recordingPaused);
+      _elapsed = clock.seconds;
       _recTick.value = (elapsed: _elapsed, levels: _recTick.value.levels);
     });
   }
@@ -1659,15 +2101,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
     final recorder = _desktopRecorder;
     if (recorder == null || _recording) return;
     final directory = await getTemporaryDirectory();
+    if (!_canStartHeldRecording) return;
     final path =
-        '${directory.path}/voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+        '${directory.path}/voice_${DateTime.now().microsecondsSinceEpoch}.m4a';
     _recPath = path;
-    _recordCancelled = false;
-    _recordingPaused = false;
-    _recordingLocked = false;
-    _elapsed = 0;
-    _recLevels.clear();
-    _recTick.value = (elapsed: 0.0, levels: const <double>[]);
     try {
       await recorder.start(
         const desktop_record.RecordConfig(
@@ -1678,183 +2115,293 @@ class _ChatInputBarState extends State<ChatInputBar> {
         path: path,
       );
     } catch (_) {
+      try {
+        await recorder.cancel();
+      } catch (_) {}
+      await _deleteTempFile(path);
+      _recPath = null;
+      _showRecordingError();
       return;
     }
-    if (!mounted) {
-      await recorder.cancel();
-      return;
-    }
+    if (_voiceDisposed || !mounted) return;
     setState(() => _recording = true);
     await _desktopRecProgress?.cancel();
     _desktopRecProgress = recorder
         .onAmplitudeChanged(const Duration(milliseconds: 100))
         .listen((amplitude) {
-          if (!mounted) return;
+          if (!mounted || _voiceDisposed || !_recording || _recordingPaused) {
+            return;
+          }
           final level = amplitude.current;
           if (level.isFinite) {
             _recLevels.add(level.clamp(-120.0, 0.0));
             _recTick.value = (
               elapsed: _elapsed,
-              levels: _recLevels.reversed.take(42).toList().reversed.toList(),
+              levels: _recLevels.reversed.take(120).toList().reversed.toList(),
             );
           }
         });
     _recTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (!mounted) return;
+      if (!mounted || _voiceDisposed || !_recording) return;
       if (_recordingPaused) return;
       _elapsed += 0.1;
       _recTick.value = (elapsed: _elapsed, levels: _recTick.value.levels);
     });
-    if (_desktopStopAfterStart ||
-        (!_desktopSpaceHeld && !_desktopPointerHeld)) {
-      _desktopStopAfterStart = false;
-      unawaited(_stopRec());
-    }
   }
 
-  Future<void> _stopRec() async {
-    if (Platform.isMacOS) {
-      await _stopDesktopRec();
-      return;
-    }
-    final r = _recorder;
+  Future<void> _stopRec() {
+    final pending = _voiceStop;
+    if (pending != null) return pending;
+    if (_voiceDisposed || !mounted) return Future<void>.value();
+    setState(() => _stoppingRecording = true);
+    late final Future<void> stop;
+    stop = _finishVoiceRecording().whenComplete(() {
+      if (identical(_voiceStop, stop)) _voiceStop = null;
+      _stoppingRecording = false;
+      if (mounted && !_voiceDisposed) setState(() {});
+    });
+    _voiceStop = stop;
+    return stop;
+  }
+
+  Future<void> _finishVoiceRecording() async {
+    // A release/cancel may arrive during permission or native startup. Wait
+    // for that exact start, then finalize it once; never start another clip
+    // or send twice while the previous stop is still asynchronous.
+    await _voiceStart;
+    if (_voiceDisposed || !_recording) return;
+    final target = vm;
+    final duration = _elapsed.round();
+    final levels = List<double>.unmodifiable(_recLevels);
+    final originalPath = _recPath;
     _recTimer?.cancel();
     _recTimer = null;
     await _recProgress?.cancel();
     _recProgress = null;
-    if (r == null || !_recording) return;
-    final secs = _elapsed.round();
-    final cancelled = _recordCancelled;
-    String? url;
-    try {
-      url = await r.stopRecorder();
-    } catch (_) {}
-    if (!mounted) return;
-    setState(() {
-      _recording = false;
-      _recordingPaused = false;
-      _recordingLocked = false;
-    });
-    if (cancelled || secs < 1 || url == null) {
-      if (url != null) unawaited(_deleteTempFile(url));
-      return;
-    }
-    final result = await Navigator.of(context).push<VoiceNotePreviewResult>(
-      MaterialPageRoute(
-        builder: (_) => VoiceNotePreviewView(
-          path: url!,
-          duration: secs,
-          levels: List<double>.unmodifiable(_recLevels),
-          allowWhenOnline: vm.canSendWhenOnline,
-          effects: vm.availableMessageEffects,
-        ),
-      ),
-    );
-    if (!mounted) return;
-    if (result == null) {
-      unawaited(_deleteTempFile(url));
-      return;
-    }
-    final sent = await vm.sendVoice(
-      result.path,
-      result.duration,
-      waveform: result.waveform,
-      sendConfiguration: result.sendConfiguration,
-    );
-    if (!mounted) return;
-    if (sent) {
-      _finishPanelSend();
-    } else {
-      showToast(context, AppStringKeys.topicPostContentActionFailed);
-    }
-  }
-
-  Future<void> _stopDesktopRec() async {
-    _recTimer?.cancel();
-    _recTimer = null;
     await _desktopRecProgress?.cancel();
     _desktopRecProgress = null;
-    final recorder = _desktopRecorder;
-    if (recorder == null || !_recording) return;
-    final cancelled = _recordCancelled;
+    _recording = false;
+    _recordingPaused = false;
+    _recordingLocked = false;
+    _clearVoicePresses();
+    if (mounted && !_voiceDisposed) setState(() {});
     String? recordedPath;
     try {
-      recordedPath = await recorder.stop();
-    } catch (_) {}
+      recordedPath = _voiceUsesDesktopRecorder
+          ? await _desktopRecorder?.stop()
+          : await _recorder?.stopRecorder();
+    } catch (_) {
+      // A failed stop must still release the microphone before another hold.
+      try {
+        if (_voiceUsesDesktopRecorder) {
+          await _desktopRecorder?.cancel();
+        } else {
+          final recorder = _recorder;
+          _recorder = null;
+          await recorder?.closeRecorder();
+        }
+      } catch (_) {}
+    }
     final url = await _waitForRecordingFile(recordedPath);
-    if (!mounted) return;
-    final duration = _elapsed.round();
-    setState(() {
-      _recording = false;
-      _recordingPaused = false;
-      _recordingLocked = false;
-      _desktopSpaceHeld = false;
-      _desktopPointerHeld = false;
-    });
+    _recPath = null;
+    final cancelled =
+        _recordCancelled ||
+        _voiceDisposed ||
+        !mounted ||
+        _panel != _Panel.voice ||
+        !identical(target, vm) ||
+        !_canSendVoiceNotes;
     if (cancelled || duration < 1 || url == null) {
-      if (recordedPath != null) unawaited(_deleteTempFile(recordedPath));
-      if (!cancelled && duration >= 1 && mounted) {
-        showToast(
-          context,
-          AppStrings.t(AppStringKeys.topicPostContentActionFailed),
-        );
+      for (final path in {originalPath, recordedPath}.whereType<String>()) {
+        await _deleteTempFile(path);
       }
+      if (_voiceDisposed || !mounted) return;
+      if (!cancelled && duration >= 1 && url == null) _showRecordingError();
       _elapsed = 0;
       _recLevels.clear();
       _recTick.value = (elapsed: 0.0, levels: const <double>[]);
       return;
     }
-    final sent = await vm.sendVoice(
-      url,
-      duration,
-      waveform: encodeTelegramWaveform(_recLevels),
-    );
-    if (!mounted) return;
+    if (!mounted || _voiceDisposed) return;
+    if (_voiceUsesDesktopRecorder) {
+      setState(
+        () => _desktopVoiceDraft = VoiceNotePreviewResult(
+          path: url,
+          duration: duration,
+          waveform: encodeTelegramWaveform(levels),
+          sendConfiguration: const MessageSendConfiguration(),
+        ),
+      );
+      await _sendDesktopVoiceDraft();
+    } else {
+      final result = await Navigator.of(context).push<VoiceNotePreviewResult>(
+        MaterialPageRoute(
+          builder: (_) => VoiceNotePreviewView(
+            path: url,
+            duration: duration,
+            levels: levels,
+            allowWhenOnline: target.canSendWhenOnline,
+            effects: target.availableMessageEffects,
+          ),
+        ),
+      );
+      if (result == null) {
+        await _deleteTempFile(url);
+        return;
+      }
+      if (_voiceDisposed || !mounted || !identical(target, vm)) return;
+      final sent = await target.sendVoice(
+        result.path,
+        result.duration,
+        waveform: result.waveform,
+        sendConfiguration: result.sendConfiguration,
+      );
+      if (!mounted || _voiceDisposed) return;
+      if (sent) {
+        _finishPanelSend();
+      } else {
+        showToast(
+          context,
+          AppStrings.t(AppStringKeys.topicPostContentActionFailed),
+        );
+      }
+    }
+  }
+
+  Future<void> _sendDesktopVoiceDraft() async {
+    final draft = _desktopVoiceDraft;
+    if (draft == null || _sendingVoice || !_canSendVoiceNotes) return;
+    final target = vm;
+    setState(() => _sendingVoice = true);
+    var sent = false;
+    try {
+      sent = await target.sendVoice(
+        draft.path,
+        draft.duration,
+        waveform: draft.waveform,
+        sendConfiguration: draft.sendConfiguration,
+      );
+    } catch (_) {}
+    _sendingVoice = false;
+    if (sent) {
+      // TDLib still needs the file for its upload after accepting the send.
+      _desktopVoiceDraft = null;
+    } else if (_voiceDisposed || !mounted || !identical(target, vm)) {
+      await _deleteTempFile(draft.path);
+      _desktopVoiceDraft = null;
+    }
+    if (_voiceDisposed || !mounted || !identical(target, vm)) return;
+    setState(() {});
     if (sent) {
       _finishPanelSend();
     } else {
-      unawaited(_deleteTempFile(url));
       showToast(
         context,
-        AppStrings.t(AppStringKeys.topicPostContentActionFailed),
+        AppStrings.t(AppStringKeys.composerRecordingSendFailed),
       );
     }
   }
 
-  Future<void> _toggleRecPause() async {
-    if (Platform.isMacOS) {
-      final recorder = _desktopRecorder;
-      if (recorder == null || !_recording) return;
-      try {
-        if (_recordingPaused) {
-          await recorder.resume();
-        } else {
-          await recorder.pause();
-        }
-        if (mounted) setState(() => _recordingPaused = !_recordingPaused);
-      } catch (_) {}
-      return;
+  void _discardDesktopVoiceDraft() {
+    if (_sendingVoice) return;
+    final draft = _desktopVoiceDraft;
+    _desktopVoiceDraft = null;
+    if (draft == null) return;
+    unawaited(_deleteTempFile(draft.path));
+    if (mounted && !_voiceDisposed) {
+      _elapsed = 0;
+      _recLevels.clear();
+      _recTick.value = (elapsed: 0.0, levels: const <double>[]);
+      setState(() {});
     }
-    final recorder = _recorder;
-    if (recorder == null || !_recording) return;
+  }
+
+  void _clearVoicePresses() {
+    _desktopSpaceHeld = false;
+    _desktopPointerHeld = false;
+    _mobilePointerHeld = false;
+    _voicePointerId = null;
+  }
+
+  void _cancelVoiceRecording() {
+    _clearVoicePresses();
+    _recordCancelled = true;
+    if (!_voiceDisposed &&
+        (_recording || _voiceStart != null || _voiceStop != null)) {
+      unawaited(_stopRec());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // A held gesture can lose its release when the app loses focus. A locked
+    // mobile recording is intentional and must not be discarded by a system
+    // permission sheet, notification, or brief app switch.
+    if (_recordingLocked && state != AppLifecycleState.detached) return;
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached ||
+        (state == AppLifecycleState.inactive && _recording)) {
+      _cancelVoiceRecording();
+    }
+  }
+
+  Future<void> _disposeVoiceRecorders() async {
     try {
-      if (_recordingPaused) {
-        await recorder.resumeRecorder();
-      } else {
-        await recorder.pauseRecorder();
-      }
-      if (mounted) setState(() => _recordingPaused = !_recordingPaused);
+      await _voiceStart;
+      await _voiceStop;
     } catch (_) {}
+    try {
+      await _recorder?.closeRecorder();
+    } catch (_) {}
+    try {
+      await _desktopRecorder?.dispose();
+    } catch (_) {}
+    final path = _recPath;
+    if (path != null) await _deleteTempFile(path);
+    _discardDesktopVoiceDraft();
+  }
+
+  Future<void> _toggleRecPause() async {
+    if (!_recording || _stoppingRecording || _changingRecordingPause) return;
+    _changingRecordingPause = true;
+    final paused = _recordingPaused;
+    try {
+      if (_voiceUsesDesktopRecorder) {
+        if (paused) {
+          await _desktopRecorder?.resume();
+        } else {
+          await _desktopRecorder?.pause();
+        }
+      } else if (paused) {
+        await _recorder?.resumeRecorder();
+      } else {
+        await _recorder?.pauseRecorder();
+      }
+      if (mounted && !_voiceDisposed && _recording && !_stoppingRecording) {
+        setState(() => _recordingPaused = !paused);
+      }
+    } catch (_) {
+      _showRecordingError();
+    } finally {
+      _changingRecordingPause = false;
+    }
   }
 
   void _cancelLockedRecording() {
-    if (!_recording) return;
-    _recordCancelled = true;
-    unawaited(_stopRec());
+    _cancelVoiceRecording();
   }
 
   KeyEventResult _handleDesktopVoiceKeyEvent(FocusNode node, KeyEvent event) {
-    if (!Platform.isMacOS || _panel != _Panel.voice) {
+    if (!_voiceUsesDesktopRecorder || _panel != _Panel.voice) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyRepeatEvent) {
+      return event.logicalKey == LogicalKeyboardKey.space && _desktopSpaceHeld
+          ? KeyEventResult.handled
+          : KeyEventResult.ignored;
+    }
+    if (event is! KeyDownEvent && event is! KeyUpEvent) {
       return KeyEventResult.ignored;
     }
     final isKeyDown = event is KeyDownEvent;
@@ -1863,27 +2410,26 @@ class _ChatInputBarState extends State<ChatInputBar> {
       isEscape: event.logicalKey == LogicalKeyboardKey.escape,
       isKeyDown: isKeyDown,
       isRecording: _recording,
+      spaceHeld: _desktopSpaceHeld,
+      hasModifiers: keyboardModifiersPressed(),
     );
     switch (action) {
       case DesktopVoiceMessageAction.start:
+        if (_voiceStop != null || _desktopVoiceDraft != null || _sendingVoice) {
+          return KeyEventResult.ignored;
+        }
         _desktopSpaceHeld = true;
-        _desktopStopAfterStart = false;
-        unawaited(_beginDesktopVoiceRecording());
+        unawaited(_beginVoiceRecording());
         return KeyEventResult.handled;
       case DesktopVoiceMessageAction.stop:
         _desktopSpaceHeld = false;
-        if (_recording) {
-          unawaited(_stopRec());
-        } else {
-          _desktopStopAfterStart = true;
-        }
+        if (!_desktopPointerHeld) unawaited(_stopRec());
         return KeyEventResult.handled;
       case DesktopVoiceMessageAction.cancel:
-        _desktopSpaceHeld = false;
-        _desktopPointerHeld = false;
-        if (_recording) {
-          _recordCancelled = true;
-          unawaited(_stopRec());
+        if (_recording || _voiceStart != null) {
+          _cancelVoiceRecording();
+        } else if (_desktopVoiceDraft != null) {
+          _discardDesktopVoiceDraft();
         } else {
           _setPanel(_Panel.none);
           _desktopVoiceFocus.unfocus();
@@ -1895,28 +2441,27 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   void _desktopVoicePointerDown(PointerDownEvent event) {
-    if (_recording || _desktopPointerHeld) return;
+    if (_recording ||
+        _desktopPointerHeld ||
+        _voiceStop != null ||
+        _desktopVoiceDraft != null ||
+        _sendingVoice) {
+      return;
+    }
+    _voicePointerId = event.pointer;
     _desktopPointerHeld = true;
-    _desktopStopAfterStart = false;
-    unawaited(_beginDesktopVoiceRecording());
+    unawaited(_beginVoiceRecording());
   }
 
   void _desktopVoicePointerUp(PointerEvent event) {
+    if (_voicePointerId != event.pointer) return;
+    _voicePointerId = null;
     _desktopPointerHeld = false;
-    if (_recording) {
-      unawaited(_stopRec());
-    } else {
-      _desktopStopAfterStart = true;
-    }
+    if (!_desktopSpaceHeld) unawaited(_stopRec());
   }
 
   void _desktopVoicePointerCancel(PointerCancelEvent event) {
-    _desktopPointerHeld = false;
-    _desktopStopAfterStart = false;
-    if (_recording) {
-      _recordCancelled = true;
-      unawaited(_stopRec());
-    }
+    if (_voicePointerId == event.pointer) _cancelVoiceRecording();
   }
 
   Future<void> _deleteTempFile(String path) async {
@@ -1945,11 +2490,6 @@ class _ChatInputBarState extends State<ChatInputBar> {
     } catch (_) {
       return null;
     }
-  }
-
-  static String _recTime(double seconds) {
-    final s = seconds.floor();
-    return '${s ~/ 60}:${(s % 60).toString().padLeft(2, '0')}';
   }
 
   void _toggle(_Panel panel) {
@@ -2017,7 +2557,21 @@ class _ChatInputBarState extends State<ChatInputBar> {
     if (lengthTier == TelegramMessageLengthTier.rich) {
       final sendAsRichText = await _confirmLongMessageAsRichText();
       if (!mounted || !sendAsRichText) return;
-      if (await _richTextSendMode() == null || !mounted) return;
+      if (await _richTextSendMode() == null) {
+        if (!mounted) return;
+        // This length cannot travel as a plain message, so a declined or
+        // failed relay setup keeps the draft and says why instead of dropping
+        // the text silently.
+        final configured = await _configureRichMessageRelay();
+        if (!mounted) return;
+        if (!configured) {
+          showToast(
+            context,
+            AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+          );
+          return;
+        }
+      }
       if (vm.requiresPaidMessage) {
         final ok = await _confirmPaidMessageSend();
         if (!mounted || !ok) return;
@@ -2589,12 +3143,35 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Future<void> _showTextSendOptions() async {
-    final configuration = await showMessageSendOptionsSheet(
-      context,
-      allowWhenOnline: widget.vm.canSendWhenOnline,
-      effects: widget.vm.availableMessageEffects,
-      onOpenScheduledMessages: _openScheduledMessages,
-    );
+    MessageSendConfiguration? configuration;
+    if (_usesNativeDesktopComposer(context)) {
+      _hideDesktopPopovers();
+      final target = _desktopSendOptionsTargetKey.currentContext
+          ?.findRenderObject();
+      final anchorTop = target is RenderBox && target.hasSize
+          ? target.localToGlobal(Offset.zero).dy
+          : MediaQuery.sizeOf(context).height;
+      final menu = showMessageSendOptionsContextMenu(
+        context,
+        anchor: _desktopSendOptionsLink,
+        maxHeight: math.max(80, anchorTop - 12),
+        allowWhenOnline: widget.vm.canSendWhenOnline,
+        effects: widget.vm.availableMessageEffects,
+        onOpenScheduledMessages: _openScheduledMessages,
+      );
+      _desktopSendOptionsMenu = menu;
+      configuration = await menu.result;
+      if (identical(_desktopSendOptionsMenu, menu)) {
+        _desktopSendOptionsMenu = null;
+      }
+    } else {
+      configuration = await showMessageSendOptionsSheet(
+        context,
+        allowWhenOnline: widget.vm.canSendWhenOnline,
+        effects: widget.vm.availableMessageEffects,
+        onOpenScheduledMessages: _openScheduledMessages,
+      );
+    }
     if (!mounted || configuration == null) return;
     if (_pendingClipboardAttachments.isNotEmpty) {
       await _sendPendingClipboardAttachments(sendConfiguration: configuration);
@@ -2628,7 +3205,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Future<void> _openRichTextComposer() async {
-    if (await _richTextSendMode() == null) return;
+    // Every account can compose rich text; whether it can be delivered as a
+    // rich message is resolved at send time, so the editor itself is never
+    // gated behind the relay bot.
     if (!mounted) return;
     if (_usesNativeDesktopComposer(context)) {
       try {
@@ -2826,6 +3405,14 @@ class _ChatInputBarState extends State<ChatInputBar> {
     final c = context.colors;
     final aiSettings = context.watch<AiSettingsController?>();
     final desktopComposer = _usesNativeDesktopComposer(context);
+    if (desktopComposer) {
+      // Hidden tabs and covered routes must release their native screenshot key.
+      TickerMode.valuesOf(context);
+      ModalRoute.isCurrentOf(context);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _desktopScreenshotHotkeyRegistration?.refresh();
+      });
+    }
     final editingMessage = vm.editingMessage;
     final replyKeyboard = _activeReplyKeyboard();
     final replyKeyboardPanelVisible =
@@ -2834,10 +3421,13 @@ class _ChatInputBarState extends State<ChatInputBar> {
         _replyKeyboardVisible &&
         !_hasText &&
         _pendingClipboardAttachments.isEmpty;
+    final bottomSafeArea = MediaQuery.paddingOf(context).bottom;
+    final mediaPanelVisible =
+        _panel == _Panel.emoji || _panel == _Panel.sticker;
     final panelSurfaceVisible =
         editingMessage == null &&
+        !mediaPanelVisible &&
         (_panel != _Panel.none || replyKeyboardPanelVisible);
-    final bottomSafeArea = MediaQuery.paddingOf(context).bottom;
     final bar = ColoredBox(
       key: const ValueKey('chat-input-safe-area-background'),
       color: c.inputBarBackground,
@@ -2893,12 +3483,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
                   _functionPanel(),
                 if (editingMessage == null &&
                     !desktopComposer &&
-                    _panel == _Panel.emoji)
-                  _emojiPanel(),
-                if (editingMessage == null &&
-                    !desktopComposer &&
-                    _panel == _Panel.sticker)
-                  _stickerPanel(),
+                    (_panel == _Panel.emoji || _panel == _Panel.sticker))
+                  _mediaPanel(),
                 if (editingMessage == null && _panel == _Panel.voice)
                   _voicePanel(),
               ],
@@ -2912,10 +3498,12 @@ class _ChatInputBarState extends State<ChatInputBar> {
               child: _desktopResizeHandle(),
             ),
           // The base input surface is painted exactly once across the complete
-          // composer. When a media/reply panel is open, extend that panel's
-          // surface through the system inset with the same single overlay used
-          // by the visible panel. This keeps translucent cloud-theme colors
-          // identical above and below the home indicator.
+          // composer. The media panel uses that same surface, so it needs no
+          // inset layer; the panels that paint their own surface extend it
+          // through the system inset with one overlay. This keeps translucent
+          // cloud-theme colors identical above and below the home indicator.
+          // The overlay extends a docked panel through the home indicator, so
+          // it paints that panel's surface, not a second, recessed colour.
           if (panelSurfaceVisible && bottomSafeArea > 0)
             Positioned(
               left: 0,
@@ -2925,7 +3513,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
               child: IgnorePointer(
                 child: ColoredBox(
                   key: const ValueKey('chat-input-panel-safe-area-background'),
-                  color: c.panelBackground,
+                  color: _composerDockedSurfaceColor,
                 ),
               ),
             ),
@@ -2934,15 +3522,31 @@ class _ChatInputBarState extends State<ChatInputBar> {
     );
     // Without its own layer the composer shares one with the chat wallpaper, so
     // a keystroke or a typing update re-records the full-screen gradient too.
-    return RepaintBoundary(child: bar);
+    // On a phone the whole bar joins the field's tap region group: taps on the
+    // send button, attachments entry or panel strips count as inside, so the
+    // app-wide outside-tap keyboard dismissal leaves the keyboard open.
+    // Keep the framework's default group so selection handles and the
+    // selection toolbar remain inside the same region too.
+    return RepaintBoundary(
+      child: desktopComposer ? bar : TextFieldTapRegion(child: bar),
+    );
   }
 
   Widget _inlineBotResultMenu() {
     final c = context.colors;
-    final results = _inlineBotResults?.results ?? const <BotInlineResult>[];
-    Widget child;
-    if (results.isEmpty) {
-      child = SizedBox(
+    final page = _inlineBotResults;
+    final results = page?.results ?? const <BotInlineResult>[];
+    final headerButton = page?.button;
+    final headerText = _inlineBot?.inlinePlaceholder.trim() ?? '';
+    Widget body;
+    if (_inlineBotLoading && page == null) {
+      body = const SizedBox(
+        key: ValueKey('inlineBotLoadingIndicator'),
+        height: 58,
+        child: Center(child: AppActivityIndicator(size: 20)),
+      );
+    } else if (results.isEmpty) {
+      body = SizedBox(
         height: 54,
         child: Center(
           child: Text(
@@ -2951,84 +3555,232 @@ class _ChatInputBarState extends State<ChatInputBar> {
           ),
         ),
       );
+    } else if (page != null && page.rendersAsGallery) {
+      body = GridView.builder(
+        key: const ValueKey('inlineBotGalleryGrid'),
+        shrinkWrap: true,
+        padding: const EdgeInsets.all(6),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 4,
+          mainAxisSpacing: 6,
+          crossAxisSpacing: 6,
+        ),
+        itemCount: results.length,
+        itemBuilder: (_, index) => _inlineGalleryTile(results[index]),
+      );
     } else {
-      child = ListView.separated(
+      body = ListView.separated(
         shrinkWrap: true,
         padding: EdgeInsets.zero,
         itemCount: results.length,
-        separatorBuilder: (_, _) => const InsetDivider(leadingInset: 54),
-        itemBuilder: (_, index) {
-          final result = results[index];
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => unawaited(_sendInlineBotResult(result)),
-            child: SizedBox(
-              height: 58,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: Row(
-                  children: [
-                    AppIcon(
-                      _inlineResultIcon(result.type),
-                      size: 23,
-                      color: AppTheme.brand,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            result.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: c.textPrimary,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w500,
-                            ),
-                          ),
-                          if (result.description.isNotEmpty)
-                            Text(
-                              result.description,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: c.textSecondary,
-                                fontSize: 12,
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        },
+        separatorBuilder: (_, _) => const InsetDivider(leadingInset: 60),
+        itemBuilder: (_, index) => _inlineListRow(results[index]),
       );
     }
 
-    return Container(
-      key: const ValueKey('inlineBotResultMenu'),
-      constraints: const BoxConstraints(maxHeight: 260),
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      decoration: BoxDecoration(
-        color: c.card,
-        borderRadius: BorderRadius.circular(AppRadius.control),
-        border: Border.all(color: c.divider, width: 0.5),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.12),
-            blurRadius: 14,
-            offset: const Offset(0, -4),
-          ),
-        ],
+    return NotificationListener<ScrollNotification>(
+      onNotification: (notification) {
+        if (notification.metrics.extentAfter < 120) {
+          unawaited(_loadMoreInlineBotResults());
+        }
+        return false;
+      },
+      child: Container(
+        key: const ValueKey('inlineBotResultMenu'),
+        constraints: const BoxConstraints(maxHeight: 280),
+        margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        decoration: BoxDecoration(
+          color: c.card,
+          borderRadius: BorderRadius.circular(AppRadius.control),
+          border: Border.all(color: c.divider, width: 0.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.12),
+              blurRadius: 14,
+              offset: const Offset(0, -4),
+            ),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (headerButton != null)
+              GestureDetector(
+                key: const ValueKey('inlineBotResultsHeaderButton'),
+                behavior: HitTestBehavior.opaque,
+                onTap: () =>
+                    unawaited(_activateInlineResultsButton(headerButton)),
+                child: Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(color: c.divider, width: 0.5),
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          headerButton.text,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: AppTheme.brand,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      AppIcon(
+                        headerButton.isWebApp
+                            ? HeroAppIcons.globe
+                            : HeroAppIcons.arrowTopRight,
+                        size: 13,
+                        color: AppTheme.brand,
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            else if (headerText.isNotEmpty && results.isNotEmpty)
+              Container(
+                key: const ValueKey('inlineBotPlaceholderHeader'),
+                padding: const EdgeInsets.fromLTRB(12, 7, 12, 6),
+                decoration: BoxDecoration(
+                  border: Border(
+                    bottom: BorderSide(color: c.divider, width: 0.5),
+                  ),
+                ),
+                child: Text(
+                  '@${_inlineBot!.username} · $headerText',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: c.textSecondary, fontSize: 12),
+                ),
+              ),
+            Flexible(child: body),
+            if (_inlineBotLoadingMore)
+              const SizedBox(
+                key: ValueKey('inlineBotLoadingMoreIndicator'),
+                height: 36,
+                child: Center(child: AppActivityIndicator(size: 16)),
+              ),
+          ],
+        ),
       ),
-      clipBehavior: Clip.antiAlias,
-      child: child,
+    );
+  }
+
+  Widget _inlineListRow(BotInlineResult result) {
+    final c = context.colors;
+    return GestureDetector(
+      key: ValueKey('inlineBotResult-${result.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => unawaited(_sendInlineBotResult(result)),
+      onLongPress: () => unawaited(_sendInlineBotResultWithOptions(result)),
+      child: SizedBox(
+        height: 58,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Row(
+            children: [
+              _inlineResultLeading(result),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      result.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: c.textPrimary,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (result.description.isNotEmpty)
+                      Text(
+                        result.description,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: c.textSecondary, fontSize: 12),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _inlineGalleryTile(BotInlineResult result) {
+    final c = context.colors;
+    final thumb = result.thumbnail;
+    return GestureDetector(
+      key: ValueKey('inlineBotResult-${result.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => unawaited(_sendInlineBotResult(result)),
+      onLongPress: () => unawaited(_sendInlineBotResultWithOptions(result)),
+      child: Container(
+        decoration: BoxDecoration(
+          color: c.searchFill,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: thumb != null
+            ? TDImage(
+                photo: thumb,
+                fit: result.type == 'inlineQueryResultSticker'
+                    ? BoxFit.contain
+                    : BoxFit.cover,
+              )
+            : Center(
+                child: result.emoji.isNotEmpty
+                    ? Text(result.emoji, style: const TextStyle(fontSize: 28))
+                    : AppIcon(
+                        _inlineResultIcon(result.type),
+                        size: 26,
+                        color: AppTheme.brand,
+                      ),
+              ),
+      ),
+    );
+  }
+
+  Widget _inlineResultLeading(BotInlineResult result) {
+    final c = context.colors;
+    final thumb = result.thumbnail;
+    if (thumb != null) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+        child: SizedBox(width: 40, height: 40, child: TDImage(photo: thumb)),
+      );
+    }
+    return Container(
+      width: 40,
+      height: 40,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: c.searchFill,
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: result.emoji.isNotEmpty
+          ? Text(result.emoji, style: const TextStyle(fontSize: 20))
+          : AppIcon(
+              _inlineResultIcon(result.type),
+              size: 21,
+              color: AppTheme.brand,
+            ),
     );
   }
 
@@ -3047,18 +3799,27 @@ class _ChatInputBarState extends State<ChatInputBar> {
     _ => HeroAppIcons.font,
   };
 
-  Future<void> _sendInlineBotResult(BotInlineResult result) async {
-    final page = _inlineBotResults;
-    if (page == null || page.queryId == 0 || result.id.isEmpty) return;
+  Future<void> _sendInlineBotResult(
+    BotInlineResult result, {
+    int? queryId,
+    MessageSendConfiguration? configuration,
+  }) async {
+    final resolvedQueryId =
+        queryId ??
+        (result.queryId != 0
+            ? result.queryId
+            : (_inlineBotResults?.queryId ?? 0));
+    if (resolvedQueryId == 0 || result.id.isEmpty) return;
     try {
-      final reply = vm.replyTo;
       await _botPlatform.sendInlineResult(
         chatId: vm.chatId,
-        queryId: page.queryId,
+        queryId: resolvedQueryId,
         resultId: result.id,
-        replyTo: reply == null
-            ? null
-            : {'@type': 'inputMessageReplyToMessage', 'message_id': reply.id},
+        topicId: vm.forumTopicSendRef,
+        replyTo: vm.replyToInput,
+        options: configuration?.messageSendOptions(
+          paidStarCount: vm.paidMessageStarCount,
+        ),
       );
       if (!mounted) return;
       vm.setReply(null);
@@ -3068,6 +3829,25 @@ class _ChatInputBarState extends State<ChatInputBar> {
     } catch (error) {
       _showBotPlatformFailure(error);
     }
+  }
+
+  Future<void> _sendInlineBotResultWithOptions(BotInlineResult result) async {
+    final capturedQueryId = result.queryId != 0
+        ? result.queryId
+        : (_inlineBotResults?.queryId ?? 0);
+    if (capturedQueryId == 0 || result.id.isEmpty) return;
+    final configuration = await showMessageSendOptionsSheet(
+      context,
+      allowWhenOnline: vm.canSendWhenOnline,
+      effects: vm.availableMessageEffects,
+      onOpenScheduledMessages: _openScheduledMessages,
+    );
+    if (!mounted || configuration == null) return;
+    await _sendInlineBotResult(
+      result,
+      queryId: capturedQueryId,
+      configuration: configuration,
+    );
   }
 
   Widget _botCommandMenu() {
@@ -3204,6 +3984,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
                           title: candidate.name,
                           photo: candidate.photo,
                           size: 34,
+                          isDeleted: candidate.isDeleted,
                         ),
                         const SizedBox(width: 10),
                         Expanded(
@@ -3459,7 +4240,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
         : (m.senderName?.isNotEmpty ?? false)
         ? m.senderName!
         : vm.peerTitle;
-    return '$name:${_replyPreview(m)}';
+    return '$name:${vm.replyQuote?.text ?? _replyPreview(m)}';
   }
 
   String _replyPreview(ChatMessage m) {
@@ -3494,21 +4275,16 @@ class _ChatInputBarState extends State<ChatInputBar> {
   // MARK: - Input row
 
   void _hideDesktopPopovers({bool rebuild = true}) {
-    final changed =
-        _desktopSenderPopoverVisible ||
-        _desktopEmojiPopoverVisible ||
-        _desktopStickerPopoverVisible;
+    _desktopSendOptionsMenu?.dismiss();
+    _desktopSendOptionsMenu = null;
+    final changed = _desktopSenderPopoverVisible || _desktopMediaPopoverVisible;
     if (_desktopSenderPopoverVisible) {
       _desktopSenderPopoverController.hide();
       _desktopSenderPopoverVisible = false;
     }
-    if (_desktopEmojiPopoverVisible) {
-      _desktopEmojiPopoverController.hide();
-      _desktopEmojiPopoverVisible = false;
-    }
-    if (_desktopStickerPopoverVisible) {
-      _desktopStickerPopoverController.hide();
-      _desktopStickerPopoverVisible = false;
+    if (_desktopMediaPopoverVisible) {
+      _desktopMediaPopoverController.hide();
+      _desktopMediaPopoverVisible = false;
     }
     if (changed && rebuild && mounted) setState(() {});
   }
@@ -3523,8 +4299,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
     setState(() => _desktopSenderPopoverVisible = true);
   }
 
-  void _toggleDesktopEmojiPopover() {
-    if (_desktopEmojiPopoverVisible) {
+  void _toggleDesktopMediaPopover() {
+    if (_desktopMediaPopoverVisible) {
       _hideDesktopPopovers();
       return;
     }
@@ -3533,28 +4309,17 @@ class _ChatInputBarState extends State<ChatInputBar> {
       _panel = _Panel.none;
       widget.onPanelGeometryChanged?.call();
     }
-    EmojiStore.shared.loadIfNeeded();
-    _desktopEmojiPopoverController.show();
-    setState(() => _desktopEmojiPopoverVisible = true);
-    if (_isPanelSearchSelected && _panelSearch.text.trim().isNotEmpty) {
-      _queuePanelSearch();
+    switch (_mediaKind) {
+      case _MediaKind.emoji:
+        EmojiStore.shared.loadIfNeeded();
+        EmojiRecentsStore.shared.loadIfNeeded();
+      case _MediaKind.sticker:
+        StickerStore.shared.loadIfNeeded();
+      case _MediaKind.gif:
+        GifStore.shared.loadIfNeeded();
     }
-  }
-
-  void _toggleDesktopStickerPopover() {
-    if (_desktopStickerPopoverVisible) {
-      _hideDesktopPopovers();
-      return;
-    }
-    _hideDesktopPopovers(rebuild: false);
-    if (_panel != _Panel.none) {
-      _panel = _Panel.none;
-      widget.onPanelGeometryChanged?.call();
-    }
-    StickerStore.shared.loadIfNeeded();
-    GifStore.shared.loadIfNeeded();
-    _desktopStickerPopoverController.show();
-    setState(() => _desktopStickerPopoverVisible = true);
+    _desktopMediaPopoverController.show();
+    setState(() => _desktopMediaPopoverVisible = true);
     if (_isPanelSearchSelected && _panelSearch.text.trim().isNotEmpty) {
       _queuePanelSearch();
     }
@@ -3601,6 +4366,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
                   width: width,
                   clipBehavior: Clip.antiAlias,
                   decoration: BoxDecoration(
+                    // A floating popover anchored above the composer, not a
+                    // docked panel: it carries its own 0.7pt outline and 24pt
+                    // drop shadow, so it keeps the recessed surface to read as
+                    // a separate card over the composer bar it hangs from.
                     color: c.panelBackground,
                     borderRadius: BorderRadius.circular(cornerRadius),
                     border: Border.all(color: c.divider, width: 0.7),
@@ -3655,31 +4424,17 @@ class _ChatInputBarState extends State<ChatInputBar> {
     );
   }
 
-  Widget _desktopEmojiPopover(BuildContext overlayContext) {
+  Widget _desktopMediaPopover(BuildContext overlayContext) {
     final size = MediaQuery.sizeOf(overlayContext);
     final width = math.max(300.0, math.min(420.0, size.width - 24));
     final height = math.max(220.0, math.min(360.0, size.height - 88));
     return _desktopPopoverOverlay(
       overlayContext: overlayContext,
-      link: _desktopEmojiPopoverLink,
-      surfaceKey: const ValueKey('desktopEmojiPopover'),
+      link: _desktopMediaPopoverLink,
+      surfaceKey: const ValueKey('desktopMediaPopover'),
       width: width,
       onDismiss: _hideDesktopPopovers,
-      child: _emojiPanel(height: height, popover: true),
-    );
-  }
-
-  Widget _desktopStickerPopover(BuildContext overlayContext) {
-    final size = MediaQuery.sizeOf(overlayContext);
-    final width = math.max(300.0, math.min(420.0, size.width - 24));
-    final height = math.max(220.0, math.min(360.0, size.height - 88));
-    return _desktopPopoverOverlay(
-      overlayContext: overlayContext,
-      link: _desktopStickerPopoverLink,
-      surfaceKey: const ValueKey('desktopStickerPopover'),
-      width: width,
-      onDismiss: _hideDesktopPopovers,
-      child: _stickerPanel(height: height, popover: true),
+      child: _mediaPanel(height: height),
     );
   }
 
@@ -4826,6 +5581,17 @@ class _ChatInputBarState extends State<ChatInputBar> {
                                     controller: _controller,
                                     focusNode: _focus,
                                     onTap: _handleEmptyInputTap,
+                                    // Submit from editing completion without
+                                    // onSubmitted: Flutter restarts the input
+                                    // connection after a completion action
+                                    // whenever onSubmitted is present, even
+                                    // when onEditingComplete retains focus.
+                                    onEditingComplete: () {
+                                      _controller.clearComposing();
+                                      if (!desktop && widget.enterToSend) {
+                                        unawaited(_sendCurrentText());
+                                      }
+                                    },
                                     minLines: desktop ? null : 1,
                                     maxLines: desktop ? null : 4,
                                     expands: desktop,
@@ -4835,9 +5601,6 @@ class _ChatInputBarState extends State<ChatInputBar> {
                                         : widget.enterToSend
                                         ? TextInputAction.send
                                         : TextInputAction.newline,
-                                    onSubmitted: !desktop && widget.enterToSend
-                                        ? (_) => unawaited(_sendCurrentText())
-                                        : null,
                                     inputFormatters:
                                         widget.enterToSend &&
                                             Theme.of(context).platform ==
@@ -4884,7 +5647,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
                                             label:
                                                 originalPaste?.label ??
                                                 AppStringKeys
-                                                    .accountBackupLoadPyrogramPaste
+                                                    .accountBackupLoadSessionPaste
                                                     .l10n(context),
                                             onPressed: () => unawaited(
                                               _handlePaste(originalPaste),
@@ -5019,60 +5782,71 @@ class _ChatInputBarState extends State<ChatInputBar> {
                       ),
                       const SizedBox(height: 6),
                     ],
-                    GestureDetector(
+                    AppInteractiveSurface(
                       key: const ValueKey('composerSendButton'),
-                      onTap: _aiReplyWorkingTargetId != null
-                          ? null
-                          : () => unawaited(_sendCurrentText()),
+                      semanticLabel:
+                          (editing
+                                  ? AppStringKeys.messageActionEdit
+                                  : AppStringKeys.composerSend)
+                              .l10n(context),
+                      enabled: _aiReplyWorkingTargetId == null,
+                      onTap: () => unawaited(_sendCurrentText()),
                       onLongPress: _aiReplyWorkingTargetId != null
                           ? null
                           : editing
                           ? null
                           : () => unawaited(_showTextSendOptions()),
-                      child: Container(
-                        width: vm.requiresPaidMessage ? 58 : 36,
-                        height: 36,
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: _aiReplyWorkingTargetId != null
-                              ? AppTheme.brand.withValues(alpha: 0.42)
-                              : editing
-                              ? AppTheme.cloverGreen
-                              : AppTheme.brand,
-                          shape: BoxShape.circle,
-                        ),
-                        child: editing
-                            ? const AppIcon(
-                                HeroAppIcons.check,
-                                size: 18,
-                                color: Colors.white,
-                              )
-                            : vm.requiresPaidMessage
-                            ? Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const AppIcon(
-                                    HeroAppIcons.solidStar,
-                                    size: 14,
+                      borderRadius: BorderRadius.circular(24),
+                      child: SizedBox(
+                        width: vm.requiresPaidMessage ? 58 : 44,
+                        height: 44,
+                        child: Center(
+                          child: Container(
+                            width: vm.requiresPaidMessage ? 58 : 36,
+                            height: 36,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: _aiReplyWorkingTargetId != null
+                                  ? AppTheme.brand.withValues(alpha: 0.42)
+                                  : editing
+                                  ? AppTheme.cloverGreen
+                                  : AppTheme.brand,
+                              shape: BoxShape.circle,
+                            ),
+                            child: editing
+                                ? const AppIcon(
+                                    HeroAppIcons.check,
+                                    size: 18,
+                                    color: Colors.white,
+                                  )
+                                : vm.requiresPaidMessage
+                                ? Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const AppIcon(
+                                        HeroAppIcons.solidStar,
+                                        size: 14,
+                                        color: Colors.white,
+                                      ),
+                                      const SizedBox(width: 3),
+                                      Text(
+                                        'x${vm.paidMessageStarCount}',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ],
+                                  )
+                                : const AppIcon(
+                                    HeroAppIcons.solidPaperPlane,
+                                    size: 17,
                                     color: Colors.white,
                                   ),
-                                  const SizedBox(width: 3),
-                                  Text(
-                                    'x${vm.paidMessageStarCount}',
-                                    style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                                ],
-                              )
-                            : const AppIcon(
-                                HeroAppIcons.solidPaperPlane,
-                                size: 17,
-                                color: Colors.white,
-                              ),
+                          ),
+                        ),
                       ),
                     ),
                   ],
@@ -5217,34 +5991,42 @@ class _ChatInputBarState extends State<ChatInputBar> {
           ),
         ),
         if (!editing)
-          AppInteractiveSurface(
-            key: const ValueKey('desktopComposerSendOptionsButton'),
-            semanticLabel: AppStringKeys.messageSendOptionsTitle.l10n(context),
-            enabled: !disabled,
-            onTap: disabled ? null : () => unawaited(_showTextSendOptions()),
-            borderRadius: const BorderRadius.only(
-              topRight: splitRadius,
-              bottomRight: splitRadius,
-            ),
-            child: Container(
-              key: const ValueKey('desktopComposerSendOptionsControl'),
-              width: 34,
-              height: 34,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: color,
-                border: Border(
-                  left: BorderSide(color: Colors.white.withValues(alpha: 0.28)),
-                ),
-                borderRadius: const BorderRadius.only(
-                  topRight: splitRadius,
-                  bottomRight: splitRadius,
-                ),
+          CompositedTransformTarget(
+            key: _desktopSendOptionsTargetKey,
+            link: _desktopSendOptionsLink,
+            child: AppInteractiveSurface(
+              key: const ValueKey('desktopComposerSendOptionsButton'),
+              semanticLabel: AppStringKeys.messageSendOptionsTitle.l10n(
+                context,
               ),
-              child: const AppIcon(
-                HeroAppIcons.chevronDown,
-                size: 12,
-                color: Colors.white,
+              enabled: !disabled,
+              onTap: disabled ? null : () => unawaited(_showTextSendOptions()),
+              borderRadius: const BorderRadius.only(
+                topRight: splitRadius,
+                bottomRight: splitRadius,
+              ),
+              child: Container(
+                key: const ValueKey('desktopComposerSendOptionsControl'),
+                width: 34,
+                height: 34,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: color,
+                  border: Border(
+                    left: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.28),
+                    ),
+                  ),
+                  borderRadius: const BorderRadius.only(
+                    topRight: splitRadius,
+                    bottomRight: splitRadius,
+                  ),
+                ),
+                child: const AppIcon(
+                  HeroAppIcons.chevronDown,
+                  size: 12,
+                  color: Colors.white,
+                ),
               ),
             ),
           ),
@@ -5568,11 +6350,12 @@ class _ChatInputBarState extends State<ChatInputBar> {
   Widget _replyKeyboardPanel(_ReplyKeyboard keyboard) {
     final c = context.colors;
     return Container(
+      key: const ValueKey('composerReplyKeyboardPanel'),
       constraints: const BoxConstraints(maxHeight: 330),
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
-        color: c.panelBackground,
+        color: _composerDockedSurfaceColor,
         border: Border(top: BorderSide(color: c.divider, width: 0.5)),
       ),
       child: SingleChildScrollView(
@@ -5647,34 +6430,18 @@ class _ChatInputBarState extends State<ChatInputBar> {
                     ),
                   ],
                   CompositedTransformTarget(
-                    link: _desktopEmojiPopoverLink,
+                    link: _desktopMediaPopoverLink,
                     child: OverlayPortal(
-                      controller: _desktopEmojiPopoverController,
-                      overlayChildBuilder: _desktopEmojiPopover,
+                      controller: _desktopMediaPopoverController,
+                      overlayChildBuilder: _desktopMediaPopover,
                       child: _desktopIcon(
-                        key: const ValueKey('desktopComposerEmojiAction'),
+                        key: const ValueKey('desktopComposerMediaAction'),
                         icon: HeroAppIcons.solidFaceSmile,
                         semanticLabel: AppStrings.t(
-                          AppStringKeys.composerEmoji,
+                          AppStringKeys.composerMediaPicker,
                         ),
-                        active: _desktopEmojiPopoverVisible,
-                        onTap: _toggleDesktopEmojiPopover,
-                      ),
-                    ),
-                  ),
-                  CompositedTransformTarget(
-                    link: _desktopStickerPopoverLink,
-                    child: OverlayPortal(
-                      controller: _desktopStickerPopoverController,
-                      overlayChildBuilder: _desktopStickerPopover,
-                      child: _desktopIcon(
-                        key: const ValueKey('desktopComposerStickerAction'),
-                        icon: HeroAppIcons.grip,
-                        semanticLabel: AppStrings.t(
-                          AppStringKeys.composerStickers,
-                        ),
-                        active: _desktopStickerPopoverVisible,
-                        onTap: _toggleDesktopStickerPopover,
+                        active: _desktopMediaPopoverVisible,
+                        onTap: _toggleDesktopMediaPopover,
                       ),
                     ),
                   ),
@@ -5968,13 +6735,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
               _panel == _Panel.voice,
               _toggleVoice,
             ),
-          _icon(
-            HeroAppIcons.image,
-            AppStrings.t(AppStringKeys.composerImage),
-            false,
-            _pickPhotos,
-          ),
-          if (Platform.isAndroid || Platform.isIOS)
+          if (widget.phoneStripForTesting || composerShowsCameraIcon())
             _icon(
               HeroAppIcons.camera,
               AppStrings.t(AppStringKeys.composerCamera),
@@ -5982,35 +6743,16 @@ class _ChatInputBarState extends State<ChatInputBar> {
               _takePhoto,
             ),
           _icon(
-            HeroAppIcons.grip,
-            AppStrings.t(AppStringKeys.composerStickers),
-            _panel == _Panel.sticker,
-            () {
-              _toggle(_Panel.sticker);
-              if (_panel == _Panel.sticker) {
-                StickerStore.shared.loadIfNeeded();
-                GifStore.shared.loadIfNeeded();
-                if (_isPanelSearchSelected &&
-                    _panelSearch.text.trim().isNotEmpty) {
-                  _queuePanelSearch();
-                }
-              }
-            },
+            HeroAppIcons.image,
+            AppStrings.t(AppStringKeys.composerImage),
+            false,
+            _pickPhotos,
           ),
           _icon(
             HeroAppIcons.solidFaceSmile,
-            AppStrings.t(AppStringKeys.composerEmoji),
-            _panel == _Panel.emoji,
-            () {
-              _toggle(_Panel.emoji);
-              if (_panel == _Panel.emoji) {
-                EmojiStore.shared.loadIfNeeded();
-                if (_isPanelSearchSelected &&
-                    _panelSearch.text.trim().isNotEmpty) {
-                  _queuePanelSearch();
-                }
-              }
-            },
+            AppStrings.t(AppStringKeys.composerMediaPicker),
+            _panel == _Panel.emoji || _panel == _Panel.sticker,
+            _toggleMediaPanel,
           ),
           _icon(
             _panel != _Panel.none
@@ -6194,9 +6936,20 @@ class _ChatInputBarState extends State<ChatInputBar> {
   /// 相机: capture a photo and send it.
   Future<void> _takePhoto() async {
     try {
-      final shot = await ImagePicker().pickImage(source: ImageSource.camera);
-      if (shot == null) return;
-      final edited = await _editImage(shot.path);
+      final capture = await captureComposerPhoto(
+        context,
+        saveToAlbum: context.read<ThemeController>().saveCapturedPhotosToAlbum,
+      );
+      if (capture == null || !mounted) return;
+      if (capture.albumWriteFailed) {
+        showToast(
+          context,
+          capture.albumResult == MediaLibrarySaveResult.permissionDenied
+              ? AppStringKeys.chatSaveToPhotosPermissionDenied
+              : AppStringKeys.chatSaveToPhotosFailed,
+        );
+      }
+      final edited = await _editImage(capture.file.path);
       if (edited != null) {
         final attachment = await resolveAttachmentDimensions(
           OutgoingAttachment(
@@ -6466,9 +7219,28 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   Future<void> _sendRichTextResult(RichTextComposerResult result) async {
-    final mode = await _richTextSendMode();
-    if (mode == null) return;
+    var mode = await _richTextSendMode();
     if (!mounted) return;
+    if (mode == null && result.hasRichBlocks) {
+      // The document needs a capability this account does not have. Offer the
+      // relay once; declining or a failed setup falls through to a plain
+      // formatted message.
+      var configured = false;
+      try {
+        configured = await _configureRichMessageRelay();
+      } catch (error) {
+        debugPrint('Rich text relay setup failed: $error');
+      }
+      if (!mounted) return;
+      if (configured) mode = _RichTextSendMode.botRelay;
+    }
+    if (mode == null) {
+      await _sendRichTextFormattedOnly(
+        result,
+        droppedRichBlocks: result.hasRichBlocks,
+      );
+      return;
+    }
     try {
       var sentAny = false;
       if (mode == _RichTextSendMode.direct) {
@@ -6524,6 +7296,41 @@ class _ChatInputBarState extends State<ChatInputBar> {
         showToast(context, message);
         await _reopenFailedRichTextComposer(result);
       }
+    }
+  }
+
+  /// Delivers the composer's text as an ordinary formatted message when the
+  /// account has no rich send path. Block structure has no representation in
+  /// `inputMessageText`, so it is dropped with one toast; when nothing at all
+  /// can be sent (a document containing media, or a rejected send) the draft
+  /// is reopened instead of silently sending only its caption and losing media.
+  Future<void> _sendRichTextFormattedOnly(
+    RichTextComposerResult result, {
+    required bool droppedRichBlocks,
+  }) async {
+    if (result.text.trim().isEmpty || result.attachments.isNotEmpty) {
+      showToast(
+        context,
+        AppStringKeys.richTextRelayPremiumOrBotRequired.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    final sent = await widget.vm.sendFormatted(result.text, result.entities);
+    if (!mounted) return;
+    if (!sent) {
+      showToast(
+        context,
+        AppStringKeys.composerRichTextSendFailed.l10n(context),
+      );
+      await _reopenFailedRichTextComposer(result);
+      return;
+    }
+    widget.onMessageSent();
+    _controller.clear();
+    _focus.requestFocus();
+    if (droppedRichBlocks) {
+      showToast(context, AppStringKeys.richTextSentFormattedOnly.l10n(context));
     }
   }
 
@@ -6658,6 +7465,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
     if (entry?.mounted ?? false) entry!.remove();
   }
 
+  /// Resolves how this account can deliver a rich message, without asking the
+  /// user for anything. A null result means the account has no rich send path;
+  /// callers may then offer [RichMessageRelayConfig] setup once and fall back
+  /// to a plain formatted message.
   Future<_RichTextSendMode?> _richTextSendMode() async {
     try {
       if (await TdClient.shared.activeAccountUsesBotApi()) {
@@ -6669,17 +7480,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
       if (await RichMessageRelayConfig.isConfigured()) {
         return _RichTextSendMode.botRelay;
       }
-      if (mounted && await _configureRichMessageRelay()) {
-        return _RichTextSendMode.botRelay;
-      }
-    } catch (error) {
-      if (mounted) {
-        final message = switch (error) {
-          TdError(:final message) when message.trim().isNotEmpty => message,
-          _ => error.toString(),
-        };
-        showToast(context, message);
-      }
+    } catch (_) {
+      // Capability probing is advisory here: a failure leaves the caller on the
+      // plain formatted-message path rather than replacing the message with a
+      // probe error.
     }
     return null;
   }
@@ -6984,7 +7788,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
     return Container(
       key: const ValueKey('composerFunctionPanel'),
       width: double.infinity,
-      color: c.panelBackground,
+      color: _composerDockedSurfaceColor,
       padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
       child: IconGrid(
         perRow: 5,
@@ -7023,21 +7827,203 @@ class _ChatInputBarState extends State<ChatInputBar> {
     );
   }
 
-  // MARK: - Emoji panel (standard catalog → inserts into the field)
+  // MARK: - Unified media panel (emoji / stickers / GIF)
 
-  Widget _emojiPanel({double height = 326, bool popover = false}) {
-    final c = context.colors;
+  /// One picker with a segmented selector (Emoji | Stickers | GIF) above each
+  /// kind's own tab strip and content, painted on the composer's own surface
+  /// so it continues the input bar instead of reading as a separate block.
+  /// Rendered for both `_Panel.emoji` and `_Panel.sticker`.
+  Widget _mediaPanel({double height = 376}) {
     return Container(
-      key: popover ? const ValueKey('desktopEmojiPopoverContent') : null,
+      key: const ValueKey('composerMediaPanel'),
       height: height,
-      color: c.panelBackground,
+      color: _composerDockedSurfaceColor,
       child: Column(
         children: [
-          _emojiTabStrip(),
-          if (_emojiTab == _emojiSearchTab) _panelSearchField(),
-          Expanded(child: _emojiContent()),
+          _mediaKindSegmentControl(),
+          _mediaSecondaryStrip(),
+          if (_isPanelSearchSelected) _panelSearchField(),
+          Expanded(child: _mediaContent()),
         ],
       ),
+    );
+  }
+
+  Widget _mediaSecondaryStrip() => switch (_mediaKind) {
+    _MediaKind.emoji => _emojiTabStrip(),
+    _MediaKind.sticker => _stickerTabStrip(),
+    _MediaKind.gif => _gifTabStrip(),
+  };
+
+  Widget _mediaContent() {
+    return switch (_mediaKind) {
+      _MediaKind.emoji => _emojiContent(),
+      _MediaKind.sticker => _stickerContent(),
+      _MediaKind.gif =>
+        _gifSearchSelected ? _gifSearchContent() : _gifContent(),
+    };
+  }
+
+  Widget _mediaKindSegmentControl() {
+    final c = context.colors;
+    final reduceMotion = MediaQuery.maybeDisableAnimationsOf(context) ?? false;
+    Widget segment(_MediaKind kind, AppIconData icon, String label) {
+      final selected = _mediaKind == kind;
+      final content = AnimatedContainer(
+        duration: reduceMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        height: 30,
+        decoration: BoxDecoration(
+          color: selected ? c.card : Colors.transparent,
+          borderRadius: BorderRadius.circular(AppRadius.control),
+          boxShadow: selected
+              ? [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.08),
+                    blurRadius: 3,
+                    offset: const Offset(0, 1),
+                  ),
+                ]
+              : null,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            AppIcon(
+              icon,
+              size: 16,
+              color: selected ? AppTheme.brand : c.textSecondary,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.fade,
+              softWrap: false,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: selected ? c.textPrimary : c.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      );
+      return Expanded(
+        child: Semantics(
+          button: true,
+          selected: selected,
+          label: label,
+          child: GestureDetector(
+            key: ValueKey('mediaSegment-${kind.name}'),
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _selectMediaKind(kind),
+            // Large text scales shrink the pill content instead of clipping.
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: content,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      key: const ValueKey('mediaKindSegments'),
+      margin: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        color: c.searchFill,
+        borderRadius: BorderRadius.circular(9),
+      ),
+      child: Row(
+        children: [
+          segment(
+            _MediaKind.emoji,
+            HeroAppIcons.solidFaceSmile,
+            AppStrings.t(AppStringKeys.composerEmoji),
+          ),
+          segment(
+            _MediaKind.sticker,
+            HeroAppIcons.grip,
+            AppStrings.t(AppStringKeys.composerStickers),
+          ),
+          segment(
+            _MediaKind.gif,
+            HeroAppIcons.gif,
+            AppStrings.t(AppStringKeys.downloadsMediaAnimation),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _gifTabStrip() {
+    final c = context.colors;
+    return Container(
+      key: const ValueKey('gifPanelTabs'),
+      decoration: BoxDecoration(
+        color: c.inputBarBackground,
+        border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),
+      ),
+      child: SizedBox(
+        height: 50,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          children: [
+            _emojiTabButton(
+              key: const ValueKey('gifSearchTab'),
+              selected: _gifSearchSelected,
+              onTap: () => _selectStickerTab(_stickerSearchTabId),
+              child: AppIcon(
+                HeroAppIcons.magnifyingGlass,
+                size: 20,
+                color: _gifSearchSelected ? AppTheme.brand : c.textSecondary,
+              ),
+            ),
+            _emojiTabButton(
+              key: const ValueKey('gifSavedTab'),
+              selected: !_gifSearchSelected,
+              onTap: () => _selectStickerTab(_gifTabId),
+              child: AppIcon(
+                HeroAppIcons.gif,
+                size: 22,
+                color: !_gifSearchSelected ? AppTheme.brand : c.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _gifSearchContent() {
+    if (_panelSearch.text.trim().isEmpty) return const SizedBox.shrink();
+    if (_gifSearchResults.isEmpty && _gifSearchNextOffset.isEmpty) {
+      return _panelSearchState();
+    }
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        childAspectRatio: 1.2,
+        mainAxisSpacing: 4,
+        crossAxisSpacing: 4,
+      ),
+      itemCount:
+          _gifSearchResults.length + (_gifSearchNextOffset.isNotEmpty ? 1 : 0),
+      itemBuilder: (context, index) {
+        if (index == _gifSearchResults.length) {
+          return _gifSearchLoadMoreTile();
+        }
+        return _gifTile(_gifSearchResults[index], search: true);
+      },
     );
   }
 
@@ -7057,71 +8043,33 @@ class _ChatInputBarState extends State<ChatInputBar> {
         }
       }
       if (pack != null) {
-        return GridView.builder(
-          padding: const EdgeInsets.all(12),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 8,
+        final packEmoji = pack.emoji;
+        return LayoutBuilder(
+          builder: (context, constraints) => GridView.builder(
+            padding: const EdgeInsets.all(12),
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: emojiPanelColumnCount(constraints.maxWidth),
+            ),
+            itemCount: packEmoji.length,
+            itemBuilder: (context, index) {
+              final item = packEmoji[index];
+              return item.customEmojiId != 0
+                  ? EmojiPanelCell(
+                      customItem: item,
+                      onTap: () => _controller.insertCustomEmoji(
+                        item.customEmojiId,
+                        item.emoji,
+                      ),
+                    )
+                  : const SizedBox();
+            },
           ),
-          itemCount: pack.emoji.length,
-          itemBuilder: (context, index) {
-            final item = pack!.emoji[index];
-            return GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () =>
-                  _controller.insertCustomEmoji(item.customEmojiId, item.emoji),
-              child: Padding(
-                padding: const EdgeInsets.all(2),
-                child: item.customEmojiId != 0
-                    ? CustomEmojiView(
-                        id: item.customEmojiId,
-                        size: 34,
-                        color: context.colors.textPrimary,
-                      )
-                    : const SizedBox(),
-              ),
-            );
-          },
         );
       }
     }
-    return CustomScrollView(
-      slivers: [
-        const SliverToBoxAdapter(child: SizedBox(height: 8)),
-        for (final category in EmojiCatalog.categories) ...[
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.only(left: 14, top: 6, bottom: 2),
-              child: Text(
-                category.name.l10n(context),
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w500,
-                  color: context.colors.textSecondary,
-                ),
-              ),
-            ),
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 8,
-              ),
-              delegate: SliverChildBuilderDelegate((context, index) {
-                final emoji = category.emojis[index];
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => _controller.insertText(emoji),
-                  child: Center(
-                    child: Text(emoji, style: const TextStyle(fontSize: 26)),
-                  ),
-                );
-              }, childCount: category.emojis.length),
-            ),
-          ),
-        ],
-        const SliverToBoxAdapter(child: SizedBox(height: 8)),
-      ],
+    return StandardEmojiPane(
+      insertText: _controller.insertText,
+      insertCustomEmoji: _controller.insertCustomEmoji,
     );
   }
 
@@ -7178,48 +8126,55 @@ class _ChatInputBarState extends State<ChatInputBar> {
   Widget _emojiSearchContent() {
     final count = _emojiSearchResults.length + _customEmojiSearchResults.length;
     if (count == 0) return _panelSearchState();
-    return GridView.builder(
-      padding: const EdgeInsets.all(12),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 8,
-      ),
-      itemCount: count,
-      itemBuilder: (context, index) {
-        if (index < _emojiSearchResults.length) {
-          final emoji = _emojiSearchResults[index];
+    return LayoutBuilder(
+      builder: (context, constraints) => GridView.builder(
+        padding: const EdgeInsets.all(12),
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: emojiPanelColumnCount(constraints.maxWidth),
+        ),
+        itemCount: count,
+        itemBuilder: (context, index) {
+          if (index < _emojiSearchResults.length) {
+            final emoji = _emojiSearchResults[index];
+            return EmojiPanelCell(
+              key: ValueKey('emojiSearch-$emoji'),
+              emoji: emoji,
+              onTap: () {
+                EmojiRecentsStore.shared.record(emoji);
+                _controller.insertText(emoji);
+              },
+            );
+          }
+          final item =
+              _customEmojiSearchResults[index - _emojiSearchResults.length];
           return GestureDetector(
-            key: ValueKey('emojiSearch-$emoji'),
+            key: ValueKey('customEmojiSearch-${item.customEmojiId}'),
             behavior: HitTestBehavior.opaque,
-            onTap: () => _controller.insertText(emoji),
-            child: Center(
-              child: Text(emoji, style: const TextStyle(fontSize: 26)),
+            onTap: () {
+              if (item.customEmojiId != 0) {
+                EmojiRecentsStore.shared.recordCustom(
+                  item.customEmojiId,
+                  item.emoji,
+                );
+                _controller.insertCustomEmoji(item.customEmojiId, item.emoji);
+              } else if (item.emoji.isNotEmpty) {
+                EmojiRecentsStore.shared.record(item.emoji);
+                _controller.insertText(item.emoji);
+              }
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(2),
+              child: item.customEmojiId != 0
+                  ? CustomEmojiView(
+                      id: item.customEmojiId,
+                      size: 34,
+                      color: context.colors.textPrimary,
+                    )
+                  : StickerPreview(item: item),
             ),
           );
-        }
-        final item =
-            _customEmojiSearchResults[index - _emojiSearchResults.length];
-        return GestureDetector(
-          key: ValueKey('customEmojiSearch-${item.customEmojiId}'),
-          behavior: HitTestBehavior.opaque,
-          onTap: () {
-            if (item.customEmojiId != 0) {
-              _controller.insertCustomEmoji(item.customEmojiId, item.emoji);
-            } else if (item.emoji.isNotEmpty) {
-              _controller.insertText(item.emoji);
-            }
-          },
-          child: Padding(
-            padding: const EdgeInsets.all(2),
-            child: item.customEmojiId != 0
-                ? CustomEmojiView(
-                    id: item.customEmojiId,
-                    size: 34,
-                    color: context.colors.textPrimary,
-                  )
-                : StickerPreview(item: item),
-          ),
-        );
-      },
+        },
+      ),
     );
   }
 
@@ -7321,13 +8276,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
   }
 
   void _closeDesktopVoicePanel() {
-    if (_recording) {
-      _recordCancelled = true;
-      unawaited(_stopRec());
-    }
-    _desktopSpaceHeld = false;
-    _desktopPointerHeld = false;
-    _desktopStopAfterStart = false;
+    _cancelVoiceRecording();
     _desktopVoiceFocus.unfocus();
     _setPanel(_Panel.none);
   }
@@ -7339,167 +8288,167 @@ class _ChatInputBarState extends State<ChatInputBar> {
 
   Widget _desktopVoicePanel() {
     final c = context.colors;
-    final granted = _desktopRecorder != null;
-    final label = !granted
-        ? AppStrings.t(AppStringKeys.composerMicrophonePermissionRequired)
-        : !_recording
-        ? AppStrings.t(AppStringKeys.composerDesktopVoiceHoldSpace)
-        : AppStrings.t(AppStringKeys.composerDesktopVoiceRelease);
-    return Container(
-      key: const ValueKey('desktopVoiceMessagePanel'),
-      height: 282,
-      width: double.infinity,
-      color: c.panelBackground,
-      child: Focus(
-        focusNode: _desktopVoiceFocus,
-        autofocus: true,
-        onKeyEvent: _handleDesktopVoiceKeyEvent,
-        child: Stack(
+    final draft = _desktopVoiceDraft;
+    final busy = _startingRecording || _stoppingRecording || _sendingVoice;
+    final label = _sendingVoice
+        ? AppStrings.t(AppStringKeys.feedbackReportSending)
+        : _stoppingRecording
+        ? AppStrings.t(AppStringKeys.composerRecordingFinishing)
+        : _startingRecording
+        ? AppStrings.t(AppStringKeys.composerRecordingPreparing)
+        : draft != null
+        ? AppStrings.t(AppStringKeys.composerRecordingSendFailed)
+        : _recording
+        ? AppStrings.t(AppStringKeys.composerDesktopVoiceRelease)
+        : AppStrings.t(AppStringKeys.composerDesktopVoiceHoldSpace);
+    return Focus(
+      focusNode: _desktopVoiceFocus,
+      autofocus: true,
+      onKeyEvent: _handleDesktopVoiceKeyEvent,
+      onFocusChange: (focused) {
+        if (!focused && _recording) _cancelVoiceRecording();
+      },
+      child: Container(
+        key: const ValueKey('desktopVoiceMessagePanel'),
+        width: double.infinity,
+        color: _composerDockedSurfaceColor,
+        padding: const EdgeInsets.fromLTRB(20, 8, 16, 14),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Positioned(
-              left: 24,
-              top: 18,
-              child: Text(
-                AppStrings.t(AppStringKeys.voiceNotePreviewVoiceMessage),
-                style: TextStyle(
-                  color: c.textPrimary,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            Positioned(
-              top: 10,
-              right: 16,
-              child: Semantics(
-                button: true,
-                label: AppStrings.t(AppStringKeys.composerCloseMenu),
-                child: GestureDetector(
-                  key: const ValueKey('desktopVoicePanelClose'),
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _closeDesktopVoicePanel,
-                  child: SizedBox.square(
-                    dimension: 36,
-                    child: Center(
-                      child: AppIcon(
-                        HeroAppIcons.xmark,
-                        size: 18,
-                        color: c.textSecondary,
-                      ),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    AppStrings.t(AppStringKeys.voiceNotePreviewVoiceMessage),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: c.textPrimary,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
-              ),
+                _desktopVoiceAction(
+                  key: const ValueKey('desktopVoicePanelClose'),
+                  icon: HeroAppIcons.xmark,
+                  label: AppStrings.t(AppStringKeys.composerCloseMenu),
+                  onTap: _closeDesktopVoicePanel,
+                ),
+              ],
             ),
-            Align(
-              child: Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    ValueListenableBuilder<_RecTick>(
-                      valueListenable: _recTick,
-                      builder: (context, tick, _) => Text(
-                        _recTime(tick.elapsed),
-                        style: TextStyle(
-                          color: _recording ? c.textPrimary : c.textTertiary,
-                          fontSize: 15,
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    if (_recording)
-                      SizedBox(
-                        width: 250,
-                        height: 34,
-                        child: ValueListenableBuilder<_RecTick>(
-                          valueListenable: _recTick,
-                          builder: (context, tick, _) => Row(
-                            children: [
-                              for (final level in tick.levels)
-                                Expanded(
-                                  child: Align(
-                                    child: Container(
-                                      width: 3,
-                                      height:
-                                          (5 +
-                                                  ((level.clamp(-60.0, 0.0) +
-                                                              60) /
-                                                          60) *
-                                                      29)
-                                              .toDouble(),
-                                      decoration: BoxDecoration(
-                                        color: _recordingPaused
-                                            ? c.textTertiary
-                                            : AppTheme.brand,
-                                        borderRadius: BorderRadius.circular(2),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ),
-                      )
-                    else
-                      const SizedBox(height: 34),
-                    const SizedBox(height: 14),
-                    Semantics(
-                      button: true,
-                      label: label,
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: Semantics(
+                    button: true,
+                    label: label,
+                    child: MouseRegion(
+                      cursor: busy || draft != null
+                          ? SystemMouseCursors.basic
+                          : SystemMouseCursors.click,
                       child: Listener(
                         key: const ValueKey('desktopVoiceRecordButton'),
                         behavior: HitTestBehavior.opaque,
                         onPointerDown: _desktopVoicePointerDown,
                         onPointerUp: _desktopVoicePointerUp,
                         onPointerCancel: _desktopVoicePointerCancel,
-                        child: AnimatedScale(
-                          scale: _recording ? 1.08 : 1,
-                          duration: const Duration(milliseconds: 150),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 150),
-                            width: 96,
-                            height: 96,
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: granted
-                                  ? AppTheme.brand
-                                  : AppTheme.brand.withValues(alpha: 0.35),
-                              shape: BoxShape.circle,
-                              boxShadow: _recording
-                                  ? [
-                                      BoxShadow(
-                                        color: AppTheme.brand.withValues(
-                                          alpha: 0.28,
+                        child: Container(
+                          height: 52,
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          decoration: BoxDecoration(
+                            color: c.card,
+                            borderRadius: BorderRadius.circular(AppRadius.card),
+                            border: Border.all(
+                              color: _recording
+                                  ? AppTheme.brand.withValues(alpha: 0.45)
+                                  : c.divider,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              if (busy && !_recording)
+                                const AppActivityIndicator(size: 18)
+                              else
+                                AppIcon(
+                                  HeroAppIcons.microphone,
+                                  size: 20,
+                                  color: _recording
+                                      ? AppTheme.brand
+                                      : c.textSecondary,
+                                ),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: SizedBox(
+                                  height: 30,
+                                  child: ValueListenableBuilder<_RecTick>(
+                                    valueListenable: _recTick,
+                                    builder: (context, tick, _) =>
+                                        DesktopVoiceWaveform(
+                                          key: const ValueKey(
+                                            'desktopVoiceWaveform',
+                                          ),
+                                          levels: tick.levels,
+                                          color: _recordingPaused
+                                              ? c.textTertiary
+                                              : AppTheme.brand,
+                                          baselineColor: c.textTertiary
+                                              .withValues(alpha: 0.3),
                                         ),
-                                        spreadRadius: 8,
-                                      ),
-                                    ]
-                                  : null,
-                            ),
-                            child: const AppIcon(
-                              HeroAppIcons.microphone,
-                              size: 34,
-                              color: Colors.white,
-                            ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 14),
+                              ValueListenableBuilder<_RecTick>(
+                                valueListenable: _recTick,
+                                builder: (context, tick, _) => Text(
+                                  formatMediaDuration(tick.elapsed.floor()),
+                                  style: TextStyle(
+                                    color: c.textSecondary,
+                                    fontSize: 14,
+                                    fontFeatures: const [
+                                      FontFeature.tabularFigures(),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    Text(
-                      label,
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: _recordCancelled
-                            ? AppTheme.tagRed
-                            : c.textSecondary,
-                        fontSize: 13,
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
+                if (draft != null) ...[
+                  const SizedBox(width: 8),
+                  _desktopVoiceAction(
+                    key: const ValueKey('desktopVoiceDiscard'),
+                    icon: HeroAppIcons.trash,
+                    label: AppStrings.t(AppStringKeys.composerRecordingDiscard),
+                    onTap: busy ? null : _discardDesktopVoiceDraft,
+                  ),
+                  _desktopVoiceAction(
+                    key: const ValueKey('desktopVoiceRetrySend'),
+                    icon: HeroAppIcons.paperPlane,
+                    label: AppStrings.t(AppStringKeys.composerSend),
+                    onTap: busy
+                        ? null
+                        : () => unawaited(_sendDesktopVoiceDraft()),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              label,
+              style: TextStyle(
+                color: draft != null && !_sendingVoice
+                    ? AppTheme.tagRed
+                    : c.textSecondary,
+                fontSize: 12,
               ),
             ),
           ],
@@ -7508,24 +8457,54 @@ class _ChatInputBarState extends State<ChatInputBar> {
     );
   }
 
+  Widget _desktopVoiceAction({
+    required Key key,
+    required AppIconData icon,
+    required String label,
+    required VoidCallback? onTap,
+  }) => AppInteractiveSurface(
+    key: key,
+    semanticLabel: label,
+    onTap: onTap,
+    enabled: onTap != null,
+    borderRadius: BorderRadius.circular(AppRadius.control),
+    child: SizedBox.square(
+      dimension: 36,
+      child: Center(
+        child: AppIcon(
+          icon,
+          size: 18,
+          color: onTap != null
+              ? context.colors.textSecondary
+              : context.colors.textTertiary,
+        ),
+      ),
+    ),
+  );
+
   Widget _mobileVoicePanel() {
     final c = context.colors;
     final granted = _recorder != null;
-    final label = !granted
+    final label = _startingRecording
+        ? AppStrings.t(AppStringKeys.composerRecordingPreparing)
+        : _stoppingRecording
+        ? AppStrings.t(AppStringKeys.composerRecordingFinishing)
+        : !granted
         ? AppStrings.t(AppStringKeys.composerMicrophonePermissionRequired)
         : !_recording
         ? AppStrings.t(AppStringKeys.composerHoldToTalk)
         : _recordingLocked
         ? (_recordingPaused
-              ? 'Recording paused'
-              : 'Recording locked · pause or stop')
+              ? AppStrings.t(AppStringKeys.composerRecordingPaused)
+              : AppStrings.t(AppStringKeys.composerRecordingLocked))
         : (_recordCancelled
               ? AppStrings.t(AppStringKeys.composerReleaseFingerToCancel)
-              : 'Release to preview · slide up to lock · left to cancel');
+              : AppStrings.t(AppStringKeys.composerRecordingReleasePreview));
     return Container(
+      key: const ValueKey('composerMobileVoicePanel'),
       height: 318,
       width: double.infinity,
-      color: c.panelBackground,
+      color: _composerDockedSurfaceColor,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
@@ -7559,7 +8538,8 @@ class _ChatInputBarState extends State<ChatInputBar> {
                     label: AppStrings.t(
                       AppStringKeys.videoNotePreviewVideoMessage,
                     ),
-                    onTap: _recording
+                    onTap:
+                        _recording || _startingRecording || _stoppingRecording
                         ? null
                         : () {
                             _setPanel(_Panel.none);
@@ -7615,7 +8595,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
             child: ValueListenableBuilder<_RecTick>(
               valueListenable: _recTick,
               builder: (context, tick, _) => Text(
-                _recTime(tick.elapsed),
+                formatMediaDuration(tick.elapsed.floor()),
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.w500,
@@ -7626,21 +8606,21 @@ class _ChatInputBarState extends State<ChatInputBar> {
           ),
           const SizedBox(height: 16),
           Listener(
+            key: const ValueKey('mobileVoiceRecordButton'),
             onPointerDown: (e) {
+              if (_recording || _voiceStop != null || _mobilePointerHeld) {
+                return;
+              }
+              _voicePointerId = e.pointer;
+              _mobilePointerHeld = true;
               _pressStartX = e.position.dx;
               _pressStartY = e.position.dy;
-              // Check the recorder live (not the build-time `granted`) so a press
-              // right after the panel opens still records; otherwise prime it.
-              if (_recorder != null) {
-                _startRec();
-              } else {
-                _prepareRecorder();
-              }
+              unawaited(_beginVoiceRecording());
             },
             onPointerMove: (e) {
-              if (!_recording || _recordingLocked) return;
+              if (_voicePointerId != e.pointer || _recordingLocked) return;
               final cancel = e.position.dx - _pressStartX < -70;
-              final lock = e.position.dy - _pressStartY < -70;
+              final lock = _recording && e.position.dy - _pressStartY < -70;
               if (lock) {
                 setState(() {
                   _recordingLocked = true;
@@ -7652,12 +8632,14 @@ class _ChatInputBarState extends State<ChatInputBar> {
                 setState(() => _recordCancelled = cancel);
               }
             },
-            onPointerUp: (_) {
-              if (_recorder != null) {
-                if (!_recordingLocked) unawaited(_stopRec());
-              } else {
-                _prepareRecorder();
-              }
+            onPointerUp: (e) {
+              if (_voicePointerId != e.pointer) return;
+              _voicePointerId = null;
+              _mobilePointerHeld = false;
+              if (!_recordingLocked) unawaited(_stopRec());
+            },
+            onPointerCancel: (e) {
+              if (_voicePointerId == e.pointer) _cancelVoiceRecording();
             },
             child: AnimatedScale(
               scale: _recording ? 1.12 : 1,
@@ -7785,30 +8767,11 @@ class _ChatInputBarState extends State<ChatInputBar> {
     ),
   );
 
-  Widget _stickerPanel({double height = 326, bool popover = false}) {
-    final c = context.colors;
-    return Container(
-      key: popover ? const ValueKey('desktopStickerPopoverContent') : null,
-      height: height,
-      color: c.panelBackground,
-      child: Column(
-        children: [
-          _stickerTabStrip(),
-          if (_stickerPack == _stickerSearchTabId) _panelSearchField(),
-          Expanded(child: _stickerContent()),
-        ],
-      ),
-    );
-  }
-
   Widget _stickerContent() {
     final store = StickerStore.shared;
     final packs = store.packs;
-    final activeId =
-        _stickerPack ??
-        (packs.isNotEmpty ? packs.first.id : StickerStore.recentPackId);
+    final activeId = _activeStickerTab;
     if (activeId == _stickerSearchTabId) return _stickerSearchContent();
-    if (activeId == _gifTabId) return _gifContent();
     if (packs.isEmpty) {
       return Center(
         child: Text(
@@ -7897,52 +8860,10 @@ class _ChatInputBarState extends State<ChatInputBar> {
 
   Widget _stickerSearchContent() {
     if (_panelSearch.text.trim().isEmpty) return const SizedBox.shrink();
-    if (_stickerSearchResults.isEmpty && _gifSearchResults.isEmpty) {
+    if (_stickerSearchResults.isEmpty) {
       return _panelSearchState();
     }
-    return CustomScrollView(
-      slivers: [
-        if (_stickerSearchResults.isNotEmpty)
-          SliverPadding(
-            padding: const EdgeInsets.all(12),
-            sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 4,
-                mainAxisSpacing: 8,
-                crossAxisSpacing: 8,
-              ),
-              delegate: SliverChildBuilderDelegate(
-                (context, index) =>
-                    _stickerTile(_stickerSearchResults[index], search: true),
-                childCount: _stickerSearchResults.length,
-              ),
-            ),
-          ),
-        if (_gifSearchResults.isNotEmpty || _gifSearchNextOffset.isNotEmpty)
-          SliverPadding(
-            padding: const EdgeInsets.all(8),
-            sliver: SliverGrid(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                childAspectRatio: 1.2,
-                mainAxisSpacing: 4,
-                crossAxisSpacing: 4,
-              ),
-              delegate: SliverChildBuilderDelegate(
-                (context, index) {
-                  if (index == _gifSearchResults.length) {
-                    return _gifSearchLoadMoreTile();
-                  }
-                  return _gifTile(_gifSearchResults[index], search: true);
-                },
-                childCount:
-                    _gifSearchResults.length +
-                    (_gifSearchNextOffset.isNotEmpty ? 1 : 0),
-              ),
-            ),
-          ),
-      ],
-    );
+    return _stickerGrid(_stickerSearchResults, search: true);
   }
 
   Widget _stickerTile(StickerItem item, {bool search = false}) =>
@@ -8010,9 +8931,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
   Widget _stickerTabStrip() {
     final c = context.colors;
     final packs = StickerStore.shared.packs;
-    final activeId =
-        _stickerPack ??
-        (packs.isNotEmpty ? packs.first.id : StickerStore.recentPackId);
+    final activeId = _activeStickerTab;
     final installed = packs.where((p) => p.id != StickerStore.recentPackId);
     return Container(
       key: const ValueKey('stickerPanelTabs'),
@@ -8039,6 +8958,7 @@ class _ChatInputBarState extends State<ChatInputBar> {
               ),
             ),
             _emojiTabButton(
+              key: const ValueKey('stickerRecentsTab'),
               selected: activeId == StickerStore.recentPackId,
               onTap: () => _selectStickerTab(StickerStore.recentPackId),
               child: AppIcon(
@@ -8049,17 +8969,9 @@ class _ChatInputBarState extends State<ChatInputBar> {
                     : c.textSecondary,
               ),
             ),
-            _emojiTabButton(
-              selected: activeId == _gifTabId,
-              onTap: () => _selectStickerTab(_gifTabId),
-              child: AppIcon(
-                HeroAppIcons.gif,
-                size: 22,
-                color: activeId == _gifTabId ? AppTheme.brand : c.textSecondary,
-              ),
-            ),
             for (final pack in installed)
               _emojiTabButton(
+                key: ValueKey('stickerPackTab-${pack.id}'),
                 selected: pack.id == activeId,
                 onTap: () => _selectStickerTab(pack.id),
                 child: pack.cover != null

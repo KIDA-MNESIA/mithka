@@ -158,6 +158,71 @@ class AppPinIcon extends StatelessWidget {
   }
 }
 
+/// Owned "jump to earlier message" glyph.
+///
+/// The horizontal rule is the destination and the arrow moves toward it. The
+/// bundled Heroicons set has arrows and trays, but no upward arrow terminating
+/// at a line, so the chat quote control draws that exact shape here.
+class AppArrowUpToLineIcon extends StatelessWidget {
+  const AppArrowUpToLineIcon({super.key, this.size = 18, this.color});
+
+  final double size;
+  final Color? color;
+
+  @override
+  Widget build(BuildContext context) {
+    final resolvedColor =
+        color ?? IconTheme.of(context).color ?? const Color(0xFF000000);
+    return SizedBox.square(
+      dimension: size,
+      child: CustomPaint(
+        painter: _AppArrowUpToLineIconPainter(color: resolvedColor),
+      ),
+    );
+  }
+}
+
+class _AppArrowUpToLineIconPainter extends CustomPainter {
+  const _AppArrowUpToLineIconPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final strokeWidth = (size.shortestSide * 0.10).clamp(1.35, 1.9);
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final centerX = size.width * 0.5;
+    final barY = size.height * 0.17;
+    final tipY = size.height * 0.34;
+    final wingY = size.height * 0.53;
+    final stemBottom = size.height * 0.86;
+
+    canvas.drawLine(
+      Offset(size.width * 0.20, barY),
+      Offset(size.width * 0.80, barY),
+      paint,
+    );
+    canvas.drawPath(
+      Path()
+        ..moveTo(size.width * 0.28, wingY)
+        ..lineTo(centerX, tipY)
+        ..lineTo(size.width * 0.72, wingY)
+        ..moveTo(centerX, tipY)
+        ..lineTo(centerX, stemBottom),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_AppArrowUpToLineIconPainter oldDelegate) =>
+      oldDelegate.color != color;
+}
+
 class _AppPinIconPainter extends CustomPainter {
   const _AppPinIconPainter({required this.color});
 
@@ -219,7 +284,9 @@ class HeroAppIcons {
   static const bell = AppIconData(HeroiconsOutline.bell);
   static const bellSlash = AppIconData(HeroiconsOutline.bellSlash);
   static const bookmark = AppIconData(HeroiconsOutline.bookmark);
+  static const bug = AppIconData(HeroiconsOutline.bugAnt);
   static const venue = AppIconData(HeroiconsOutline.buildingStorefront);
+  static const cake = AppIconData(HeroiconsOutline.cake);
   static const camera = AppIconData(HeroiconsOutline.camera);
   static const check = AppIconData(HeroiconsOutline.check);
   static const checkDouble = AppIconData(HeroiconsOutline.check);
@@ -237,8 +304,10 @@ class HeroAppIcons {
   static const circleUser = AppIconData(HeroiconsOutline.userCircle);
   static const circleXmark = AppIconData(HeroiconsOutline.xCircle);
   static const clipboard = AppIconData(HeroiconsOutline.clipboard);
+  static const calendarDays = AppIconData(HeroiconsOutline.calendarDays);
   static const clock = AppIconData(HeroiconsOutline.clock);
   static const code = AppIconData(HeroiconsOutline.codeBracket);
+  static const commandLine = AppIconData(HeroiconsOutline.commandLine);
   static const cloud = AppIconData(HeroiconsOutline.cloud);
   static const cloudArrowDown = AppIconData(HeroiconsOutline.cloudArrowDown);
   static const comment = AppIconData(HeroiconsOutline.chatBubbleOvalLeft);
@@ -261,11 +330,21 @@ class HeroAppIcons {
   static const eye = AppIconData(HeroiconsOutline.eye);
   static const eyeSlash = AppIconData(HeroiconsOutline.eyeSlash);
   static const faceScan = AppIconData(HeroiconsOutline.viewfinderCircle);
+  static const faceSmile = AppIconData(HeroiconsOutline.faceSmile);
   static const file = AppIconData(HeroiconsOutline.document);
   static const filter = AppIconData(HeroiconsOutline.funnel);
   static const fingerprint = AppIconData(HeroiconsOutline.fingerPrint);
   static const flash = AppIconData(HeroiconsOutline.bolt);
   static const folder = AppIconData(HeroiconsOutline.folder);
+  static const briefcase = AppIconData(HeroiconsOutline.briefcase);
+  static const home = AppIconData(HeroiconsOutline.home);
+  static const book = AppIconData(HeroiconsOutline.bookOpen);
+  static const lightbulb = AppIconData(HeroiconsOutline.lightBulb);
+  static const banknotes = AppIconData(HeroiconsOutline.banknotes);
+  static const academicCap = AppIconData(HeroiconsOutline.academicCap);
+  static const puzzle = AppIconData(HeroiconsOutline.puzzlePiece);
+  static const gift = AppIconData(HeroiconsOutline.gift);
+  static const trophy = AppIconData(HeroiconsOutline.trophy);
   static const font = AppIconData(HeroiconsOutline.documentText);
 
   /// Message, post, and story forwarding. Generic share/export actions keep
@@ -280,6 +359,7 @@ class HeroAppIcons {
   static const idBadge = AppIconData(HeroiconsOutline.identification);
   static const image = AppIconData(HeroiconsOutline.photo);
   static const images = AppIconData(HeroiconsOutline.photo);
+  static const archiveBox = AppIconData(HeroiconsOutline.archiveBox);
   static const inbox = AppIconData(HeroiconsOutline.inbox);
   static const language = AppIconData(HeroiconsOutline.language);
   static const key = AppIconData(HeroiconsOutline.key);
@@ -357,6 +437,7 @@ class HeroAppIcons {
     HeroiconsOutline.exclamationTriangle,
   );
   static const upload = AppIconData(HeroiconsOutline.arrowUpTray);
+  static const user = AppIconData(HeroiconsOutline.user);
   static const userPlus = AppIconData(HeroiconsOutline.userPlus);
   static const users = AppIconData(HeroiconsOutline.userGroup);
   static const video = AppIconData(HeroiconsOutline.videoCamera);

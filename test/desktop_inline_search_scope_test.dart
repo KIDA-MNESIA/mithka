@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mithka/app/active_conversation.dart';
 import 'package:mithka/chat/chat_search_query.dart';
+import 'package:mithka/chat/chat_search_view.dart';
 import 'package:mithka/chats/search_view.dart';
 import 'package:mithka/tdlib/td_client.dart';
 import 'package:mithka/theme/app_theme.dart';
@@ -160,6 +161,61 @@ void main() {
       isEmpty,
     );
   });
+
+  testWidgets('submitting a chat-scoped search keeps its chat boundary', (
+    tester,
+  ) async {
+    final controller = DesktopInlineSearchController(
+      miniAppSearch: (_) async => const [],
+    );
+    addTearDown(controller.dispose);
+    await tester.pumpWidget(_harness(controller));
+    controller.focus(scope: _scope);
+    await tester.pump();
+    await _type(tester, 'needle');
+    requests.clear();
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pumpAndSettle();
+    expect(find.byType(ChatSearchView), findsOneWidget);
+    expect(
+      tester.widget<ChatSearchView>(find.byType(ChatSearchView)).chatId,
+      100,
+    );
+    expect(requests.where((r) => r['@type'] == 'searchMessages'), isEmpty);
+  });
+
+  for (final query in ['has:music', 'from:@mao has:music']) {
+    testWidgets('scoped $query applies only the requested media filter', (
+      tester,
+    ) async {
+      final controller = DesktopInlineSearchController(
+        miniAppSearch: (_) async => const [],
+      );
+      addTearDown(controller.dispose);
+      await tester.pumpWidget(_harness(controller));
+      controller.focus(scope: _scope);
+      await tester.pump();
+      await _type(tester, query);
+
+      final searches = requests
+          .where((request) => request['@type'] == 'searchChatMessages')
+          .toList();
+      expect(searches, hasLength(1));
+      expect(searches.single['chat_id'], 100);
+      expect(searches.single['query'], '');
+      expect(searches.single['filter'], {'@type': 'searchMessagesFilterAudio'});
+      if (query.startsWith('from:')) {
+        expect(searches.single['sender_id'], {
+          '@type': 'messageSenderUser',
+          'user_id': 55,
+        });
+      }
+      expect(
+        requests.where((request) => request['@type'] == 'searchMessages'),
+        isEmpty,
+      );
+    });
+  }
 
   testWidgets('dismissing ends the scoped session', (tester) async {
     final controller = DesktopInlineSearchController(

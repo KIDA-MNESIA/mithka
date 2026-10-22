@@ -21,6 +21,7 @@ class TdFileRef {
     this.localPath,
     this.fileName,
     this.mimeType,
+    this.size,
     this.miniThumb,
     this.thumbnail,
     this.hasAnimation = false,
@@ -30,6 +31,10 @@ class TdFileRef {
   final String? localPath;
   final String? fileName;
   final String? mimeType;
+
+  /// Bytes TDLib knows for this file: the real size once it is known,
+  /// otherwise the server's estimate. Null when neither is available.
+  final int? size;
   final bool hasAnimation;
   final int? photoId;
   Uint8List? miniThumb; // decoded JPEG for instant placeholder
@@ -41,6 +46,7 @@ class TdFileRef {
       localPath: _usablePath(localPath) ?? _usablePath(previous?.localPath),
       fileName: _usablePath(fileName) ?? _usablePath(previous?.fileName),
       mimeType: _usablePath(mimeType) ?? _usablePath(previous?.mimeType),
+      size: size ?? previous?.size,
       miniThumb: miniThumb ?? previous?.miniThumb,
       hasAnimation: hasAnimation || (previous?.hasAnimation ?? false),
       photoId: photoId ?? previous?.photoId,
@@ -170,6 +176,31 @@ class MessageTextEntity {
       'type': entityType,
     };
   }
+}
+
+/// A server quote or a manually selected UTF-16 range from a message.
+class MessageTextQuote {
+  const MessageTextQuote({
+    required this.text,
+    required this.position,
+    this.entities = const [],
+    this.isManual = true,
+  });
+
+  final String text;
+  final int position;
+  final List<MessageTextEntity> entities;
+  final bool isManual;
+
+  Map<String, dynamic> toInputJson() => {
+    '@type': 'inputTextQuote',
+    'text': {
+      '@type': 'formattedText',
+      'text': text,
+      'entities': [for (final entity in entities) entity.toTdJson()],
+    },
+    'position': position,
+  };
 }
 
 class RichMessageTableCell {
@@ -511,7 +542,9 @@ class ChatSummary {
     required this.lastMessageId,
     required this.date,
     required this.unreadCount,
+    this.lastReadInboxMessageId = 0,
     this.unreadMentionCount = 0,
+    this.unreadReactionCount = 0,
     required this.order,
     required this.isMuted,
     this.kind = ChatKind.unknown,
@@ -540,7 +573,9 @@ class ChatSummary {
   int lastMessageId;
   int date;
   int unreadCount;
+  int lastReadInboxMessageId;
   int unreadMentionCount;
+  int unreadReactionCount;
   int order;
   bool isMuted;
   ChatKind kind;
@@ -562,6 +597,11 @@ class ChatSummary {
   ChatMessage? lastChatMessage;
   bool
   isSavedMessages; // true when this is the Saved Messages chat (private chat with yourself)
+
+  /// Chat folders this chat currently sits in, kept from its TDLib chat-list
+  /// positions. Lets a chat-list row draw its folder tags without asking
+  /// TDLib — or recomputing folder filters — once per row.
+  final Set<int> folderIds = {};
 
   /// Groups & channels use a rounded-square avatar unless UI preferences
   /// override them; people use a circle.
@@ -654,6 +694,7 @@ class ChatMessage {
     required this.text,
     required this.date,
     this.chatId,
+    this.forumTopicId,
     this.senderName,
     this.senderIsChat = false,
     this.isService = false,
@@ -667,6 +708,7 @@ class ChatMessage {
     this.restrictedContentText,
     this.restrictedContentTextEntities = const [],
     this.containsUnreadMention = false,
+    this.hasUnreadReactions = false,
     this.senderId,
     this.senderPhoto,
     this.image,
@@ -677,6 +719,7 @@ class ChatMessage {
     this.senderRole,
     this.senderTitle,
     this.senderIsPremium = false,
+    this.senderIsDeleted = false,
     this.senderAccentColorId = -1,
     this.senderEmojiStatusId = 0,
     this.mediaAlbumId = 0,
@@ -685,6 +728,7 @@ class ChatMessage {
     this.video,
     this.videoDuration,
     this.videoFileSize,
+    this.hasSpoiler = false,
     this.videoNoteTranscription = '',
     this.videoNoteTranscriptionPending = false,
     this.videoNoteTranscriptionError,
@@ -704,7 +748,12 @@ class ChatMessage {
     this.summaryLanguageCode = '',
     this.canRecognizeSpeech = false,
     this.replyToMessageId,
+    this.replyToChatId,
+    this.replyToQuote,
+    this.textQuoteSource,
+    this.textQuoteSourceEntities,
     this.replyToDate,
+    this.replyToEntities = const [],
     this.replyToImage,
     this.replyToImageWidth,
     this.replyToImageHeight,
@@ -731,6 +780,8 @@ class ChatMessage {
     this.lastCommentMessageId,
     bool? commentThreadMetadataKnown,
     this.blockedByUser = false,
+    this.viaBotUserId,
+    this.viaBotUsername,
   }) : commentThreadMetadataKnown =
            commentThreadMetadataKnown ??
            (hasCommentThread ||
@@ -742,6 +793,11 @@ class ChatMessage {
   String text;
   final int date;
   int? chatId;
+
+  /// The forum topic this message belongs to, from TDLib's `message.topic_id`.
+  /// Null outside forums and for messages TDLib reports without a topic (the
+  /// General topic); the chat view's topic sections resolve General from it.
+  final int? forumTopicId;
   String? senderName;
   bool senderIsChat;
   bool isService;
@@ -763,6 +819,8 @@ class ChatMessage {
   String? restrictedContentText;
   List<MessageTextEntity> restrictedContentTextEntities;
   bool containsUnreadMention;
+  bool hasUnreadReactions;
+
   int? senderId;
   TdFileRef? senderPhoto;
   TdFileRef? image; // photo / sticker / video-thumb / gif
@@ -773,6 +831,7 @@ class ChatMessage {
   MemberRole? senderRole;
   String? senderTitle;
   bool senderIsPremium;
+  bool senderIsDeleted;
   int senderAccentColorId;
   int senderEmojiStatusId;
   int mediaAlbumId;
@@ -781,6 +840,11 @@ class ChatMessage {
   TdFileRef? video; // playable video file (messageVideo)
   int? videoDuration; // seconds, for the duration badge
   int? videoFileSize; // bytes, for the inline autoplay budget
+  /// Cover the media preview until explicitly revealed.
+  bool hasSpoiler;
+
+  /// Non-interactive quote/search previews cannot reveal a media spoiler.
+  TdFileRef? get previewImage => hasSpoiler ? null : image;
   String videoNoteTranscription;
   bool videoNoteTranscriptionPending;
   String? videoNoteTranscriptionError;
@@ -807,9 +871,22 @@ class ChatMessage {
 
   // 引用 / reply: the message this one replies to, resolved lazily for the quote.
   int? replyToMessageId;
+  int? replyToChatId;
+  MessageTextQuote? replyToQuote;
+  // Rendering can extract tables from the original formatted text. Quotes
+  // must still address the unmodified source text, not that rendered subset.
+  String? textQuoteSource;
+  List<MessageTextEntity>? textQuoteSourceEntities;
+  String get quoteSourceText => textQuoteSource ?? text;
+  List<MessageTextEntity> get quoteSourceEntities =>
+      textQuoteSourceEntities ?? textEntities;
+  String? get replyPreviewText => replyToQuote?.text ?? replyToPreview;
+  List<MessageTextEntity> get replyPreviewEntities =>
+      replyToQuote?.entities ?? replyToEntities;
   int? replyToDate; // unix timestamp of the quoted message
   String? replyToSender; // resolved sender name of the quoted message
   String? replyToPreview; // one-line preview of the quoted message
+  List<MessageTextEntity> replyToEntities;
   TdFileRef? replyToImage; // thumbnail/photo shown inside the quote block
   int? replyToImageWidth;
   int? replyToImageHeight;
@@ -859,9 +936,25 @@ class ChatMessage {
   bool blockedByUser;
   List<MessageReaction> reactions = const [];
   String? forwardOrigin; // name of the original author when forwarded
+  String? forwardAuthorSignature; // signed author within the origin channel
   int? forwardFromUserId; // origin user, resolved lazily to forwardOrigin
   int? forwardFromChatId; // origin chat/channel, resolved lazily
   int? forwardFromMessageId; // original channel message when TDLib exposes it
+  int? viaBotUserId; // inline bot through which this message was sent
+  String? viaBotUsername; // resolved lazily to @username or bot display name
+
+  /// Whether TDLib supplied an inline-bot attribution (`via_bot_user_id > 0`).
+  bool get hasViaBotAttribution =>
+      (viaBotUserId != null && viaBotUserId! > 0) ||
+      (viaBotUsername?.trim().isNotEmpty ?? false);
+
+  /// Stable label for the `via @bot` header while the bot's username is being
+  /// resolved or when the bot only exposes a display name.
+  String get viaBotDisplayName {
+    final raw = viaBotUsername?.trim();
+    if (raw != null && raw.isNotEmpty) return raw;
+    return '@bot';
+  }
 
   /// Whether TDLib supplied enough forwarding metadata to render an
   /// attribution header, even while the display name is still being resolved.
@@ -875,7 +968,14 @@ class ChatMessage {
   /// flight or when Telegram intentionally hides the original name.
   String get forwardDisplayName {
     final name = forwardOrigin?.trim();
-    if (name != null && name.isNotEmpty) return name;
+    final signature = forwardAuthorSignature?.trim();
+    if (name != null && name.isNotEmpty) {
+      if (signature != null && signature.isNotEmpty && signature != name) {
+        return '$name ($signature)';
+      }
+      return name;
+    }
+    if (signature != null && signature.isNotEmpty) return signature;
     return AppStrings.t(AppStringKeys.groupManagementLogUnknownActor);
   }
 
@@ -1004,6 +1104,60 @@ class ChatMessage {
 
 enum MessageButtonStyle { standard, primary, danger, success }
 
+enum SwitchInlineTargetKind { currentChat, chooseChat, internalLink }
+
+class SwitchInlineTarget {
+  const SwitchInlineTarget.currentChat()
+    : kind = SwitchInlineTargetKind.currentChat,
+      allowUserChats = false,
+      allowBotChats = false,
+      allowGroupChats = false,
+      allowChannelChats = false,
+      internalLink = null;
+
+  const SwitchInlineTarget.chooseChat({
+    this.allowUserChats = true,
+    this.allowBotChats = true,
+    this.allowGroupChats = true,
+    this.allowChannelChats = true,
+  }) : kind = SwitchInlineTargetKind.chooseChat,
+       internalLink = null;
+
+  const SwitchInlineTarget.internalLink(Map<String, dynamic> this.internalLink)
+    : kind = SwitchInlineTargetKind.internalLink,
+      allowUserChats = false,
+      allowBotChats = false,
+      allowGroupChats = false,
+      allowChannelChats = false;
+
+  final SwitchInlineTargetKind kind;
+  final bool allowUserChats;
+  final bool allowBotChats;
+  final bool allowGroupChats;
+  final bool allowChannelChats;
+  final Map<String, dynamic>? internalLink;
+
+  bool get isCurrentChat => kind == SwitchInlineTargetKind.currentChat;
+
+  Set<ChatKind> get allowedChatKinds {
+    final kinds = <ChatKind>{
+      if (allowUserChats) ChatKind.privateChat,
+      if (allowBotChats) ChatKind.bot,
+      if (allowGroupChats) ChatKind.group,
+      if (allowChannelChats) ChatKind.channel,
+    };
+    if (kinds.isEmpty) {
+      return const {
+        ChatKind.privateChat,
+        ChatKind.bot,
+        ChatKind.group,
+        ChatKind.channel,
+      };
+    }
+    return kinds;
+  }
+}
+
 class MessageButton {
   const MessageButton({
     required this.text,
@@ -1013,6 +1167,7 @@ class MessageButton {
     this.userId,
     this.copyText,
     this.switchInlineQuery,
+    this.switchInlineTarget,
     this.requestId,
     this.suggestedName,
     this.suggestedUsername,
@@ -1028,6 +1183,7 @@ class MessageButton {
   final int? userId;
   final String? copyText;
   final String? switchInlineQuery;
+  final SwitchInlineTarget? switchInlineTarget;
   final int? requestId;
   final String? suggestedName;
   final String? suggestedUsername;
@@ -1044,6 +1200,13 @@ class MessageButton {
   bool get isWebApp =>
       type == 'inlineKeyboardButtonTypeWebApp' ||
       type == 'keyboardButtonTypeWebApp';
+
+  bool get isSwitchInline =>
+      type == 'inlineKeyboardButtonTypeSwitchInline' ||
+      switchInlineQuery != null;
+
+  bool get isSwitchInlineCurrentChat =>
+      isSwitchInline && (switchInlineTarget?.isCurrentChat ?? false);
 }
 
 class MessageLinkPreview {
@@ -1461,7 +1624,9 @@ abstract final class TDParse {
       lastMessageId: lastMessageId,
       date: date,
       unreadCount: unread,
+      lastReadInboxMessageId: chat.int64('last_read_inbox_message_id') ?? 0,
       unreadMentionCount: chat.integer('unread_mention_count') ?? 0,
+      unreadReactionCount: chat.integer('unread_reaction_count') ?? 0,
       order: order,
       isMuted: muted,
       kind: chatKind(chat),
@@ -1533,18 +1698,18 @@ abstract final class TDParse {
     final forwardInfo = message.obj('forward_info');
     final origin = forwardInfo?.obj('origin');
     final forwardSource = forwardInfo?.obj('source');
-    String? fwdName;
+    String? fwdName, fwdAuthorSignature;
     int? fwdUserId, fwdChatId, fwdMessageId;
     switch (origin?.type) {
       case 'messageOriginUser':
         fwdUserId = origin?.int64('sender_user_id');
       case 'messageOriginChat':
         fwdChatId = origin?.int64('sender_chat_id');
-        fwdName = origin?.str('author_signature');
+        fwdAuthorSignature = origin?.str('author_signature');
       case 'messageOriginChannel':
         fwdChatId = origin?.int64('chat_id');
         fwdMessageId = origin?.int64('message_id');
-        fwdName = origin?.str('author_signature');
+        fwdAuthorSignature = origin?.str('author_signature');
       case 'messageOriginHiddenUser':
         fwdName = origin?.str('sender_name');
     }
@@ -1557,10 +1722,29 @@ abstract final class TDParse {
     fwdMessageId ??= forwardSource?.int64('message_id');
     if (fwdMessageId != null && fwdMessageId <= 0) fwdMessageId = null;
 
+    final rawViaBotUserId = message.int64('via_bot_user_id');
+    final viaBotUserId = rawViaBotUserId != null && rawViaBotUserId > 0
+        ? rawViaBotUserId
+        : null;
+
     // 引用: reply_to is messageReplyToMessage { chat_id, message_id, … }.
     final replyTo = message.obj('reply_to');
     final replyToMessageId = replyTo?.type == 'messageReplyToMessage'
         ? replyTo?.int64('message_id')
+        : null;
+    final rawReplyToChatId = replyTo?.type == 'messageReplyToMessage'
+        ? replyTo?.int64('chat_id')
+        : null;
+    final replyToChatId = rawReplyToChatId == null || rawReplyToChatId == 0
+        ? null
+        : rawReplyToChatId;
+
+    // Which forum topic this message belongs to. TDLib reports it as a
+    // MessageTopic: messageTopicForum carries the forum topic id, while
+    // messageTopicThread is a non-forum thread this view never sections.
+    final topicRef = message.obj('topic_id');
+    final forumTopicId = topicRef?.type == 'messageTopicForum'
+        ? topicRef?.integer('forum_topic_id')
         : null;
 
     final parsedEntities = messageTextEntities(content);
@@ -1594,6 +1778,7 @@ abstract final class TDParse {
         text: displayText,
         date: date,
         chatId: chatId,
+        forumTopicId: forumTopicId,
         isService: service,
         isCall: isCall,
         callIsVideo: callIsVideo,
@@ -1608,6 +1793,8 @@ abstract final class TDParse {
             : const [],
         containsUnreadMention:
             message.boolean('contains_unread_mention') ?? false,
+        hasUnreadReactions:
+            (message.objects('unread_reactions') ?? const []).isNotEmpty,
         senderId: senderId,
         senderIsChat: sender?.type == 'messageSenderChat',
         senderTitle:
@@ -1624,6 +1811,7 @@ abstract final class TDParse {
         video: media.video,
         videoDuration: media.videoDuration,
         videoFileSize: media.videoFileSize,
+        hasSpoiler: content?.boolean('has_spoiler') ?? false,
         videoNoteTranscription: videoNoteSpeech(content).$1,
         videoNoteTranscriptionPending: videoNoteSpeech(content).$2,
         videoNoteTranscriptionError: videoNoteSpeech(content).$3,
@@ -1648,6 +1836,14 @@ abstract final class TDParse {
         summaryCard: summaryCard(message, content),
         summaryLanguageCode: message.str('summary_language_code') ?? '',
         replyToMessageId: isContentRestricted ? null : replyToMessageId,
+        replyToChatId: isContentRestricted ? null : replyToChatId,
+        replyToQuote: isContentRestricted
+            ? null
+            : textQuote(replyTo?.obj('quote')),
+        textQuoteSource: isContentRestricted
+            ? null
+            : formattedTextForContent(content)?.str('text'),
+        textQuoteSourceEntities: isContentRestricted ? null : parsedEntities,
         serviceUserIds: isContentRestricted
             ? const []
             : serviceUserIds(content, senderId),
@@ -1687,9 +1883,11 @@ abstract final class TDParse {
       )
       ..reactions = reactionsFrom(message)
       ..forwardOrigin = isContentRestricted ? null : fwdName
+      ..forwardAuthorSignature = isContentRestricted ? null : fwdAuthorSignature
       ..forwardFromUserId = isContentRestricted ? null : fwdUserId
       ..forwardFromChatId = isContentRestricted ? null : fwdChatId
-      ..forwardFromMessageId = isContentRestricted ? null : fwdMessageId;
+      ..forwardFromMessageId = isContentRestricted ? null : fwdMessageId
+      ..viaBotUserId = isContentRestricted ? null : viaBotUserId;
   }
 
   /// Returns the server-provided reason that makes a chat or message
@@ -1966,6 +2164,10 @@ abstract final class TDParse {
     final loginUrl = type?.obj('url');
     final webApp = type?.obj('web_app');
     final copyText = type?.obj('copy_text')?.str('text');
+    final switchInlineTarget =
+        typeName == 'inlineKeyboardButtonTypeSwitchInline'
+        ? _switchInlineTarget(type)
+        : null;
     return MessageButton(
       text: text,
       type: typeName,
@@ -1974,6 +2176,7 @@ abstract final class TDParse {
       userId: type?.int64('user_id'),
       copyText: type?.str('text') ?? copyText,
       switchInlineQuery: type?.str('query'),
+      switchInlineTarget: switchInlineTarget,
       requestId: type?.integer('id'),
       suggestedName: type?.str('suggested_name'),
       suggestedUsername: type?.str('suggested_username'),
@@ -1981,6 +2184,32 @@ abstract final class TDParse {
       iconCustomEmojiId: button.int64('icon_custom_emoji_id') ?? 0,
       isReplyKeyboard: isReplyKeyboard,
     );
+  }
+
+  static SwitchInlineTarget _switchInlineTarget(Map<String, dynamic>? type) {
+    final targetChat = type?.obj('target_chat');
+    if (targetChat != null) {
+      switch (targetChat.type) {
+        case 'targetChatCurrent':
+          return const SwitchInlineTarget.currentChat();
+        case 'targetChatChosen':
+          final types = targetChat.obj('types');
+          if (types == null) return const SwitchInlineTarget.chooseChat();
+          return SwitchInlineTarget.chooseChat(
+            allowUserChats: types.boolean('allow_user_chats') ?? false,
+            allowBotChats: types.boolean('allow_bot_chats') ?? false,
+            allowGroupChats: types.boolean('allow_group_chats') ?? false,
+            allowChannelChats: types.boolean('allow_channel_chats') ?? false,
+          );
+        case 'targetChatInternalLink':
+          final link = targetChat.obj('link');
+          if (link != null) return SwitchInlineTarget.internalLink(link);
+      }
+    }
+    if (type?.boolean('in_current_chat') == true) {
+      return const SwitchInlineTarget.currentChat();
+    }
+    return const SwitchInlineTarget.chooseChat();
   }
 
   /// Extracts textEntityTypeCustomEmoji spans from a formattedText object.
@@ -2024,6 +2253,18 @@ abstract final class TDParse {
       return _richMessageText(content.obj('message'))?.entities ?? const [];
     }
     return textEntities(formattedTextForContent(content));
+  }
+
+  static MessageTextQuote? textQuote(Map<String, dynamic>? quote) {
+    final formatted = quote?.obj('text');
+    final text = formatted?.str('text');
+    if (text == null || text.isEmpty) return null;
+    return MessageTextQuote(
+      text: text,
+      position: quote?.integer('position') ?? 0,
+      entities: textEntities(formatted),
+      isManual: quote?.boolean('is_manual') ?? true,
+    );
   }
 
   static List<MessageTextEntity> textEntities(Map<String, dynamic>? ft) {
@@ -2144,8 +2385,33 @@ abstract final class TDParse {
             'inlineKeyboardButtonTypeSwitchInline',
           {'switch_inline_query': final Object? query} when query != null =>
             'inlineKeyboardButtonTypeSwitchInline',
+          {'switch_inline_query_chosen_chat': final Object? chosen}
+              when chosen != null =>
+            'inlineKeyboardButtonTypeSwitchInline',
           _ => '',
         };
+    final chosenChat =
+        button.obj('switch_inline_query_chosen_chat') ??
+        action.obj('switch_inline_query_chosen_chat');
+    final switchInlineTarget =
+        actionType == 'inlineKeyboardButtonTypeSwitchInline'
+        ? action.obj('target_chat') != null ||
+                  action.containsKey('in_current_chat')
+              ? _switchInlineTarget(action)
+              : button.containsKey('switch_inline_query_current_chat')
+              ? const SwitchInlineTarget.currentChat()
+              : chosenChat != null
+              ? SwitchInlineTarget.chooseChat(
+                  allowUserChats:
+                      chosenChat.boolean('allow_user_chats') ?? false,
+                  allowBotChats: chosenChat.boolean('allow_bot_chats') ?? false,
+                  allowGroupChats:
+                      chosenChat.boolean('allow_group_chats') ?? false,
+                  allowChannelChats:
+                      chosenChat.boolean('allow_channel_chats') ?? false,
+                )
+              : const SwitchInlineTarget.chooseChat()
+        : null;
     return MessageButton(
       text: label,
       type: actionType,
@@ -2159,7 +2425,9 @@ abstract final class TDParse {
       switchInlineQuery:
           action.str('query') ??
           button.str('switch_inline_query_current_chat') ??
-          button.str('switch_inline_query'),
+          button.str('switch_inline_query') ??
+          chosenChat?.str('query'),
+      switchInlineTarget: switchInlineTarget,
       style: _richButtonStyle(button['style']),
       iconCustomEmojiId: button.int64('icon_custom_emoji_id') ?? 0,
     );
@@ -2615,10 +2883,12 @@ abstract final class TDParse {
         _splitMarkdownTableRow(trimmed).length >= 2;
   }
 
+  static final _markdownSeparatorCell = RegExp(r'^:?-{3,}:?$');
+
   static bool _looksLikeMarkdownSeparatorRow(String line) {
     final cells = _splitMarkdownTableRow(line);
     if (cells.length < 2) return false;
-    return cells.every((cell) => RegExp(r'^:?-{3,}:?$').hasMatch(cell.trim()));
+    return cells.every((cell) => _markdownSeparatorCell.hasMatch(cell.trim()));
   }
 
   static List<RichMessageTableCell> _markdownTableCells(
@@ -3543,6 +3813,31 @@ abstract final class TDParse {
     );
   }
 
+  static MediaAttachment _messageStickerMedia(
+    Map<String, dynamic> sticker, {
+    bool isAnimatedEmoji = false,
+  }) {
+    final thumb = fileRef(sticker.obj('thumbnail')?.obj('file'));
+    final stickerFile = fileRef(sticker.obj('sticker'));
+    final fmt = sticker.obj('format')?.type;
+    final isTgs = fmt == 'stickerFormatTgs';
+    final isWebm = fmt == 'stickerFormatWebm';
+    return MediaAttachment(
+      // Static (.webp) stickers are shown directly via `image`, so point at
+      // the full sticker file — the thumbnail is low-res and looks blurry
+      // scaled up. Animated (.tgs) / video (.webm) keep the thumb only as a
+      // placeholder behind the rendered animation.
+      image: (isTgs || isWebm) ? thumb : (stickerFile ?? thumb),
+      width: sticker.integer('width'),
+      height: sticker.integer('height'),
+      animated: isTgs ? stickerFile : null,
+      videoSticker: isWebm ? stickerFile : null,
+      stickerFileId: stickerFile?.id,
+      stickerSetId: sticker.int64('set_id'),
+      isAnimatedEmoji: isAnimatedEmoji,
+    );
+  }
+
   static MediaAttachment _paidMediaAttachment(Map<String, dynamic> media) {
     return switch (media.type) {
       'paidMediaPhoto' => photoAttachment(media.obj('photo')),
@@ -3575,48 +3870,13 @@ abstract final class TDParse {
         }
       case 'messageSticker':
         final sticker = content.obj('sticker');
-        if (sticker != null) {
-          final thumb = fileRef(sticker.obj('thumbnail')?.obj('file'));
-          final stickerFile = fileRef(sticker.obj('sticker'));
-          final w = sticker.integer('width'), h = sticker.integer('height');
-          final fmt = sticker.obj('format')?.type;
-          final isTgs = fmt == 'stickerFormatTgs';
-          final isWebm = fmt == 'stickerFormatWebm';
-          return MediaAttachment(
-            // Static (.webp) stickers are shown directly via `image`, so point at
-            // the full sticker file — the thumbnail is low-res and looks blurry
-            // scaled up. Animated (.tgs) / video (.webm) keep the thumb only as a
-            // placeholder behind the rendered animation.
-            image: (isTgs || isWebm) ? thumb : (stickerFile ?? thumb),
-            width: w,
-            height: h,
-            animated: isTgs ? stickerFile : null,
-            videoSticker: isWebm ? stickerFile : null,
-            stickerFileId: stickerFile?.id,
-            stickerSetId: sticker.int64('set_id'),
-          );
-        }
+        if (sticker != null) return _messageStickerMedia(sticker);
       case 'messageAnimatedEmoji':
         // A lone emoji → TDLib sends its animated sticker (usually .tgs); render
         // it like a sticker so single emoji animate instead of "[动画表情]" text.
         final sticker = content.obj('animated_emoji')?.obj('sticker');
         if (sticker != null) {
-          final thumb = fileRef(sticker.obj('thumbnail')?.obj('file'));
-          final stickerFile = fileRef(sticker.obj('sticker'));
-          final w = sticker.integer('width'), h = sticker.integer('height');
-          final fmt = sticker.obj('format')?.type;
-          final isTgs = fmt == 'stickerFormatTgs';
-          final isWebm = fmt == 'stickerFormatWebm';
-          return MediaAttachment(
-            image: (isTgs || isWebm) ? thumb : (stickerFile ?? thumb),
-            width: w,
-            height: h,
-            animated: isTgs ? stickerFile : null,
-            videoSticker: isWebm ? stickerFile : null,
-            stickerFileId: stickerFile?.id,
-            stickerSetId: sticker.int64('set_id'),
-            isAnimatedEmoji: true,
-          );
+          return _messageStickerMedia(sticker, isAnimatedEmoji: true);
         }
       case 'messageAnimation':
         final anim = content.obj('animation');
@@ -4091,6 +4351,7 @@ abstract final class TDParse {
     return TdFileRef(
       id: ref.id,
       localPath: ref.localPath,
+      size: ref.size,
       miniThumb: ref.miniThumb,
       thumbnail: ref.thumbnail,
       hasAnimation: photoInfo.boolean('has_animation') ?? false,
@@ -4122,6 +4383,7 @@ abstract final class TDParse {
       localPath: completedLocalPath,
       fileName: fileName,
       mimeType: mimeType,
+      size: _fileSize(file),
       miniThumb: miniThumb,
       thumbnail: normalizedThumbnail,
     );
@@ -4198,7 +4460,15 @@ abstract final class TDParse {
 
   // MARK: Users
 
+  /// A TDLib account whose owner deleted it. It keeps its id and history, but
+  /// has no name of its own and can receive nothing.
+  static bool isDeletedUser(Map<String, dynamic> user) =>
+      user.obj('type')?.type == 'userTypeDeleted';
+
   static String userName(Map<String, dynamic> user) {
+    if (isDeletedUser(user)) {
+      return AppStrings.t(AppStringKeys.chatDeletedAccountName);
+    }
     final first = user.str('first_name') ?? '';
     final last = user.str('last_name') ?? '';
     final full = [first, last].where((s) => s.isNotEmpty).join(' ');

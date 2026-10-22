@@ -27,6 +27,7 @@ import UserNotifications
   private var telegramPasskeyBridge: TelegramPasskeyBridge?
   private var premiumAuthPurchaseBridge: PremiumAuthPurchaseBridge?
   private var mithkaProBridge: MithkaProBridge?
+  private var nowPlayingBridge: NowPlayingBridge?
   private var applePCCBridge: ApplePCCBridge?
   private var privacyShieldView: UIView?
 
@@ -171,6 +172,47 @@ import UserNotifications
     guard !didRegisterFlutterPlugins else { return }
     didRegisterFlutterPlugins = true
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    if let registrar = engineBridge.pluginRegistry.registrar(forPlugin: "NativeGlassSurface") {
+      registrar.register(NativeGlassSurfaceFactory(registrar: registrar), withId: "mithka/native_glass")
+    }
+    let windowGeometryChannel = FlutterMethodChannel(
+      name: "mithka/window_geometry",
+      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+    )
+    windowGeometryChannel.setMethodCallHandler { call, result in
+      guard call.method == "sideNavigationGeometry", let window = Self.keyWindow() else {
+        result(nil)
+        return
+      }
+      var bottom: CGFloat = 0
+      let insets = window.safeAreaInsets
+      let sideWidth = max(insets.left, insets.right)
+      guard sideWidth >= 64, window.bounds.height > 0 else {
+        result(nil)
+        return
+      }
+      let side = CGRect(
+        x: insets.right >= insets.left ? window.bounds.maxX - sideWidth : 0,
+        y: 0, width: sideWidth, height: window.bounds.height
+      )
+      if let scene = window.windowScene, let manager = scene.statusBarManager {
+        let frame = window.convert(manager.statusBarFrame, from: scene.coordinateSpace)
+        if frame.intersects(side) { bottom = max(bottom, frame.maxY) }
+      }
+      #if compiler(>=6.4)
+      if #available(iOS 27.1, *) {
+        for region in window.reservedRegions(kind: .occlusion) where region.isActive {
+          if region.frame.intersects(side) { bottom = max(bottom, region.frame.maxY) }
+        }
+      }
+      #endif
+      // Do not invent usable space when the system reserves the whole edge.
+      var geometry: [String: Any] = [:]
+      if bottom > 0 && bottom < window.bounds.height {
+        geometry["topFraction"] = Double((bottom + 8) / window.bounds.height)
+      }
+      result(geometry)
+    }
     HandoffBridge.shared.register(
       messenger: engineBridge.applicationRegistrar.messenger()
     )
@@ -206,6 +248,31 @@ import UserNotifications
             )
           )
         }
+        return
+      }
+      if call.method == "writeImage" {
+        guard let bytes = call.arguments as? FlutterStandardTypedData, !bytes.data.isEmpty else {
+          result(false)
+          return
+        }
+        let data = bytes.data
+        let type: String
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) {
+          type = "public.png"
+        } else if data.starts(with: [0x47, 0x49, 0x46, 0x38]) {
+          type = "com.compuserve.gif"
+        } else if data.starts(with: [0xFF, 0xD8, 0xFF]) {
+          type = "public.jpeg"
+        } else if data.count >= 12,
+                  data.starts(with: [0x52, 0x49, 0x46, 0x46]),
+                  data[8..<12].elementsEqual([0x57, 0x45, 0x42, 0x50]) {
+          type = "org.webmproject.webp"
+        } else {
+          result(false)
+          return
+        }
+        UIPasteboard.general.setData(data, forPasteboardType: type)
+        result(true)
         return
       }
       guard call.method == "readImage" else {
@@ -501,6 +568,9 @@ import UserNotifications
       messenger: engineBridge.applicationRegistrar.messenger()
     )
     mithkaProBridge = MithkaProBridge(
+      messenger: engineBridge.applicationRegistrar.messenger()
+    )
+    nowPlayingBridge = NowPlayingBridge(
       messenger: engineBridge.applicationRegistrar.messenger()
     )
     applePCCBridge = ApplePCCBridge(

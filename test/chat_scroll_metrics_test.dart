@@ -71,13 +71,27 @@ void main() {
 
   test('desktop split replacements prepare chat geometry before setState', () {
     final source = File('lib/app/main_tab_view.dart').readAsStringSync();
-    final selectionStart = source.indexOf('onChatSelected: (chat) {');
+    // Every entry point that changes the pane goes through _showMessageChat, and
+    // that helper must prepare the exit geometry before it replaces the pane.
+    final showStart = source.indexOf('void _showMessageChat(');
+    final showEnd = source.indexOf(
+      'void _prepareMessageChatReplacement(',
+      showStart,
+    );
+    expect(showStart, greaterThanOrEqualTo(0));
+    expect(showEnd, greaterThan(showStart));
+    final show = source.substring(showStart, showEnd);
+    expect(
+      show.indexOf('_prepareMessageChatReplacement(next);'),
+      lessThan(show.indexOf('setState(() {')),
+    );
+    // The chat list must not bypass it: a direct selection assignment would skip
+    // the geometry snapshot and lose the reader's place.
+    final selectionStart = source.indexOf('onChatSelected: _showMessageChat');
+    expect(selectionStart, greaterThanOrEqualTo(0));
     final selectionEnd = source.indexOf('onCommunitySelected:', selectionStart);
     final selection = source.substring(selectionStart, selectionEnd);
-    expect(
-      selection.indexOf('_prepareMessageChatReplacement(chat);'),
-      lessThan(selection.indexOf('setState(() {')),
-    );
+    expect(selection, isNot(contains('setState(')));
 
     final replacementStart = source.indexOf(
       'void _prepareMessageChatReplacement(',
@@ -165,6 +179,37 @@ void main() {
     expect(mountedGuard, lessThan(loadedFastPath));
   });
 
+  test('reply jumps flash their reached destination on desktop', () {
+    final source = File('lib/chat/chat_view.dart').readAsStringSync();
+    final openStart = source.indexOf('Future<void> _openReplyMessage(');
+    final openEnd = source.indexOf(
+      'Future<bool> _scrollToMessageAndReport(',
+      openStart,
+    );
+    expect(openStart, greaterThanOrEqualTo(0));
+    expect(openEnd, greaterThan(openStart));
+    final open = source.substring(openStart, openEnd);
+    expect(open, contains('final didReachTarget = await'));
+    expect(open, contains('if (!didReachTarget || !mounted) return;'));
+    expect(open, contains('isDesktopTargetPlatform'));
+    expect(open, contains('_flashLinkedMessageHighlight(messageId)'));
+
+    final highlightStart = source.indexOf(
+      'Widget _messageNavigationHighlight(',
+    );
+    final highlightEnd = source.indexOf(
+      'TranscriptPivotPartition<_TranscriptEntry> _partitionTranscript(',
+      highlightStart,
+    );
+    expect(highlightStart, greaterThanOrEqualTo(0));
+    expect(highlightEnd, greaterThan(highlightStart));
+    final highlight = source.substring(highlightStart, highlightEnd);
+    expect(highlight, contains('_linkedMessageHighlightId'));
+    expect(highlight, contains('_linkedMessageHighlightActive'));
+    expect(highlight, contains('? 0.18'));
+    expect(highlight, contains('AnimatedContainer('));
+  });
+
   test('session unread history loads carry cancellation through mutation', () {
     final viewSource = File('lib/chat/chat_view.dart').readAsStringSync();
     final sessionJumpStart = viewSource.indexOf(
@@ -236,7 +281,7 @@ void main() {
     expect(firstPostAwaitCancellation, lessThan(targetParse));
 
     final secondAwait = modelMethod.indexOf(
-      'final response = await _client.query(',
+      'final response = await _queryHistory(',
       targetParse,
     );
     final secondPostAwaitCancellation = modelMethod.indexOf(
@@ -372,6 +417,55 @@ void main() {
     expect(ensure, contains('final activeKey = _targetKey;'));
     expect(ensure, isNot(contains('_pinnedKey')));
     expect(ensure, contains('!_isCurrentScrollTarget'));
+  });
+
+  test('offscreen message navigation stages and settles the target', () {
+    final source = File('lib/chat/chat_view.dart').readAsStringSync();
+    final initialStart = source.indexOf(
+      'Future<void> _positionInitialTranscript()',
+    );
+    final initialEnd = source.indexOf(
+      'void _jumpToInitialEstimate()',
+      initialStart,
+    );
+    final initialPositioning = source.substring(initialStart, initialEnd);
+    expect(
+      initialPositioning,
+      contains('_stageMessageAtTranscriptCenter(initialTarget)'),
+    );
+
+    final ensureStart = source.indexOf(
+      'Future<bool> _ensureMessageVisibleAndReport(',
+    );
+    final ensureEnd = source.indexOf(
+      'Future<bool> _alignMessageTarget(',
+      ensureStart,
+    );
+    final ensure = source.substring(ensureStart, ensureEnd);
+    final stage = ensure.indexOf('_stageMessageAtTranscriptCenter(messageId)');
+    final frame = ensure.indexOf(
+      'await WidgetsBinding.instance.endOfFrame;',
+      stage,
+    );
+    expect(stage, greaterThanOrEqualTo(0));
+    expect(frame, greaterThan(stage));
+    expect(
+      ensure,
+      isNot(
+        contains('Future<void>.delayed(const Duration(milliseconds: 120))'),
+      ),
+    );
+
+    final alignStart = ensureEnd;
+    final alignEnd = source.indexOf(
+      'Future<bool> _alignPinnedMessage(',
+      alignStart,
+    );
+    final align = source.substring(alignStart, alignEnd);
+    expect(align, contains('for (var pass = 0; pass < 3; pass++)'));
+    expect(align, contains('await Scrollable.ensureVisible('));
+    expect(align, contains('await WidgetsBinding.instance.endOfFrame;'));
+    expect(align, contains('const Duration(milliseconds: 80)'));
   });
 
   test('short transcript positioning is awaited and cancelable', () {

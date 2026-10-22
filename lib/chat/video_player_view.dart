@@ -18,16 +18,23 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fvp/fvp.dart';
 import 'package:mithka/l10n/app_localizations.dart';
+import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 import '../app/app_navigator.dart';
+import '../app/ipad_window_chrome.dart';
 import '../app/video_split_controller.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
+import '../media/media_metadata.dart';
+import '../media/media_metadata_dialog.dart';
+import '../media/video_playback_reporting.dart';
 import '../media/video_view_compatibility.dart';
+import '../platform/fullscreen_system_ui.dart';
+import '../platform/keyboard_modifiers.dart';
 import '../platform/player_brightness.dart';
 import '../platform/player_system_volume.dart';
 import '../platform/screen_wakelock.dart';
@@ -35,9 +42,12 @@ import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
 import '../tdlib/td_image_loader.dart';
 import '../tdlib/td_models.dart';
+import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
+import '../theme/theme_controller.dart';
 import 'chat_picker_view.dart';
 import 'forward_options.dart';
+import 'media_download_service.dart';
 import 'media_library_saver.dart';
 import 'td_video_stream_server.dart';
 import 'video_playback_preferences.dart';
@@ -167,6 +177,7 @@ class VideoPlayerView extends StatefulWidget {
     this.onFVideoPictureInPictureRestore,
     this.onToggleFullscreen,
     this.streamQuery,
+    this.thumbnailProvider,
   });
 
   final TdFileRef video;
@@ -201,6 +212,10 @@ class VideoPlayerView extends StatefulWidget {
   /// Overrides TDLib file queries for deterministic host tests.
   @visibleForTesting
   final TdVideoStreamQuery? streamQuery;
+
+  /// Overrides native thumbnail generation for deterministic host tests.
+  @visibleForTesting
+  final FVideoThumbnailProvider? thumbnailProvider;
 
   @override
   State<VideoPlayerView> createState() => _VideoPlayerViewState();
@@ -248,12 +263,19 @@ class VideoOnDemandPlayerView extends StatefulWidget {
       _VideoOnDemandPlayerViewState();
 }
 
-class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView> {
+class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView>
+    with SingleTickerProviderStateMixin {
   late VideoPlaybackQueue _queue = widget.queue;
   late Duration? _initialPosition = widget.initialPosition;
   late bool _initialPlaying = widget.initialPlaying;
   late double _lastAudibleVolume;
   late bool _muted;
+  late final AnimationController _queueTransition = AnimationController(
+    vsync: this,
+    duration: AppMotion.deliberate,
+    value: 1,
+  );
+  int _queueTransitionDirection = 1;
 
   @override
   void initState() {
@@ -269,6 +291,9 @@ class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView> {
   void didUpdateWidget(covariant VideoOnDemandPlayerView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.queue != oldWidget.queue) {
+      if (widget.queue.current.video.id != _queue.current.video.id) {
+        _startQueueTransition(widget.queue.index >= _queue.index ? 1 : -1);
+      }
       _queue = widget.queue;
       _initialPosition = widget.initialPosition;
       _initialPlaying = widget.initialPlaying;
@@ -288,18 +313,36 @@ class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView> {
       _initialPosition = null;
       _initialPlaying = true;
     });
+    _startQueueTransition(delta);
     widget.onQueueChanged?.call(next);
   }
 
   void _selectOnDemandItem(int index) {
     final next = _queue.moveTo(index);
     if (next == null || identical(next, _queue)) return;
+    final direction = index >= _queue.index ? 1 : -1;
     setState(() {
       _queue = next;
       _initialPosition = null;
       _initialPlaying = true;
     });
+    _startQueueTransition(direction);
     widget.onQueueChanged?.call(next);
+  }
+
+  void _startQueueTransition(int direction) {
+    _queueTransitionDirection = direction >= 0 ? 1 : -1;
+    if (AppMotion.isReduced(context)) {
+      _queueTransition.value = 1;
+    } else {
+      _queueTransition.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _queueTransition.dispose();
+    super.dispose();
   }
 
   void _handleVolumeChanged(double volume) {
@@ -314,7 +357,7 @@ class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView> {
   @override
   Widget build(BuildContext context) {
     final item = _queue.current;
-    return VideoPlayerView(
+    final player = VideoPlayerView(
       key: ValueKey(
         '${item.accountSlot ?? 'active'}:${item.video.id}:${item.messageId ?? 0}',
       ),
@@ -353,6 +396,24 @@ class _VideoOnDemandPlayerViewState extends State<VideoOnDemandPlayerView> {
             streamQuery: widget.streamQuery,
           ),
     );
+    return ColoredBox(
+      color: Colors.black,
+      child: AnimatedBuilder(
+        animation: _queueTransition,
+        child: player,
+        builder: (context, child) {
+          final arrival = AppMotion.standard.transform(_queueTransition.value);
+          return Opacity(
+            key: const ValueKey('video-queue-arrival'),
+            opacity: 0.35 + arrival * 0.65,
+            child: Transform.translate(
+              offset: Offset(0, _queueTransitionDirection * (1 - arrival) * 44),
+              child: child,
+            ),
+          );
+        },
+      ),
+    );
   }
 }
 
@@ -361,6 +422,12 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   late final TdVideoStreamQuery _streamQuery =
       widget.streamQuery ?? tdVideoStreamQueryForAccount(widget.accountSlot);
   VideoPlayerController? _controller;
+  late final _playbackDiagnostics = VideoPlaybackDiagnostics(
+    location: VideoPlaybackLocation.player,
+    mimeType: widget.video.mimeType,
+    width: widget.width,
+    height: widget.height,
+  );
   bool _failed = false;
   bool _moreMenuVisible = false;
   bool _modeMenuVisible = false;
@@ -383,6 +450,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   Object? _lastControllerInitializationError;
   Timer? _streamStallTimer;
   Duration? _streamStallPosition;
+  bool _appInForeground = true;
   bool _retryInFlight = false;
   bool _retryFromPlaybackSnapshot = false;
   bool _lastKnownPlaybackWasPlaying = false;
@@ -402,6 +470,11 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   bool? _lastSystemPiPMuted;
   Rect? _lastSystemPiPSourceRect;
   FVideoActions? _reusablePlayerActions;
+
+  /// Control visibility for the loading chrome, which mithka owns until the
+  /// package player takes over. Reset whenever playback re-enters loading.
+  bool _loadingControlsVisible = true;
+  _LoadingVideoActions? _loadingActions;
   bool _debuggerVisible = false;
   bool _onDemandPanelVisible = false;
   final List<String> _debugEvents = <String>[];
@@ -423,6 +496,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   Duration _gestureStartPosition = Duration.zero;
   Duration _gestureSeekPosition = Duration.zero;
   int _gestureNavigationDelta = 0;
+  Timer? _heldSeekTimer;
+  int _heldSeekDirection = 0;
+  bool _heldSeekInFlight = false;
+  Timer? _touchControlsHideTimer;
   double _videoZoomScale = 1;
   Offset _videoZoomOffset = Offset.zero;
   Rect _videoZoomViewport = Rect.zero;
@@ -453,7 +530,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     debugLabel: 'video-display-mode-button',
   );
   final List<FocusNode> _moreMenuFocusNodes = List<FocusNode>.generate(
-    4,
+    6,
     (index) => FocusNode(debugLabel: 'video-more-menu-action-$index'),
   );
   final Map<VideoDisplayMode, FocusNode> _modeMenuFocusNodes = {
@@ -518,6 +595,8 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appInForeground = state == AppLifecycleState.resumed;
+    _syncStreamStallRecovery(_controller?.value);
     // Leaving the app is where the resume position has to become durable: the
     // process may never be resumed, and the periodic save is coarse.
     if (state == AppLifecycleState.hidden ||
@@ -612,12 +691,23 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       mimeType: widget.video.mimeType,
     );
     _streamServer = server;
-    final uri = await server.start();
+    Uri? uri;
+    Object? sourceError;
+    try {
+      uri = await server.start();
+    } catch (error) {
+      sourceError = error;
+    }
     if (!mounted) {
       unawaited(server.close());
       return;
     }
     if (uri == null) {
+      _playbackDiagnostics.recordFailure(
+        sourceError,
+        stage: VideoFailureStage.source,
+        source: VideoPlaybackSource.loopback,
+      );
       if (await _recoverFromCompletedFile(
         releaseActiveController: false,
         resumeOverride: resumeOverride,
@@ -680,6 +770,13 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       return;
     }
     if (!mounted) return;
+    if (!prepared) {
+      _playbackDiagnostics.recordFailure(
+        null,
+        stage: VideoFailureStage.source,
+        source: VideoPlaybackSource.loopback,
+      );
+    }
     if (await _recoverFromCompletedFile(
       releaseActiveController: false,
       resumeOverride: resumeOverride,
@@ -702,7 +799,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
         '@type': 'getFile',
         'file_id': widget.video.id,
       });
-      return _validatedCompletedVideoPath(file);
+      return await _validatedCompletedVideoPath(file);
     } catch (_) {
       return null;
     }
@@ -723,7 +820,11 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     }
     try {
       return await operation.timeout(const Duration(minutes: 5));
-    } on TimeoutException {
+    } on TimeoutException catch (error) {
+      _playbackDiagnostics.recordFailure(
+        error,
+        stage: VideoFailureStage.download,
+      );
       debugPrint(
         'VideoPlayerView full-file fallback timed out for '
         '${widget.video.id}; retaining the in-flight request.',
@@ -742,8 +843,12 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
         'limit': 0,
         'synchronous': true,
       });
-      return _validatedCompletedVideoPath(file);
+      return await _validatedCompletedVideoPath(file);
     } catch (error) {
+      _playbackDiagnostics.recordFailure(
+        error,
+        stage: VideoFailureStage.download,
+      );
       debugPrint(
         'VideoPlayerView full-file fallback failed for '
         '${widget.video.id}: $error',
@@ -839,9 +944,16 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     Duration? resumeOverride,
     bool? playOverride,
   }) async {
+    _playbackDiagnostics.beginAttempt(
+      source: c.dataSourceType == DataSourceType.file
+          ? VideoPlaybackSource.file
+          : VideoPlaybackSource.loopback,
+      viewType: c.viewType,
+    );
     _lastControllerInitializationError = null;
     try {
       await c.initialize().timeout(const Duration(seconds: 45));
+      _playbackDiagnostics.initialized(value: c.value);
       await c.setLooping(false);
       await c.setPlaybackSpeed(_speed);
       await c.setVolume(_controllerGainForCurrentVolume);
@@ -857,6 +969,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       _lastKnownPlaybackWasPlaying = shouldPlay;
     } catch (error, stackTrace) {
       _lastControllerInitializationError = error;
+      _playbackDiagnostics.recordFailure(
+        error,
+        stage: VideoFailureStage.initialization,
+      );
       debugPrint(
         'VideoPlayerView failed to initialize ${c.dataSource}: $error\n'
         '$stackTrace',
@@ -873,6 +989,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       '${_debugTimestamp()}  controller ready  ${_fmt(c.value.duration)}',
     );
     setState(() => _controller = c);
+    _syncStreamStallRecovery(c.value);
     if (_usesAndroidSystemMediaVolume) {
       unawaited(_syncAndroidSystemVolume(c));
     }
@@ -976,6 +1093,13 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       return;
     }
     debugPrint('VideoPlayerView runtime error for ${widget.video.id}: $error');
+    _playbackDiagnostics.recordFailure(
+      controller.value.errorDescription ?? error,
+      stage: requireControllerError
+          ? VideoFailureStage.playback
+          : VideoFailureStage.stall,
+      reason: requireControllerError ? null : VideoFailureReason.stalled,
+    );
     final isNetworkSource =
         source.startsWith('http://') || source.startsWith('https://');
     if (!isNetworkSource) {
@@ -1086,6 +1210,13 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       if (initialized) {
         server.startBackgroundDownload();
         return;
+      }
+      if (!prepared) {
+        _playbackDiagnostics.recordFailure(
+          null,
+          stage: VideoFailureStage.source,
+          source: VideoPlaybackSource.loopback,
+        );
       }
       final recovered = await _recoverFromCompletedFile(
         releaseActiveController: false,
@@ -1199,6 +1330,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       setState(() {
         _controller = null;
         _failed = false;
+        _loadingControlsVisible = true;
       });
     }
     _updateWakelock();
@@ -1220,6 +1352,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     bool preservePlaybackSnapshot = false,
   }) {
     if (!mounted) return;
+    _playbackDiagnostics.reportTerminal(
+      streamRecoveries: _automaticStreamRecoveryCount,
+      completedFileFallback: _completedFileRecoveryAttempted,
+    );
     if (preservePlaybackSnapshot) _retryFromPlaybackSnapshot = true;
     setState(() => _failed = true);
     showToast(context, messageKey);
@@ -1261,7 +1397,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       _localPath = null;
       _retryFromPlaybackSnapshot =
           resumeOverride != null || playOverride != null;
-      setState(() => _failed = false);
+      setState(() {
+        _failed = false;
+        _loadingControlsVisible = true;
+      });
       await _load(resumeOverride: resumeOverride, playOverride: playOverride);
       if (_controller != null) _retryFromPlaybackSnapshot = false;
     } finally {
@@ -1291,13 +1430,16 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   void _syncStreamStallRecovery(VideoPlayerValue? value) {
     final controller = _controller;
     final source = _localPath;
+    final wasPlayingBeforeBuffering =
+        value?.isBuffering == true && _lastKnownPlaybackWasPlaying;
     final shouldWatch =
         controller != null &&
         value != null &&
         value.isInitialized &&
-        value.isBuffering &&
+        (value.isPlaying || wasPlayingBeforeBuffering) &&
         !value.hasError &&
-        _lastKnownPlaybackWasPlaying &&
+        !_completionHandled &&
+        _appInForeground &&
         source != null &&
         (source.startsWith('http://') || source.startsWith('https://')) &&
         _streamServer != null &&
@@ -1328,12 +1470,22 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       final stalledAt = _streamStallPosition;
       _streamStallPosition = null;
       if (!mounted ||
+          !identical(activeController, controller) ||
           activeController == null ||
           activeValue == null ||
-          !activeValue.isBuffering ||
-          stalledAt == null ||
-          (activeValue.position - stalledAt).abs() >=
-              const Duration(milliseconds: 250)) {
+          !(activeValue.isPlaying ||
+              (activeValue.isBuffering && _lastKnownPlaybackWasPlaying)) ||
+          activeValue.hasError ||
+          _completionHandled ||
+          !_appInForeground ||
+          _systemPiPHandoff ||
+          _systemPiPBusy ||
+          stalledAt == null) {
+        return;
+      }
+      if ((activeValue.position - stalledAt).abs() >=
+          const Duration(milliseconds: 250)) {
+        _syncStreamStallRecovery(activeValue);
         return;
       }
       _recoverAfterStreamFailure(
@@ -1745,7 +1897,12 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       final server = _streamServer;
       final shouldCancelOnStop =
           !_openedCompletedLocalFile && _progress?.isCompleted != true;
-      var restoreAccepted = false;
+      final handlers = _fVideoPictureInPictureSessionHandlers(
+        c,
+        id: handoffId,
+        server: server,
+        shouldCancelOnStop: shouldCancelOnStop,
+      );
       started = await FVideoPictureInPicture.start(
         id: handoffId,
         uri: uri,
@@ -1762,33 +1919,8 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
         onEntered: _handleFVideoPictureInPictureEntered,
         onRestored: _handleFVideoPictureInPictureRestored,
         onActionRequested: _handleFVideoPictureInPictureAction,
-        onRestoreRequested: (position) async {
-          final accepted = await _restoreFVideoPictureInPicture(position);
-          restoreAccepted = accepted;
-          return accepted;
-        },
-        onStop: (finalPosition) async {
-          if (_usesAndroidFVideoPictureInPicture && mounted) {
-            _systemPiPPrepared = false;
-            _systemPiPId = null;
-            _systemPiPActive = false;
-            _streamServer = null;
-            try {
-              await c.pause();
-            } catch (_) {}
-            if (mounted) _close();
-          }
-          if (finalPosition != null) {
-            await _storeResumePosition(finalPosition, c.value.duration);
-          }
-          if (FVideoPictureInPicture.usesActivePlayer(handoffId)) {
-            await c.dispose();
-          }
-          await server?.close();
-          if (shouldCancelOnStop && !restoreAccepted) {
-            await _cancelIncompleteDownload();
-          }
-        },
+        onRestoreRequested: handlers.onRestoreRequested,
+        onStop: handlers.onStop,
       );
       if (!mounted) {
         await FVideoPictureInPicture.cancelPrepared(id);
@@ -1823,6 +1955,51 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     if (!_systemPiPUsesActivePlayer) unawaited(c.pause());
     _close();
     return true;
+  }
+
+  /// Restore and stop handlers for one system PiP session, shared by the
+  /// prepared and the on-demand start. A stop after an accepted restore keeps
+  /// the download, which the restored in-app player goes on using.
+  ({
+    FVideoPictureInPictureRestoreRequested onRestoreRequested,
+    FVideoPictureInPictureStopped onStop,
+  })
+  _fVideoPictureInPictureSessionHandlers(
+    VideoPlayerController c, {
+    required String id,
+    required TdVideoStreamServer? server,
+    required bool shouldCancelOnStop,
+  }) {
+    var restoreAccepted = false;
+    return (
+      onRestoreRequested: (position) async {
+        final accepted = await _restoreFVideoPictureInPicture(position);
+        restoreAccepted = accepted;
+        return accepted;
+      },
+      onStop: (finalPosition) async {
+        if (_usesAndroidFVideoPictureInPicture && mounted) {
+          _systemPiPPrepared = false;
+          _systemPiPId = null;
+          _systemPiPActive = false;
+          _streamServer = null;
+          try {
+            await c.pause();
+          } catch (_) {}
+          if (mounted) _close();
+        }
+        if (finalPosition != null) {
+          await _storeResumePosition(finalPosition, c.value.duration);
+        }
+        if (FVideoPictureInPicture.usesActivePlayer(id)) {
+          await c.dispose();
+        }
+        await server?.close();
+        if (shouldCancelOnStop && !restoreAccepted) {
+          await _cancelIncompleteDownload();
+        }
+      },
+    );
   }
 
   Uri? _systemPiPSourceUri() {
@@ -1863,7 +2040,12 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     _systemPiPId = id;
     final sourceRect = _systemPictureInPictureSourceRect(c);
     if (sourceRect != null) _lastSystemPiPSourceRect = sourceRect;
-    var restoreAccepted = false;
+    final handlers = _fVideoPictureInPictureSessionHandlers(
+      c,
+      id: id,
+      server: server,
+      shouldCancelOnStop: shouldCancelOnStop,
+    );
     final prepared = await FVideoPictureInPicture.prepare(
       id: id,
       uri: uri,
@@ -1880,33 +2062,8 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       onEntered: _handleFVideoPictureInPictureEntered,
       onRestored: _handleFVideoPictureInPictureRestored,
       onActionRequested: _handleFVideoPictureInPictureAction,
-      onRestoreRequested: (position) async {
-        final accepted = await _restoreFVideoPictureInPicture(position);
-        restoreAccepted = accepted;
-        return accepted;
-      },
-      onStop: (finalPosition) async {
-        if (_usesAndroidFVideoPictureInPicture && mounted) {
-          _systemPiPPrepared = false;
-          _systemPiPId = null;
-          _systemPiPActive = false;
-          _streamServer = null;
-          try {
-            await c.pause();
-          } catch (_) {}
-          if (mounted) _close();
-        }
-        if (finalPosition != null) {
-          await _storeResumePosition(finalPosition, c.value.duration);
-        }
-        if (FVideoPictureInPicture.usesActivePlayer(id)) {
-          await c.dispose();
-        }
-        await server?.close();
-        if (shouldCancelOnStop && !restoreAccepted) {
-          await _cancelIncompleteDownload();
-        }
-      },
+      onRestoreRequested: handlers.onRestoreRequested,
+      onStop: handlers.onStop,
     );
     if (!mounted || _systemPiPId != id) {
       if (prepared) unawaited(FVideoPictureInPicture.cancelPrepared(id));
@@ -1958,6 +2115,8 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _heldSeekTimer?.cancel();
+    _touchControlsHideTimer?.cancel();
     _releaseVideoOrientation();
     unawaited(_restorePlayerBrightness());
     if (_wakelockActive) {
@@ -2051,15 +2210,20 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
   Widget build(BuildContext context) {
     final c = _controller;
     final ready = c != null && c.value.isInitialized;
-    return ColoredBox(
-      color: Colors.black,
-      child: _playbackSurface(ready ? c : null),
+    return FullscreenSystemUi(
+      enabled:
+          widget.presentation == VideoPlayerPresentation.fullscreen &&
+          !_systemPiPActive,
+      child: ColoredBox(
+        color: Colors.black,
+        child: _playbackSurface(ready ? c : null),
+      ),
     );
   }
 
   Widget _playbackSurface(VideoPlayerController? controller) {
     final player = controller == null
-        ? _loadingState()
+        ? _loadingSurface()
         : _reusablePlayer(controller);
     if (widget.presentation != VideoPlayerPresentation.fullscreen ||
         controller == null) {
@@ -2149,8 +2313,14 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       behavior: HitTestBehavior.translucent,
       onPointerDown: _handleVideoZoomPointerDown,
       onPointerMove: _handleVideoZoomPointerMove,
-      onPointerUp: _handleVideoZoomPointerEnd,
-      onPointerCancel: _handleVideoZoomPointerEnd,
+      onPointerUp: (event) {
+        _stopHeldSeek();
+        _handleVideoZoomPointerEnd(event);
+      },
+      onPointerCancel: (event) {
+        _stopHeldSeek();
+        _handleVideoZoomPointerEnd(event);
+      },
       child: player,
     );
   }
@@ -2196,7 +2366,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     if (source == null) {
       return Future<Uint8List?>.value();
     }
-    return FVideoThumbnail.generateRequest(
+    return _generateScrubThumbnail(
       FVideoThumbnailRequest(
         source: source,
         position: request.position,
@@ -2241,9 +2411,21 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
 
   Widget _playerChrome(BuildContext context, FVideoChromeScope scope) {
     _reusablePlayerActions = scope.actions;
+    return GestureDetector(
+      // Text and decorative chrome can hit-test without handling taps. Let
+      // their taps dismiss controls while buttons/sliders keep their gestures.
+      onTap: () => _dismissMenusAndControls(scope: scope),
+      child: _playerFullscreenChrome(context, scope),
+    );
+  }
+
+  Widget _playerFullscreenChrome(
+    BuildContext context,
+    FVideoChromeScope scope,
+  ) {
     final snapshot = scope.snapshot;
     final safePadding = MediaQuery.paddingOf(context);
-    if (_showsOnDemandLayout(context)) {
+    if (snapshot.controlsVisible && _showsOnDemandLayout(context)) {
       return _playerOnDemandChrome(context, scope, safePadding);
     }
     final standalone = _usesStandaloneFullscreenLayout(context);
@@ -2362,7 +2544,9 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                             const SizedBox(width: 12),
                             _playerChromeIconButton(
                               icon: HeroAppIcons.code,
-                              label: 'Stream inspector',
+                              label: AppStrings.t(
+                                AppStringKeys.videoPlayerStreamInspector,
+                              ),
                               onTap: () {
                                 setState(
                                   () => _debuggerVisible = !_debuggerVisible,
@@ -2379,7 +2563,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                             const SizedBox(width: 8),
                             _playerChromeIconButton(
                               icon: HeroAppIcons.ellipsisVertical,
-                              label: 'More',
+                              label: AppStrings.t(AppStringKeys.momentsMore),
                               onTap: _toggleMoreMenu,
                               size: 44,
                               iconSize: 23,
@@ -2658,7 +2842,9 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                     const SizedBox(width: 10),
                     _playerChromeIconButton(
                       icon: HeroAppIcons.code,
-                      label: 'Stream inspector',
+                      label: AppStrings.t(
+                        AppStringKeys.videoPlayerStreamInspector,
+                      ),
                       onTap: () {
                         setState(() => _debuggerVisible = !_debuggerVisible);
                         scope.actions.showControls();
@@ -2673,7 +2859,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                     const SizedBox(width: 8),
                     _playerChromeIconButton(
                       icon: HeroAppIcons.ellipsisVertical,
-                      label: 'More',
+                      label: AppStrings.t(AppStringKeys.momentsMore),
                       onTap: _toggleMoreMenu,
                       size: 44,
                       iconSize: 23,
@@ -2796,7 +2982,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       key: const ValueKey('video-on-demand-toggle'),
       child: _FocusableVideoIconButton(
         icon: HeroAppIcons.listCheck,
-        label: 'On-demand',
+        label: AppStrings.t(AppStringKeys.videoPlayerOnDemand),
         onPressed: _toggleOnDemandPanel,
         size: const Size.square(44),
         iconSize: 21,
@@ -2859,7 +3045,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     final aspect = controller == null
         ? 16 / 9
         : _displayVideoSize(controller).aspectRatio;
-    return FVideoThumbnail.generateRequest(
+    return _generateScrubThumbnail(
       FVideoThumbnailRequest(
         source: source,
         position: position,
@@ -2867,6 +3053,13 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
         quality: 70,
       ),
     );
+  }
+
+  Future<Uint8List?> _generateScrubThumbnail(FVideoThumbnailRequest request) {
+    final provider = widget.thumbnailProvider;
+    return provider == null
+        ? FVideoThumbnail.generateRequest(request)
+        : provider(request);
   }
 
   FVideoSource? _scrubThumbnailSource() {
@@ -2886,7 +3079,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     _reusablePlayerActions = scope.actions;
     final controller = _controller;
     Widget surface = child;
-    if (_showsOnDemandLayout(context)) {
+    if (scope.snapshot.controlsVisible && _showsOnDemandLayout(context)) {
       final videoChild = surface;
       surface = LayoutBuilder(
         builder: (context, constraints) {
@@ -3006,6 +3199,12 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
             _updateSurfacePanGesture(details, controller, scope.actions),
         onPanEnd: (_) => _finishSurfacePanGesture(controller),
         onPanCancel: _cancelSurfacePanGesture,
+        onLongPressStart: (details) => _startHeldSeek(
+          details.localPosition,
+          MediaQuery.sizeOf(context).width,
+          scope.actions,
+        ),
+        onLongPressEnd: (_) => _stopHeldSeek(),
         child: surface,
       );
     }
@@ -3047,6 +3246,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
 
   Widget _playerOverlay(BuildContext context, FVideoChromeScope scope) {
     _reusablePlayerActions = scope.actions;
+    _syncTouchControlsAutoHide(scope);
     if (_systemPiPActive) {
       return const IgnorePointer(child: SizedBox.expand());
     }
@@ -3060,6 +3260,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                   _activeGesture == _PlayerGesture.volume
               ? _sideLevelIndicator()
               : _gestureIndicator(controller),
+        if (_heldSeekDirection != 0) _heldSeekIndicator(),
         if (_showCompletionPrompt) _completionPrompt(),
         if (_moreMenuVisible)
           _moreMenuOverlay(
@@ -3081,6 +3282,34 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     return IgnorePointer(child: overlay);
   }
 
+  void _syncTouchControlsAutoHide(FVideoChromeScope scope) {
+    final shouldHide =
+        !_isDesktopPlatform &&
+        widget.presentation == VideoPlayerPresentation.fullscreen &&
+        !_systemPiPActive &&
+        scope.snapshot.controlsVisible &&
+        !scope.snapshot.value.isPlaying &&
+        !_moreMenuVisible &&
+        !_modeMenuVisible &&
+        !_showCompletionPrompt;
+    if (!shouldHide) {
+      _touchControlsHideTimer?.cancel();
+      _touchControlsHideTimer = null;
+      return;
+    }
+    _touchControlsHideTimer ??= Timer(const Duration(seconds: 5), () {
+      _touchControlsHideTimer = null;
+      if (!mounted ||
+          _moreMenuVisible ||
+          _modeMenuVisible ||
+          _showCompletionPrompt ||
+          _controller?.value.isPlaying == true) {
+        return;
+      }
+      scope.actions.toggleControls();
+    });
+  }
+
   KeyEventResult _handlePlayerMenuKeyEvent(KeyEvent event) {
     if (!_moreMenuVisible && !_modeMenuVisible) {
       return KeyEventResult.ignored;
@@ -3089,6 +3318,9 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       return KeyEventResult.ignored;
     }
     final key = event.logicalKey;
+    if (keyboardModifiersPressed(allowShift: key == LogicalKeyboardKey.tab)) {
+      return KeyEventResult.ignored;
+    }
     if (key == LogicalKeyboardKey.escape) {
       if (_moreMenuVisible) {
         _closeMoreMenu();
@@ -3125,7 +3357,9 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
         _moreMenuFocusNodes[0],
         _moreMenuFocusNodes[1],
         _moreMenuFocusNodes[2],
-        if (_showsOrientationButton) _moreMenuFocusNodes[3],
+        _moreMenuFocusNodes[3],
+        if (_showsOrientationButton) _moreMenuFocusNodes[4],
+        if (_showsMetadataRow) _moreMenuFocusNodes[5],
       ];
     }
     if (_modeMenuVisible) {
@@ -3308,6 +3542,83 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       return;
     }
     _cancelPlaybackGesture();
+  }
+
+  void _startHeldSeek(Offset position, double width, FVideoActions actions) {
+    if (width <= 0 || _videoZoomSuppressPlaybackGestures) return;
+    final direction = position.dx < width * 0.42
+        ? -1
+        : position.dx > width * 0.58
+        ? 1
+        : 0;
+    if (direction == 0) return;
+    _stopHeldSeek();
+    if (!mounted) return;
+    setState(() => _heldSeekDirection = direction);
+    unawaited(_runHeldSeek(actions));
+    _heldSeekTimer = Timer.periodic(
+      const Duration(milliseconds: 450),
+      (_) => unawaited(_runHeldSeek(actions)),
+    );
+    actions.hideControls();
+  }
+
+  Future<void> _runHeldSeek(FVideoActions actions) async {
+    if (!mounted || _heldSeekDirection == 0 || _heldSeekInFlight) return;
+    _heldSeekInFlight = true;
+    try {
+      await actions.seekBy(Duration(seconds: _heldSeekDirection * 10));
+    } catch (_) {
+      _stopHeldSeek();
+    } finally {
+      _heldSeekInFlight = false;
+    }
+  }
+
+  void _stopHeldSeek() {
+    _heldSeekTimer?.cancel();
+    _heldSeekTimer = null;
+    if (_heldSeekDirection == 0) return;
+    if (mounted) setState(() => _heldSeekDirection = 0);
+  }
+
+  Widget _heldSeekIndicator() {
+    final backwards = _heldSeekDirection < 0;
+    return Center(
+      child: IgnorePointer(
+        child: Semantics(
+          liveRegion: true,
+          label: AppStrings.t(
+            backwards
+                ? AppStringKeys.videoPlayerSeekBackwardTenSeconds
+                : AppStringKeys.videoPlayerSeekForwardTenSeconds,
+          ),
+          child: Container(
+            key: const ValueKey('video-held-seek-indicator'),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.76),
+              borderRadius: BorderRadius.circular(AppRadius.card),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                AppIcon(
+                  backwards ? HeroAppIcons.arrowLeft : HeroAppIcons.arrowRight,
+                  color: Colors.white,
+                  size: 22,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  backwards ? '−10s' : '+10s',
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   void _beginVideoZoomGesture(
@@ -3614,7 +3925,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       child: IgnorePointer(
         child: Semantics(
           liveRegion: true,
-          label: 'Video zoom',
+          label: AppStrings.t(AppStringKeys.videoPlayerVideoZoom),
           value: '$percentage%',
           child: Container(
             key: const ValueKey('video-zoom-indicator'),
@@ -3980,6 +4291,33 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     return Size(content.width * scale, content.height * scale);
   }
 
+  /// Shares the photo gallery's preference for its metadata row. A player
+  /// hosted outside the app's providers has no preference to read, so the row
+  /// stays hidden rather than guessing one. The focus traversal reads this too:
+  /// a node whose item is not rendered would swallow an arrow key.
+  bool get _showsMetadataRow =>
+      Provider.of<ThemeController?>(
+        context,
+        listen: false,
+      )?.mediaMetadataEnabled ??
+      false;
+
+  /// The current video's media facts, opened from the viewer menu. The player
+  /// may be streaming through its own loopback server, so it hands over the
+  /// completed local file only when it really opened one — see
+  /// [MediaMetadata.fromVideoFile].
+  void _showMediaMetadata() {
+    final metadata = MediaMetadata.fromVideoFile(
+      widget.video,
+      width: widget.width,
+      height: widget.height,
+      durationSeconds: widget.durationSeconds,
+      playerPath: _localPath,
+      playerOpenedLocalFile: _openedCompletedLocalFile,
+    );
+    unawaited(showMediaMetadataDialog(context, metadata));
+  }
+
   void _toggleMoreMenu() {
     final opening = !_moreMenuVisible;
     setState(() {
@@ -4021,9 +4359,20 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     if (hideReusableControls) scope!.actions.toggleControls();
   }
 
-  Widget _moreMenuOverlay({required VoidCallback onTapOutside}) {
+  Widget _moreMenuOverlay({required VoidCallback onTapOutside}) => Builder(
+    builder: (context) =>
+        _buildMoreMenuOverlay(context, onTapOutside: onTapOutside),
+  );
+
+  Widget _buildMoreMenuOverlay(
+    BuildContext context, {
+    required VoidCallback onTapOutside,
+  }) {
     final media = MediaQuery.of(context);
     final phoneFullscreen = media.size.shortestSide < 600;
+    final showMetadata = context.select<ThemeController?, bool>(
+      (theme) => theme?.mediaMetadataEnabled ?? false,
+    );
     final menuWidth = math.min(212.0, media.size.width - 24);
     final rtl = Directionality.of(context) == TextDirection.rtl;
     final trailingSafeInset = rtl ? media.padding.left : media.padding.right;
@@ -4104,13 +4453,19 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                                     'video-more-save-to-photos',
                                   ),
                                   child: _FocusableVideoMenuItem(
-                                    icon: HeroAppIcons.image,
-                                    label: AppStringKeys
-                                        .messageActionSaveToPhotos
-                                        .l10n(context),
+                                    icon: _isDesktopPlatform
+                                        ? HeroAppIcons.folder
+                                        : HeroAppIcons.image,
+                                    label:
+                                        (_isDesktopPlatform
+                                                ? AppStringKeys
+                                                      .messageActionSaveAs
+                                                : AppStringKeys
+                                                      .messageActionSaveToPhotos)
+                                            .l10n(context),
                                     focusNode: _moreMenuFocusNodes[1],
                                     onPressed: () => _runMoreMenuAction(
-                                      () => unawaited(_saveVideoToPhotos()),
+                                      () => unawaited(_saveVideo()),
                                     ),
                                   ),
                                 ),
@@ -4128,6 +4483,30 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                                     ),
                                   ),
                                 ),
+                                const _VideoMenuSeparator(),
+                                KeyedSubtree(
+                                  key: const ValueKey('video-more-speed'),
+                                  child: _FocusableVideoMenuItem(
+                                    icon: HeroAppIcons.clock,
+                                    label:
+                                        '${AppStringKeys.videoPlayerPlaybackSpeed.l10n(context)} '
+                                        '${_formatPlaybackSpeed(_controller?.value.playbackSpeed ?? _speed)}',
+                                    focusNode: _moreMenuFocusNodes[3],
+                                    onPressed: () {
+                                      final current =
+                                          _controller?.value.playbackSpeed ??
+                                          _speed;
+                                      final actions = _reusablePlayerActions;
+                                      if (actions != null) {
+                                        unawaited(
+                                          actions.setPlaybackSpeed(
+                                            _nextPlaybackSpeed(current),
+                                          ),
+                                        );
+                                      }
+                                    },
+                                  ),
+                                ),
                                 if (_showsOrientationButton) ...[
                                   const _VideoMenuSeparator(),
                                   KeyedSubtree(
@@ -4136,7 +4515,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                                     ),
                                     child: _FocusableVideoMenuItem(
                                       icon: HeroAppIcons.rotate,
-                                      focusNode: _moreMenuFocusNodes[3],
+                                      focusNode: _moreMenuFocusNodes[4],
                                       label:
                                           (_landscapePlayback
                                                   ? AppStringKeys
@@ -4148,6 +4527,21 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                                         () => unawaited(
                                           _toggleVideoOrientation(),
                                         ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                                if (showMetadata) ...[
+                                  const _VideoMenuSeparator(),
+                                  KeyedSubtree(
+                                    key: const ValueKey('video-more-metadata'),
+                                    child: _FocusableVideoMenuItem(
+                                      icon: HeroAppIcons.circleInfo,
+                                      label: AppStringKeys.mediaMetadataViewInfo
+                                          .l10n(context),
+                                      focusNode: _moreMenuFocusNodes[5],
+                                      onPressed: () => _runMoreMenuAction(
+                                        _showMediaMetadata,
                                       ),
                                     ),
                                   ),
@@ -4338,7 +4732,97 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     );
   }
 
-  Widget _loadingState() {
+  /// The player must look the same from the moment it opens, so the chrome is
+  /// drawn over the loading placeholder instead of appearing only once the
+  /// first frame decodes. Playback commands stay inert until the controller is
+  /// initialized; close, the menus and the display mode already work.
+  Widget _loadingSurface() {
+    if (widget.presentation != VideoPlayerPresentation.fullscreen || _failed) {
+      return _loadingState();
+    }
+    final scope = _loadingChromeScope();
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _loadingPlaceholder(),
+        // The package player owns surface taps once it is mounted. Until then
+        // this layer keeps controls that were tapped away recoverable.
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            excludeFromSemantics: true,
+            onTap: () => _handleLoadingSurfaceTap(scope),
+          ),
+        ),
+        _playerChrome(context, scope),
+        _playerOverlay(context, scope),
+      ],
+    );
+  }
+
+  FVideoChromeScope _loadingChromeScope() => FVideoChromeScope(
+    snapshot: FVideoChromeSnapshot(
+      value: _loadingChromeValue(),
+      playbackState: FVideoPlaybackState.initializing,
+      displayPosition: _controller?.value.position ?? Duration.zero,
+      controlsVisible: _loadingControlsVisible,
+      isScrubbing: false,
+      bufferingIndicatorVisible: false,
+      isFullscreen: true,
+      volume: _volume,
+    ),
+    actions: _loadingActions ??= _LoadingVideoActions(
+      readControlsVisible: () => _loadingControlsVisible,
+      onControlsVisibilityChanged: _setLoadingControlsVisible,
+    ),
+    labels: _playerLabels,
+    previous: widget.previousVideo == null
+        ? null
+        : () => widget.onNavigate?.call(-1),
+    next: widget.nextVideo == null ? null : () => widget.onNavigate?.call(1),
+  );
+
+  /// Metadata-backed stand-in for the controller value, so the timeline, the
+  /// subtitle and the aspect ratio are already right while loading.
+  VideoPlayerValue _loadingChromeValue() {
+    final value = _controller?.value;
+    final width = widget.width;
+    final height = widget.height;
+    return VideoPlayerValue(
+      duration: value != null && value.duration > Duration.zero
+          ? value.duration
+          : Duration(seconds: widget.durationSeconds ?? 0),
+      size: width != null && height != null && width > 0 && height > 0
+          ? Size(width.toDouble(), height.toDouble())
+          : value?.size ?? Size.zero,
+      position: value?.position ?? Duration.zero,
+      volume: _volume,
+      playbackSpeed: _speed,
+    );
+  }
+
+  void _handleLoadingSurfaceTap(FVideoChromeScope scope) {
+    if (_moreMenuVisible || _modeMenuVisible) {
+      _dismissMenusAndControls(scope: scope);
+      return;
+    }
+    scope.actions.toggleControls();
+  }
+
+  void _setLoadingControlsVisible(bool visible) {
+    // A request that lands after the player went live belongs to the package
+    // player, not to the loading chrome that captured it.
+    if (!mounted ||
+        _loadingControlsVisible == visible ||
+        _controller?.value.isInitialized == true) {
+      return;
+    }
+    setState(() => _loadingControlsVisible = visible);
+  }
+
+  /// Loading artwork without chrome: the thumbnail or a dark box, plus the
+  /// spinner, or the retry action once playback failed.
+  Widget _loadingPlaceholder() {
     final aspect =
         widget.width != null &&
             widget.height != null &&
@@ -4378,8 +4862,17 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
                 : const _VideoLoadingRing(size: 44),
           ),
         ),
+      ],
+    );
+  }
+
+  Widget _loadingState() {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _loadingPlaceholder(),
         PositionedDirectional(
-          top: MediaQuery.paddingOf(context).top + 6,
+          top: topChromeInsetOf(context) + 6,
           start: 8,
           child: _roundIconButton(
             HeroAppIcons.chevronLeft,
@@ -4583,7 +5076,11 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
     );
   }
 
-  Future<void> _saveVideoToPhotos() async {
+  Future<void> _saveVideo() async {
+    if (_isDesktopPlatform) {
+      await _saveVideoToFolder();
+      return;
+    }
     showToast(
       context,
       AppStringKeys.chatSavingToPhotos,
@@ -4604,6 +5101,26 @@ class _VideoPlayerViewState extends State<VideoPlayerView>
       MediaLibrarySaveResult.failed || MediaLibrarySaveResult.unsupported =>
         AppStringKeys.chatSaveToPhotosFailed,
     }, visibleFor: const Duration(seconds: 2));
+  }
+
+  /// A computer has no album, so the original file is copied into a folder
+  /// the user picks instead.
+  Future<void> _saveVideoToFolder() async {
+    showToast(
+      context,
+      AppStringKeys.chatSavingToPhotos,
+      visibleFor: const Duration(milliseconds: 1200),
+    );
+    final outcome = await MediaDownloadService.saveMedia(
+      file: widget.video,
+      isVideo: true,
+      accountSlot: widget.accountSlot,
+    );
+    if (!mounted) return;
+    final feedback = MediaDownloadService.feedbackFor(outcome);
+    if (feedback != null) {
+      showToast(context, feedback, visibleFor: const Duration(seconds: 2));
+    }
   }
 
   Future<void> _forwardVideo() async {
@@ -4821,7 +5338,9 @@ class MithkaDesktopVideoChrome extends StatelessWidget {
                             const SizedBox(width: 12),
                             MithkaVideoChromeAction(
                               icon: HeroAppIcons.code,
-                              label: 'Stream inspector',
+                              label: AppStrings.t(
+                                AppStringKeys.videoPlayerStreamInspector,
+                              ),
                               onTap: () {
                                 onToggleInspector();
                                 scope.actions.showControls();
@@ -4877,6 +5396,63 @@ class MithkaDesktopVideoChrome extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Playback facade for the loading chrome.
+///
+/// Commands that need a decoded frame are inert until the package player takes
+/// over, while control visibility keeps working so the chrome behaves the same
+/// before and after the first frame.
+class _LoadingVideoActions implements FVideoActions {
+  _LoadingVideoActions({
+    required this.readControlsVisible,
+    required this.onControlsVisibilityChanged,
+  });
+
+  final bool Function() readControlsVisible;
+  final ValueChanged<bool> onControlsVisibilityChanged;
+
+  @override
+  void showControls() => onControlsVisibilityChanged(true);
+
+  @override
+  void hideControls() => onControlsVisibilityChanged(false);
+
+  @override
+  void toggleControls() => onControlsVisibilityChanged(!readControlsVisible());
+
+  @override
+  Future<void> togglePlayback() async {}
+
+  @override
+  Future<void> seekTo(Duration position) async {}
+
+  @override
+  Future<void> seekBy(Duration delta) async {}
+
+  @override
+  Future<void> setVolume(double volume) async {}
+
+  @override
+  Future<void> toggleMute() async {}
+
+  @override
+  Future<void> setPlaybackSpeed(double speed) async {}
+
+  @override
+  void requestFullscreen(bool fullscreen) {}
+
+  @override
+  Future<void> requestPictureInPicture(bool pictureInPicture) async {}
+
+  @override
+  void beginScrub(double fraction) {}
+
+  @override
+  void updateScrub(double fraction) {}
+
+  @override
+  Future<void> endScrub(double fraction) async {}
 }
 
 /// Owned-icon action styling shared with detached-window chrome controls.
@@ -5283,9 +5859,9 @@ class _MithkaVideoOnDemandPanelState extends State<_MithkaVideoOnDemandPanel> {
                 ),
                 child: Row(
                   children: [
-                    const Text(
-                      'Autoplay',
-                      style: TextStyle(
+                    Text(
+                      AppStrings.t(AppStringKeys.videoPlayerAutoplay),
+                      style: const TextStyle(
                         color: Colors.white,
                         fontSize: 13,
                         fontWeight: FontWeight.w400,
@@ -5305,7 +5881,11 @@ class _MithkaVideoOnDemandPanelState extends State<_MithkaVideoOnDemandPanel> {
   Widget _item(int index) {
     final item = widget.queue.items[index];
     final current = index == widget.queue.index;
-    final title = item.title.trim().isEmpty ? 'Video ${index + 1}' : item.title;
+    final title = item.title.trim().isEmpty
+        ? AppStrings.t(AppStringKeys.videoPlayerVideoNumber, {
+            'value1': index + 1,
+          })
+        : item.title;
     final duration = (item.durationSeconds ?? 0) > 0
         ? formatVideoPlayerDuration(Duration(seconds: item.durationSeconds!))
         : null;
@@ -5314,7 +5894,9 @@ class _MithkaVideoOnDemandPanelState extends State<_MithkaVideoOnDemandPanel> {
       child: AppInteractiveSurface(
         key: ValueKey('video-on-demand-item-${item.video.id}'),
         semanticLabel: title,
-        semanticValue: current ? 'Playing' : duration,
+        semanticValue: current
+            ? AppStrings.t(AppStringKeys.videoPlayerPlaying)
+            : duration,
         selected: current,
         onTap: current || widget.onSelect == null
             ? null
@@ -5397,9 +5979,9 @@ class _MithkaVideoOnDemandPanelState extends State<_MithkaVideoOnDemandPanel> {
                     ],
                     if (current) ...[
                       const SizedBox(height: 3),
-                      const Text(
-                        'Playing',
-                        style: TextStyle(
+                      Text(
+                        AppStrings.t(AppStringKeys.videoPlayerPlaying),
+                        style: const TextStyle(
                           color: Color(0xFF24DDD9),
                           fontSize: 12,
                           fontWeight: FontWeight.w400,
@@ -5418,8 +6000,12 @@ class _MithkaVideoOnDemandPanelState extends State<_MithkaVideoOnDemandPanel> {
 
   Widget _autoplayToggle() {
     return AppInteractiveSurface(
-      semanticLabel: 'Autoplay',
-      semanticValue: widget.autoplay ? 'On' : 'Off',
+      semanticLabel: AppStrings.t(AppStringKeys.videoPlayerAutoplay),
+      semanticValue: AppStrings.t(
+        widget.autoplay
+            ? AppStringKeys.privacyEnabled
+            : AppStringKeys.privacyDisabled,
+      ),
       toggled: widget.autoplay,
       onTap: () => widget.onAutoplayChanged(!widget.autoplay),
       borderRadius: BorderRadius.circular(16),
@@ -5468,12 +6054,17 @@ class _MithkaVideoCenterTransport extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // While loading, the placeholder spinner owns the middle of the screen and
+    // transport buttons could not do anything yet.
+    if (scope.snapshot.playbackState == FVideoPlaybackState.initializing) {
+      return const SizedBox.shrink();
+    }
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         _MithkaVideoSeekButton(
           backwards: true,
-          label: 'Seek backward 10 seconds',
+          label: AppStrings.t(AppStringKeys.videoPlayerSeekBackwardTenSeconds),
           onTap: () =>
               unawaited(scope.actions.seekBy(const Duration(seconds: -10))),
         ),
@@ -5483,13 +6074,15 @@ class _MithkaVideoCenterTransport extends StatelessWidget {
             playing: value.isPlaying,
             onTap: () => unawaited(scope.actions.togglePlayback()),
             size: 86,
-            semanticLabel: 'Center playback',
+            semanticLabel: AppStrings.t(
+              AppStringKeys.videoPlaybackSettingsTitle,
+            ),
           ),
         ),
         const SizedBox(width: 18),
         _MithkaVideoSeekButton(
           backwards: false,
-          label: 'Seek forward 10 seconds',
+          label: AppStrings.t(AppStringKeys.videoPlayerSeekForwardTenSeconds),
           onTap: () =>
               unawaited(scope.actions.seekBy(const Duration(seconds: 10))),
         ),
@@ -5511,6 +6104,9 @@ class _MithkaVideoCompactTransport extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (scope.snapshot.playbackState == FVideoPlaybackState.initializing) {
+      return const SizedBox.shrink();
+    }
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -5523,7 +6119,9 @@ class _MithkaVideoCompactTransport extends StatelessWidget {
         else
           _MithkaVideoSeekButton(
             backwards: true,
-            label: 'Seek backward 10 seconds',
+            label: AppStrings.t(
+              AppStringKeys.videoPlayerSeekBackwardTenSeconds,
+            ),
             compact: true,
             onTap: () =>
                 unawaited(scope.actions.seekBy(const Duration(seconds: -10))),
@@ -5534,7 +6132,9 @@ class _MithkaVideoCompactTransport extends StatelessWidget {
             playing: value.isPlaying,
             onTap: () => unawaited(scope.actions.togglePlayback()),
             size: 72,
-            semanticLabel: 'Center playback',
+            semanticLabel: AppStrings.t(
+              AppStringKeys.videoPlaybackSettingsTitle,
+            ),
           ),
         ),
         const SizedBox(width: 12),
@@ -5547,7 +6147,7 @@ class _MithkaVideoCompactTransport extends StatelessWidget {
         else
           _MithkaVideoSeekButton(
             backwards: false,
-            label: 'Seek forward 10 seconds',
+            label: AppStrings.t(AppStringKeys.videoPlayerSeekForwardTenSeconds),
             compact: true,
             onTap: () =>
                 unawaited(scope.actions.seekBy(const Duration(seconds: 10))),
@@ -6000,7 +6600,9 @@ class _MithkaVideoTimelineState extends State<_MithkaVideoTimeline> {
   bool _thumbnailRequestInFlight = false;
   double? _pendingThumbnailFraction;
   double? _scrubFraction;
+  double? _thumbnailFraction;
   Uint8List? _thumbnail;
+  int _scrubGeneration = 0;
 
   @override
   void dispose() {
@@ -6017,34 +6619,51 @@ class _MithkaVideoTimelineState extends State<_MithkaVideoTimeline> {
   }
 
   void _beginScrub(double fraction) {
+    _scrubGeneration++;
     _cancelThumbnailWork();
     widget.scope.actions.beginScrub(fraction);
     setState(() {
       _scrubFraction = fraction;
       _thumbnail = null;
+      _thumbnailFraction = null;
     });
     _queueThumbnail(fraction);
   }
 
   void _updateScrub(double fraction) {
     widget.scope.actions.updateScrub(fraction);
-    setState(() => _scrubFraction = fraction);
+    setState(() {
+      _scrubFraction = fraction;
+      if (_thumbnailFraction != null &&
+          (_thumbnailFraction! - fraction).abs() > 0.005) {
+        _thumbnail = null;
+        _thumbnailFraction = null;
+      }
+    });
     _queueThumbnail(fraction);
   }
 
   void _endScrub(double fraction) {
     _cancelThumbnailWork();
     final finalFraction = _scrubFraction ?? fraction;
-    unawaited(_commitScrub(finalFraction));
+    unawaited(_commitScrub(finalFraction, _scrubGeneration));
   }
 
-  Future<void> _commitScrub(double fraction) async {
-    await widget.scope.actions.endScrub(fraction);
-    if (!mounted) return;
-    setState(() {
-      _scrubFraction = null;
-      _thumbnail = null;
-    });
+  Future<void> _commitScrub(double fraction, int generation) async {
+    try {
+      await widget.scope.actions.endScrub(fraction);
+    } catch (_) {
+      // The player owns command errors; always release this timeline's scrub
+      // preview so the controls remain usable after a failed seek.
+    } finally {
+      if (mounted && generation == _scrubGeneration) {
+        setState(() {
+          _scrubFraction = null;
+          _thumbnail = null;
+          _thumbnailFraction = null;
+        });
+      }
+    }
   }
 
   void _cancelThumbnailWork() {
@@ -6077,7 +6696,10 @@ class _MithkaVideoTimelineState extends State<_MithkaVideoTimeline> {
       _thumbnailGeneration++;
       _thumbnailTimeout = null;
       _thumbnailRequestInFlight = false;
-      setState(() => _thumbnail = null);
+      setState(() {
+        _thumbnail = null;
+        _thumbnailFraction = null;
+      });
       _schedulePendingThumbnail();
     });
 
@@ -6095,7 +6717,12 @@ class _MithkaVideoTimelineState extends State<_MithkaVideoTimeline> {
     if (pending != null && (pending - fraction).abs() < 0.0001) {
       _pendingThumbnailFraction = null;
     }
-    setState(() => _thumbnail = result);
+    if ((_scrubFraction! - fraction).abs() <= 0.005) {
+      setState(() {
+        _thumbnail = result;
+        _thumbnailFraction = result == null ? null : fraction;
+      });
+    }
     _schedulePendingThumbnail();
   }
 
@@ -6290,15 +6917,8 @@ double _nextPlaybackSpeed(double speed) {
 }
 
 @visibleForTesting
-String formatVideoPlayerDuration(Duration value) {
-  final seconds = math.max(0, value.inSeconds);
-  final hours = seconds ~/ 3600;
-  final minutes = (seconds ~/ 60) % 60;
-  final remainder = seconds % 60;
-  return hours > 0
-      ? '$hours:${minutes.toString().padLeft(2, '0')}:${remainder.toString().padLeft(2, '0')}'
-      : '$minutes:${remainder.toString().padLeft(2, '0')}';
-}
+String formatVideoPlayerDuration(Duration value) =>
+    formatMediaDuration(value.inSeconds);
 
 class _VideoLoadingRing extends StatefulWidget {
   const _VideoLoadingRing({required this.size});

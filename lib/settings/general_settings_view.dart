@@ -5,13 +5,20 @@
 //  Port of the Swift `GeneralSettingsView` / `GeneralSettingsViewModel`.
 //
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../auth/account_store.dart';
+import '../chat/link_browser.dart';
+import '../chat/link_preview_fixer.dart';
 import '../components/app_icons.dart';
+import '../components/settings_selection_row.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
 import '../l10n/app_localizations.dart';
+import '../media/media_metadata.dart';
 import '../platform/adaptive_platform.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
@@ -49,24 +56,11 @@ class _GeneralSettingsViewState extends State<GeneralSettingsView> {
       final stats = await TdClient.shared.query({
         '@type': 'getStorageStatisticsFast',
       });
-      _cacheSize = _formatBytes(stats.int64('files_size') ?? 0);
+      _cacheSize = formatMediaByteSize(stats.int64('files_size') ?? 0);
     } catch (_) {
       _cacheSize = '—';
     }
     if (mounted) setState(() => _loadingCache = false);
-  }
-
-  static String _formatBytes(int bytes) {
-    final b = bytes < 0 ? 0 : bytes;
-    if (b < 1024) return '$b B';
-    const units = ['KB', 'MB', 'GB'];
-    var size = b / 1024;
-    var i = 0;
-    while (size >= 1024 && i < units.length - 1) {
-      size /= 1024;
-      i++;
-    }
-    return '${size.toStringAsFixed(1)} ${units[i]}';
   }
 
   @override
@@ -188,6 +182,22 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
   @override
   Widget build(BuildContext context) {
     final theme = context.watch<ThemeController>();
+    // The cached Premium flag decides on the first frame, so the row never
+    // shifts between enabled and locked after the account answers.
+    final isPremium = context.watch<AccountStore?>()?.activeIsPremium ?? false;
+    final supportsInternalBrowser = internalBrowserSupported(
+      platform: Theme.of(context).platform,
+    );
+    final selectedLinkMode = supportsInternalBrowser
+        ? theme.linkOpenMode
+        : LinkOpenMode.defaultBrowser;
+    final linkModes = supportsInternalBrowser
+        ? const [
+            LinkOpenMode.askEveryTime,
+            LinkOpenMode.internalBrowser,
+            LinkOpenMode.defaultBrowser,
+          ]
+        : const [LinkOpenMode.defaultBrowser];
     return SettingsPageScaffold(
       title: AppStringKeys.settingsChatBehavior,
       onBack: () => Navigator.of(context).pop(),
@@ -226,6 +236,54 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
                 onChanged: (value) => theme.preserveSenderWhenRepeating = value,
               ),
               SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-forward-rich-markdown'),
+                title: AppStringKeys.generalForwardRichMarkdown,
+                subtitle: isPremium
+                    ? AppStringKeys.generalForwardRichMarkdownHint
+                    : AppStringKeys.chatForwardRenderMarkdownPremium,
+                value: theme.forwardRichMarkdown,
+                leading: const SettingsLeadingIcon(icon: HeroAppIcons.code),
+                enabled: isPremium,
+                // Locked off for non-Premium instead of silently storing the
+                // preference, so the switch the user sees is the live state.
+                onChanged: (value) => theme.forwardRichMarkdown = value,
+              ),
+              SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-media-metadata'),
+                title: AppStringKeys.generalMediaMetadata,
+                subtitle: AppStringKeys.generalMediaMetadataHint,
+                value: theme.mediaMetadataEnabled,
+                leading: const SettingsLeadingIcon(
+                  icon: HeroAppIcons.circleInfo,
+                ),
+                onChanged: (value) => theme.mediaMetadataEnabled = value,
+              ),
+              // Reads its own preference store, so the row rebuilds when the
+              // switch is flipped from another surface.
+              ListenableBuilder(
+                listenable: LinkPreviewFixer.shared,
+                builder: (context, _) => SettingsSwitchRow(
+                  key: const ValueKey('chat-behavior-fix-link-previews'),
+                  title: AppStringKeys.generalFixLinkPreviews,
+                  subtitle: AppStringKeys.generalFixLinkPreviewsHint,
+                  value: LinkPreviewFixer.shared.enabled,
+                  leading: const SettingsLeadingIcon(icon: HeroAppIcons.link),
+                  onChanged: (value) =>
+                      unawaited(LinkPreviewFixer.shared.setEnabled(value)),
+                ),
+              ),
+              // Only mobile composers offer a camera button, so only they can
+              // put a capture in the system album.
+              if (!isDesktopTargetPlatform(Theme.of(context).platform))
+                SettingsSwitchRow(
+                  key: const ValueKey('chat-behavior-save-captured-photos'),
+                  title: AppStringKeys.generalSaveCapturedPhotos,
+                  subtitle: AppStringKeys.generalSaveCapturedPhotosHint,
+                  value: theme.saveCapturedPhotosToAlbum,
+                  leading: const SettingsLeadingIcon(icon: HeroAppIcons.camera),
+                  onChanged: (value) => theme.saveCapturedPhotosToAlbum = value,
+                ),
+              SettingsSwitchRow(
                 key: const ValueKey('chat-behavior-quick-replies'),
                 title: AppStringKeys.businessToolsQuickReplies,
                 value: theme.quickRepliesEnabled,
@@ -233,6 +291,27 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
                   icon: HeroAppIcons.solidMessage,
                 ),
                 onChanged: (value) => theme.quickRepliesEnabled = value,
+              ),
+              SettingsSelectionRow<LinkOpenMode>(
+                key: const ValueKey('chat-behavior-link-browser'),
+                title: AppStrings.t(AppStringKeys.linkBrowserOpenLinksIn),
+                value: AppStrings.t(selectedLinkMode.label),
+                menuTitle: AppStringKeys.linkBrowserOpenLinksIn,
+                menuKey: const ValueKey('link-browser-setting-menu'),
+                leading: const SettingsLeadingIcon(icon: HeroAppIcons.globe),
+                enabled: supportsInternalBrowser,
+                options: [
+                  for (final mode in linkModes)
+                    SettingsSelectionOption<LinkOpenMode>(
+                      id: 'link-browser-mode-${mode.name}',
+                      value: mode,
+                      label: AppStrings.t(mode.label),
+                      subtitle: AppStrings.t(mode.description),
+                      icon: mode.icon,
+                    ),
+                ],
+                isSelected: (mode) => mode == selectedLinkMode,
+                onSelected: (mode) => theme.linkOpenMode = mode,
               ),
               SettingsRow(
                 key: const ValueKey('chat-behavior-video-playback'),
@@ -246,6 +325,40 @@ class _ChatBehaviorSettingsViewState extends State<ChatBehaviorSettingsView> {
               ),
             ],
           ),
+          // 盘古之白: spacing between CJK and half-width text. Receiving only
+          // repaints, while sending and editing change what the other side
+          // gets, so the three stay independent switches.
+          SettingsSection(
+            titleKey: AppStringKeys.generalPanguSpacing,
+            rows: [
+              SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-pangu-receive'),
+                title: AppStringKeys.generalPanguOnReceive,
+                value: theme.panguOnReceive,
+                leading: const SettingsLeadingIcon(icon: HeroAppIcons.inbox),
+                onChanged: (value) => theme.panguOnReceive = value,
+              ),
+              SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-pangu-send'),
+                title: AppStringKeys.generalPanguOnSend,
+                value: theme.panguOnSend,
+                leading: const SettingsLeadingIcon(
+                  icon: HeroAppIcons.paperPlane,
+                ),
+                onChanged: (value) => theme.panguOnSend = value,
+              ),
+              SettingsSwitchRow(
+                key: const ValueKey('chat-behavior-pangu-edit'),
+                title: AppStringKeys.generalPanguOnEdit,
+                value: theme.panguOnEdit,
+                leading: const SettingsLeadingIcon(
+                  icon: HeroAppIcons.penToSquare,
+                ),
+                onChanged: (value) => theme.panguOnEdit = value,
+              ),
+            ],
+          ),
+          const SettingsNote(text: AppStringKeys.generalPanguSpacingNote),
         ],
       ),
     );

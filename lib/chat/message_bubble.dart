@@ -4,7 +4,7 @@
 //  One conversation message, reference-styled. Plain rounded bubbles (no tail).
 //  Renders text (with highlighted links), inline images (tap → full-screen
 //  viewer), stickers (.tgs Lottie), voice notes, location cards, and document
-//  cards. Shows a "+1" quick-repeat badge for a duplicate tail. Swipe a bubble
+//  cards. Shows a "+1" quick-repeat badge for a duplicate tail. Swipe the row
 //  left to reply. Port of the Swift `MessageBubble`.
 //
 
@@ -12,19 +12,23 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show precisionErrorTolerance;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show SelectedContent;
+import 'package:flutter/rendering.dart' show RenderProxyBox, SelectedContent;
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart';
 import 'package:mithka/l10n/app_localizations.dart';
 import 'package:provider/provider.dart';
 
+import '../call/call_elapsed_text.dart';
 import '../components/app_icons.dart';
+import '../components/app_press_ripple.dart';
 import '../components/document_file_icon.dart';
 import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
+import '../media/media_metadata.dart';
 import '../platform/adaptive_platform.dart';
 import '../profile/profile_detail_view.dart';
 import '../settings/sensitive_content_controller.dart';
@@ -42,17 +46,23 @@ import 'animated_sticker_view.dart';
 import 'bot_button_presentation.dart';
 import 'chat_appearance_preview.dart';
 import 'custom_emoji.dart';
+import 'desktop_message_quote_source.dart';
+import 'desktop_message_text_selection.dart';
 import 'file_detail_view.dart';
 import 'inline_video_autoplay.dart';
 import 'link_handler.dart';
 import 'location_detail_view.dart';
 import 'looping_video_view.dart';
 import 'media_preview_geometry.dart';
+import 'media_spoiler.dart';
 import 'message_action_menu.dart';
 import 'message_reply_count_badge.dart';
 import 'message_special_content.dart';
+import 'message_swipe_reply.dart';
+import 'message_text_entity_runs.dart';
 import 'mobile_message_text_selection.dart';
 import 'music_player_controller.dart';
+import 'pangu_spacing.dart';
 import 'sensitive_content_reveal_prompt.dart';
 import 'stretchable_message_bubble_background.dart';
 import 'video_sticker_view.dart';
@@ -83,11 +93,13 @@ class MessageBubble extends StatefulWidget {
     this.mobileTextSelectionAreaKey,
     this.onMobileTextSelectionChanged,
     this.onMobileTextSelectionDisposed,
+    this.onDesktopQuoteChanged,
     this.onReply,
     this.onAvatarTap,
     this.onAvatarLongPress,
     this.onOpenReply,
     this.onOpenForwarded,
+    this.onTapViaBot,
     this.onOpenImage,
     this.onOpenImageGallery,
     this.onApplyMessageBubble,
@@ -154,11 +166,13 @@ class MessageBubble extends StatefulWidget {
   final GlobalKey<SelectionAreaState>? mobileTextSelectionAreaKey;
   final ValueChanged<SelectedContent?>? onMobileTextSelectionChanged;
   final VoidCallback? onMobileTextSelectionDisposed;
+  final DesktopQuoteChanged? onDesktopQuoteChanged;
   final ValueChanged<ChatMessage>? onReply;
   final ValueChanged<ChatMessage>? onAvatarTap;
   final ValueChanged<ChatMessage>? onAvatarLongPress;
   final ValueChanged<int>? onOpenReply;
   final ValueChanged<ChatMessage>? onOpenForwarded;
+  final ValueChanged<ChatMessage>? onTapViaBot;
   final ValueChanged<ChatMessage>? onOpenImage;
   final ImageGalleryOpenCallback? onOpenImageGallery;
   final ValueChanged<ChatMessage>? onApplyMessageBubble;
@@ -202,16 +216,14 @@ class MessageBubble extends StatefulWidget {
 
 class _MessageBubbleState extends State<MessageBubble>
     with SingleTickerProviderStateMixin {
-  static const double _replyTrigger = 48;
-  static const double _replyRestingLimit = 72;
-  static const double _replyHardLimit = 104;
   static const double _bubbleMaxWidthFraction = 0.75;
   static const double _desktopBubbleMaxWidth = 720;
 
   final VoicePlayer _voice = VoicePlayer();
   final GlobalKey _bubbleKey = GlobalKey();
+  final GlobalKey<SelectionAreaState> _desktopSelectionAreaKey = GlobalKey();
   final List<TapGestureRecognizer> _linkRecognizers = [];
-  late final AnimationController _swipeController;
+  late final MessageSwipeReplyController _swipe;
   bool _stickerReady = false;
   bool _videoStickerReady = false;
   bool _musicPressed = false;
@@ -222,18 +234,46 @@ class _MessageBubbleState extends State<MessageBubble>
   final ValueNotifier<bool> _hoveringTimestamp = ValueNotifier(false);
   double? _layoutWidth;
   final Set<String> _expandedQuotes = {};
+  // Rich block quotes that measured taller than the fold cap. The measurement
+  // is exact — the body is laid out at the incoming width — because a block
+  // quote carries no expandable flag on the wire.
+  final Set<String> _foldableRichQuotes = {};
+  // A block quote folds at three lines of its body text. The quote frame's
+  // padding sits outside that cap, so a folded rich quote shows the same three
+  // lines plus frame as an entity quote does.
+  static const int _richQuoteFoldLines = 3;
+  static const EdgeInsets _richQuotePadding = EdgeInsets.fromLTRB(10, 7, 8, 7);
   final Set<String> _revealedSpoilers = {};
+  // 盘古之白 results for this bubble's texts. A rebuild reuses the spaced text
+  // and the very same entity list, so the paragraphs below keep their spans.
+  final PanguDisplayMemo _panguSpacing = PanguDisplayMemo();
   bool _showRestrictedContent = false;
   int? _desktopSecondaryPointer;
   Offset? _desktopSecondaryPosition;
   bool _desktopSecondaryHandled = false;
   int _desktopSecondarySequence = 0;
+  int? _desktopTouchPointer;
+  Offset? _desktopTouchOrigin;
+  VelocityTracker? _desktopTouchVelocity;
+  Timer? _desktopTouchLongPressTimer;
+  bool _desktopTouchHorizontal = false;
+  bool _desktopTouchLongPressTriggered = false;
 
   SensitiveContentController get _sensitiveContentController =>
       widget.sensitiveContentController ?? SensitiveContentController.shared;
 
   bool get _revealsRestrictedContent =>
-      _showRestrictedContent || _sensitiveContentController.enabled;
+      _showRestrictedContent ||
+      _sensitiveContentController.enabled ||
+      (_theme.autoRevealRestrictedMedia && message.hasRestrictedRevealContent);
+
+  /// A long press flips the per-message reveal, so content uncovered by hand can
+  /// be masked again. Reveals that come from the account option or from the
+  /// auto-reveal preference are not per-message state: there the press belongs
+  /// to the ordinary action menu.
+  bool get _togglesRestrictedContentOnLongPress =>
+      message.hasRestrictedRevealContent &&
+      (_showRestrictedContent || !_revealsRestrictedContent);
 
   Rect? _bubbleBounds() {
     final box = _bubbleKey.currentContext?.findRenderObject() as RenderBox?;
@@ -252,14 +292,50 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  Widget _desktopQuoteSource(
+    ChatMessage source,
+    String text,
+    Widget child, {
+    List<MessageTextEntity> entities = const [],
+  }) {
+    // The paragraphs paint the spaced text while a quote range still has to
+    // address the stored message, so the selection is mapped back through the
+    // very insertions the renderer made.
+    final spaced = _displaySpacing(text, entities);
+    final selectable = DesktopMessageQuoteSource(
+      key: ValueKey((source.id, text)),
+      message: source,
+      displayedText: text,
+      renderedText: spaced.text,
+      renderedSpacing: spaced.insertedOffsets,
+      onChanged: widget.onDesktopQuoteChanged,
+      child: child,
+    );
+    if (source.id == message.id ||
+        !isDesktopTargetPlatform(Theme.of(context).platform)) {
+      return selectable;
+    }
+    // A grouped-file caption can belong to a message other than the row's
+    // first item. Its context menu must address that same quote source.
+    return Listener(
+      onPointerUp: (event) {
+        if (_desktopSecondaryPointer == event.pointer) {
+          _handleGroupedFileSecondaryTap(source, event.position);
+        }
+      },
+      child: selectable,
+    );
+  }
+
   void _handleLongPress([
     MessageActionSource source = MessageActionSource.normal,
   ]) {
+    if (_claimDesktopTouchLongPress(message, source)) return;
     if (_shouldOfferSensitiveContentUnblock) {
       unawaited(_showSensitiveContentUnblockPrompt(anchor: _bubbleBounds()));
       return;
     }
-    if (message.hasRestrictedRevealContent) {
+    if (_togglesRestrictedContentOnLongPress) {
       setState(() => _showRestrictedContent = !_showRestrictedContent);
       return;
     }
@@ -274,38 +350,141 @@ class _MessageBubbleState extends State<MessageBubble>
     _handleSecondaryPress(details.globalPosition, source);
   }
 
-  void _handleDesktopPointerDown(PointerDownEvent event) {
-    if ((event.buttons & kSecondaryMouseButton) == 0) return;
-    _desktopSecondarySequence += 1;
-    _desktopSecondaryPointer = event.pointer;
-    _desktopSecondaryPosition = event.position;
-    _desktopSecondaryHandled = false;
+  void _handleDesktopPointerDown(
+    PointerDownEvent event, {
+    required bool touchGesturesEnabled,
+  }) {
+    if ((event.buttons & kSecondaryMouseButton) != 0) {
+      _desktopSecondarySequence += 1;
+      _desktopSecondaryPointer = event.pointer;
+      _desktopSecondaryPosition = event.position;
+      _desktopSecondaryHandled = false;
+    }
+    if (!touchGesturesEnabled || event.kind != PointerDeviceKind.touch) return;
+    if (_desktopTouchPointer != null) {
+      _cancelDesktopTouchGesture();
+      return;
+    }
+    _desktopTouchPointer = event.pointer;
+    _desktopTouchOrigin = event.position;
+    _desktopTouchVelocity = VelocityTracker.withKind(event.kind)
+      ..addPosition(event.timeStamp, event.position);
+    _desktopTouchHorizontal = false;
+    _desktopTouchLongPressTriggered = false;
+    // Let media and file child recognizers reach the normal deadline first so
+    // their more specific action source wins. Selectable text has no message
+    // callback on desktop, so this fallback then opens the pointer menu.
+    _desktopTouchLongPressTimer = Timer(
+      kLongPressTimeout + const Duration(milliseconds: 30),
+      () => _claimDesktopTouchLongPress(message, MessageActionSource.normal),
+    );
+  }
+
+  void _handleDesktopPointerMove(PointerMoveEvent event) {
+    if (_desktopTouchPointer != event.pointer) return;
+    _desktopTouchVelocity?.addPosition(event.timeStamp, event.position);
+    final origin = _desktopTouchOrigin;
+    if (origin == null || _desktopTouchLongPressTriggered) return;
+    final travel = event.position - origin;
+    if (!_desktopTouchHorizontal) {
+      if (travel.dx.abs() < kTouchSlop && travel.dy.abs() < kTouchSlop) {
+        return;
+      }
+      _desktopTouchLongPressTimer?.cancel();
+      _desktopTouchLongPressTimer = null;
+      if (travel.dy.abs() >= travel.dx.abs()) {
+        _cancelDesktopTouchGesture();
+        return;
+      }
+      _desktopTouchHorizontal = true;
+      _swipe.beginDrag();
+    }
+    _swipe.dragTo(math.min(0, travel.dx));
+    _clearDesktopTouchSelection();
   }
 
   void _handleDesktopPointerUp(PointerUpEvent event) {
-    if (_desktopSecondaryPointer != event.pointer) return;
-    final sequence = _desktopSecondarySequence;
-    final position = _desktopSecondaryPosition ?? event.position;
-    scheduleMicrotask(() {
-      if (!mounted ||
-          sequence != _desktopSecondarySequence ||
-          _desktopSecondaryPointer != event.pointer) {
-        return;
-      }
-      final handled = _desktopSecondaryHandled;
-      _desktopSecondaryPointer = null;
-      _desktopSecondaryPosition = null;
-      _desktopSecondaryHandled = false;
-      if (!handled) _handleSecondaryPress(position);
-    });
+    if (_desktopSecondaryPointer == event.pointer) {
+      final sequence = _desktopSecondarySequence;
+      final position = _desktopSecondaryPosition ?? event.position;
+      scheduleMicrotask(() {
+        if (!mounted ||
+            sequence != _desktopSecondarySequence ||
+            _desktopSecondaryPointer != event.pointer) {
+          return;
+        }
+        final handled = _desktopSecondaryHandled;
+        _desktopSecondaryPointer = null;
+        _desktopSecondaryPosition = null;
+        _desktopSecondaryHandled = false;
+        if (!handled) _handleSecondaryPress(position);
+      });
+    }
+    if (_desktopTouchPointer != event.pointer) return;
+    _desktopTouchLongPressTimer?.cancel();
+    _desktopTouchVelocity?.addPosition(event.timeStamp, event.position);
+    if (_desktopTouchHorizontal) {
+      final velocity = _desktopTouchVelocity?.getVelocity().pixelsPerSecond.dx;
+      _swipe.finish(onReply: _replyToThisMessage, primaryVelocity: velocity);
+    }
+    if (_desktopTouchHorizontal || _desktopTouchLongPressTriggered) {
+      _clearDesktopTouchSelection();
+    }
+    _resetDesktopTouchGesture();
   }
 
   void _handleDesktopPointerCancel(PointerCancelEvent event) {
-    if (_desktopSecondaryPointer != event.pointer) return;
-    _desktopSecondarySequence += 1;
-    _desktopSecondaryPointer = null;
-    _desktopSecondaryPosition = null;
-    _desktopSecondaryHandled = false;
+    if (_desktopSecondaryPointer == event.pointer) {
+      _desktopSecondarySequence += 1;
+      _desktopSecondaryPointer = null;
+      _desktopSecondaryPosition = null;
+      _desktopSecondaryHandled = false;
+    }
+    if (_desktopTouchPointer == event.pointer) {
+      _cancelDesktopTouchGesture();
+    }
+  }
+
+  bool _claimDesktopTouchLongPress(
+    ChatMessage target,
+    MessageActionSource source,
+  ) {
+    final position = _desktopTouchOrigin;
+    if (_desktopTouchPointer == null || position == null) return false;
+    if (_desktopTouchLongPressTriggered) return true;
+    _desktopTouchLongPressTimer?.cancel();
+    _desktopTouchLongPressTimer = null;
+    _desktopTouchLongPressTriggered = true;
+    _clearDesktopTouchSelection();
+    if (identical(target, message)) {
+      _handleSecondaryPress(position, source);
+    } else {
+      widget.onLongPress?.call(
+        target,
+        Rect.fromLTWH(position.dx, position.dy, 0, 0),
+        source,
+      );
+    }
+    return true;
+  }
+
+  void _clearDesktopTouchSelection() {
+    _desktopSelectionAreaKey.currentState?.selectableRegion.clearSelection();
+  }
+
+  void _resetDesktopTouchGesture() {
+    _desktopTouchLongPressTimer?.cancel();
+    _desktopTouchLongPressTimer = null;
+    _desktopTouchPointer = null;
+    _desktopTouchOrigin = null;
+    _desktopTouchVelocity = null;
+    _desktopTouchHorizontal = false;
+    _desktopTouchLongPressTriggered = false;
+  }
+
+  void _cancelDesktopTouchGesture() {
+    if (_desktopTouchHorizontal) _swipe.cancel();
+    _resetDesktopTouchGesture();
   }
 
   void _markDesktopSecondaryHandled() {
@@ -504,9 +683,9 @@ class _MessageBubbleState extends State<MessageBubble>
     preferred: _colors.linkBlue,
   );
 
-  bool get _underlinesDisabledThemeLinks =>
-      !_theme.themingEnabled &&
-      _disabledThemeLinkStyle(message.isOutgoing).underline;
+  bool _underlinesLinks(Color body, Color link) => _theme.themingEnabled
+      ? linkNeedsUnderline(body: body, link: link)
+      : _disabledThemeLinkStyle(message.isOutgoing).underline;
 
   Color _messageQuoteColor(bool outgoing) {
     if (_usesDecorativeBubbleBackground) {
@@ -551,7 +730,7 @@ class _MessageBubbleState extends State<MessageBubble>
           : _colors.textSecondary;
     }
     if (message.replyToImage != null &&
-        (message.replyToPreview?.trim().isEmpty ?? true)) {
+        (message.replyPreviewText?.trim().isEmpty ?? true)) {
       return outgoing
           ? colors.outgoingReplyMediaText
           : colors.incomingReplyMediaText;
@@ -681,12 +860,20 @@ class _MessageBubbleState extends State<MessageBubble>
   void initState() {
     super.initState();
     _sensitiveContentController.addListener(_handleSensitiveContentChange);
-    _swipeController = AnimationController.unbounded(vsync: this);
+    _swipe = MessageSwipeReplyController(vsync: this);
   }
 
   @override
   void didUpdateWidget(covariant MessageBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // A bubble is stateful per list slot, not per message: a list rebinds the
+    // same State object to another message as rows move. The manual reveal is
+    // the reader's confirmation for ONE message, so it must not follow the
+    // slot onto a message that was never confirmed.
+    if (oldWidget.message.id != widget.message.id ||
+        oldWidget.message.chatId != widget.message.chatId) {
+      _showRestrictedContent = false;
+    }
     final oldController =
         oldWidget.sensitiveContentController ??
         SensitiveContentController.shared;
@@ -701,8 +888,9 @@ class _MessageBubbleState extends State<MessageBubble>
 
   @override
   void dispose() {
+    _desktopTouchLongPressTimer?.cancel();
     _sensitiveContentController.removeListener(_handleSensitiveContentChange);
-    _swipeController.dispose();
+    _swipe.dispose();
     _hoveringTimestamp.dispose();
     _voice.dispose();
     for (final r in _linkRecognizers) {
@@ -718,80 +906,31 @@ class _MessageBubbleState extends State<MessageBubble>
     final outgoing = widget.meId != null
         ? message.senderId == widget.meId
         : message.isOutgoing;
+    final mobileSelectionArmed = widget.mobileTextSelectionAreaKey != null;
     return LayoutBuilder(
       builder: (context, constraints) {
         _layoutWidth = constraints.maxWidth.isFinite
             ? constraints.maxWidth
             : MediaQuery.sizeOf(context).width;
-        // The swipe offset only moves this Stack, so it drives an
-        // AnimatedBuilder instead of setState: every drag update and every
-        // frame of the settle animation used to rebuild the whole bubble —
-        // spans, recognizers, colour chains and all — to shift it sideways.
-        return AnimatedBuilder(
-          animation: _swipeController,
+        // The swipe claims the whole row rather than the bubble, so the drag
+        // can start on the empty space beside a short bubble or on the avatar.
+        // A desktop mouse drag selects text instead, and the desktop touch path
+        // drives the same controller from raw pointers.
+        return buildMessageSwipeReply(
+          context: context,
+          controller: _swipe,
+          swipeEnabled: !mobileSelectionArmed,
+          onReply: widget.onReply == null ? null : _replyToThisMessage,
           child: _row(outgoing),
-          builder: (context, child) {
-            final swipeX = _swipeController.value;
-            return Stack(
-              alignment: Alignment.centerRight,
-              clipBehavior: Clip.none,
-              children: [
-                // Every mounted bubble paid for this icon — an Icon is a glyph
-                // layout, and at rest it is invisible behind opacity 0. Swap in
-                // a const placeholder until a swipe actually starts. The child
-                // count stays the same so the sibling below keeps its element.
-                if (swipeX == 0)
-                  const SizedBox.shrink()
-                else
-                  Padding(
-                    padding: const EdgeInsets.only(right: 16),
-                    child: Opacity(
-                      opacity: (math.min(
-                        1,
-                        math.max(0, -swipeX) / 50,
-                      )).toDouble(),
-                      child: AppIcon(
-                        HeroAppIcons.reply,
-                        size: 18,
-                        color: AppTheme.brand,
-                      ),
-                    ),
-                  ),
-                Transform.translate(offset: Offset(swipeX, 0), child: child),
-              ],
-            );
-          },
         );
       },
     );
   }
 
-  double _rubberBandSwipe(double value) {
-    if (value >= -_replyRestingLimit) {
-      return value.clamp(-_replyHardLimit, 0).toDouble();
-    }
-    final extra = -value - _replyRestingLimit;
-    final damped = _replyRestingLimit + extra * 0.34;
-    return -damped.clamp(0, _replyHardLimit).toDouble();
-  }
+  void _replyToThisMessage() => widget.onReply?.call(message);
 
-  void _onDragUpdate(DragUpdateDetails d) {
-    _swipeController.stop();
-    final next = _rubberBandSwipe(_swipeController.value + d.delta.dx);
-    _swipeController.value = next;
-  }
-
-  void _onDragEnd(DragEndDetails d) {
-    if (_swipeController.value < -_replyTrigger ||
-        d.primaryVelocity != null && d.primaryVelocity! < -650) {
-      widget.onReply?.call(message);
-    }
-    _swipeController.animateTo(
-      0,
-      duration: const Duration(milliseconds: 190),
-      curve: Curves.easeOutCubic,
-    );
-  }
+  bool _supportsDesktopTouchGestures(TargetPlatform platform) =>
+      platform == TargetPlatform.windows || platform == TargetPlatform.linux;
 
   Widget _row(bool outgoing) {
     final alwaysShowTime =
@@ -799,39 +938,36 @@ class _MessageBubbleState extends State<MessageBubble>
     final showDetailTime = alwaysShowTime || _showTappedTimestamp;
     final timeInSenderHeader =
         widget.isGroup && !outgoing && message.senderName != null;
-    final desktopInteraction = isDesktopTargetPlatform(
-      Theme.of(context).platform,
-    );
-    final mobileSelectionArmed = widget.mobileTextSelectionAreaKey != null;
+    final platform = Theme.of(context).platform;
+    final desktopInteraction = isDesktopTargetPlatform(platform);
+    final desktopTouchInteraction = _supportsDesktopTouchGestures(platform);
     final contentBody = _contentBody(outgoing);
     final body = GestureDetector(
       key: _bubbleKey,
       behavior: HitTestBehavior.opaque,
       onTap: () => _handleTap(alwaysShowTime),
-      onLongPress: widget.mobileTextSelectionAreaKey == null
+      onLongPress:
+          !desktopTouchInteraction && widget.mobileTextSelectionAreaKey == null
           ? _handleLongPress
           : null,
       onSecondaryTapUp: desktopInteraction ? null : _handleSecondaryTapUp,
-      onHorizontalDragStart: desktopInteraction || mobileSelectionArmed
-          ? null
-          : (_) => _swipeController.stop(),
-      onHorizontalDragUpdate: desktopInteraction || mobileSelectionArmed
-          ? null
-          : _onDragUpdate,
-      onHorizontalDragEnd: desktopInteraction || mobileSelectionArmed
-          ? null
-          : _onDragEnd,
       child: KeyedSubtree(
         key: ValueKey('messageTapTarget-${message.id}'),
         child: desktopInteraction
             ? Listener(
-                onPointerDown: _handleDesktopPointerDown,
+                onPointerDown: (event) => _handleDesktopPointerDown(
+                  event,
+                  touchGesturesEnabled: desktopTouchInteraction,
+                ),
+                onPointerMove: _handleDesktopPointerMove,
                 onPointerUp: _handleDesktopPointerUp,
                 onPointerCancel: _handleDesktopPointerCancel,
-                child: SelectionArea(
+                child: KeyedSubtree(
                   key: ValueKey('messageTextSelectionArea-${message.id}'),
-                  contextMenuBuilder: (_, _) => const SizedBox.shrink(),
-                  child: contentBody,
+                  child: DesktopMessageTextSelectionArea(
+                    selectionAreaKey: _desktopSelectionAreaKey,
+                    child: contentBody,
+                  ),
                 ),
               )
             : contentBody,
@@ -917,6 +1053,7 @@ class _MessageBubbleState extends State<MessageBubble>
                         ? message.senderPhoto
                         : widget.peerPhoto,
                     size: 38,
+                    isDeleted: widget.isGroup && message.senderIsDeleted,
                   ),
                   withLongPress: true,
                 ),
@@ -1029,7 +1166,10 @@ class _MessageBubbleState extends State<MessageBubble>
               trailing: showStatus
                   ? StatusEmojiView(
                       id: message.senderEmojiStatusId,
-                      size: 14,
+                      // The name beside it scales with the font size setting;
+                      // the status emoji should grow with it instead of
+                      // staying at a fixed pixel size.
+                      size: 14 * MediaQuery.textScalerOf(context).scale(1.0),
                       color: senderNameColor,
                       animate: theme.chatStatusEmojiMode.animate,
                     )
@@ -1088,51 +1228,76 @@ class _MessageBubbleState extends State<MessageBubble>
       spacing: 5,
       runSpacing: 5,
       alignment: outgoing ? WrapAlignment.end : WrapAlignment.start,
-      children: [
-        for (final r in message.reactions)
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => widget.onToggleReaction?.call(r),
-            onLongPress: () => widget.onShowReactionUsers?.call(message, r),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: r.chosen
-                    ? AppTheme.brand.withValues(alpha: 0.18)
-                    : c.searchFill,
-                borderRadius: BorderRadius.circular(AppRadius.card),
-                border: r.chosen ? Border.all(color: AppTheme.brand) : null,
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  r.customEmojiId != 0
-                      ? CustomEmojiView(
-                          id: r.customEmojiId,
-                          size: 16,
-                          color: r.chosen ? AppTheme.brand : c.textSecondary,
-                        )
-                      : Text(
-                          r.emoji ?? '',
-                          style: const TextStyle(fontSize: 14),
-                        ),
-                  if (r.count > 1) ...[
-                    const SizedBox(width: 4),
-                    Text(
-                      '${r.count}',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: r.chosen ? AppTheme.brand : c.textSecondary,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-      ],
+      children: [for (final r in message.reactions) _reactionChip(c, r)],
     );
   }
+
+  /// The emoji toggles the reaction; the count is a separate target that opens
+  /// the reactors sheet, so a multi-reaction chip no longer hides that list
+  /// behind an undiscoverable long press.
+  Widget _reactionChip(AppColors c, MessageReaction r) {
+    final foreground = r.chosen ? AppTheme.brand : c.textSecondary;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.onToggleReaction?.call(r),
+      onLongPress: () => widget.onShowReactionUsers?.call(message, r),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: r.chosen
+              ? AppTheme.brand.withValues(alpha: 0.18)
+              : c.searchFill,
+          borderRadius: BorderRadius.circular(AppRadius.card),
+          border: r.chosen ? Border.all(color: AppTheme.brand) : null,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            r.customEmojiId != 0
+                ? CustomEmojiView(
+                    id: r.customEmojiId,
+                    size: 16,
+                    color: foreground,
+                  )
+                : Text(r.emoji ?? '', style: const TextStyle(fontSize: 14)),
+            if (r.count > 1) _reactionCountTarget(r, foreground),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _reactionCountTarget(MessageReaction r, Color color) {
+    final count = Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Text('${r.count}', style: TextStyle(fontSize: 12, color: color)),
+    );
+    final onShow = widget.onShowReactionUsers;
+    // Without a list callback the count stays plain text, so the whole chip
+    // keeps toggling the reaction exactly as before.
+    if (onShow == null) return count;
+    return Semantics(
+      key: ValueKey('reactionCount-${message.id}-${_reactionKey(r)}'),
+      button: true,
+      label: AppStrings.t(AppStringKeys.chatReactionUsersCount, {
+        'value1': r.count,
+      }),
+      excludeSemantics: true,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => onShow(message, r),
+        child: AppPressRipple(
+          borderRadius: BorderRadius.circular(AppRadius.control),
+          color: color,
+          child: count,
+        ),
+      ),
+    );
+  }
+
+  String _reactionKey(MessageReaction reaction) => reaction.customEmojiId != 0
+      ? 'custom:${reaction.customEmojiId}'
+      : 'emoji:${reaction.emoji ?? ''}';
 
   Widget _repeatBadge() => GestureDetector(
     key: const ValueKey('messageRepeatBadge'),
@@ -1428,7 +1593,7 @@ class _MessageBubbleState extends State<MessageBubble>
                           ),
                         ),
                         child: Text(
-                          _formatCallDuration(duration),
+                          formatCallDuration(duration),
                           style: const TextStyle(
                             fontSize: 11,
                             color: Colors.white,
@@ -1785,17 +1950,36 @@ class _MessageBubbleState extends State<MessageBubble>
         onTap: () => widget.onButtonTap?.call(message, button),
         child: Container(
           height: 36,
-          alignment: Alignment.center,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(AppRadius.md),
             border: Border.all(color: colors.border, width: 0.5),
           ),
-          child: BotButtonLabel(
-            button: button,
-            color: colors.foreground,
-            fontSize: 14,
-            fontWeight: FontWeight.w500,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Padding(
+                padding: EdgeInsets.symmetric(
+                  horizontal: botButtonBadgeIcon(button) != null ? 18 : 8,
+                ),
+                child: BotButtonLabel(
+                  button: button,
+                  color: colors.foreground,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              if (botButtonBadgeIcon(button) case final badgeIcon?)
+                Positioned(
+                  top: 4,
+                  right: 5,
+                  child: AppIcon(
+                    badgeIcon,
+                    key: ValueKey('message-button-badge-${button.text}'),
+                    size: 11,
+                    color: colors.foreground.withValues(alpha: 0.72),
+                  ),
+                ),
+            ],
           ),
         ),
       ),
@@ -1909,14 +2093,23 @@ class _MessageBubbleState extends State<MessageBubble>
           ),
         )
       else
-        ..._richTextWidgets(
+        _desktopQuoteSource(
+          source,
           displayText,
-          baseColor,
-          linkColor,
-          outgoing,
-          false,
-          displayEntities,
-          textFontSize,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: _richTextWidgets(
+              displayText,
+              baseColor,
+              linkColor,
+              outgoing,
+              false,
+              displayEntities,
+              textFontSize,
+            ),
+          ),
+          entities: displayEntities,
         ),
       if (displayRichBlocks.isNotEmpty) ...[
         if (displayText.isNotEmpty) const SizedBox(height: 8),
@@ -1966,7 +2159,11 @@ class _MessageBubbleState extends State<MessageBubble>
         _forwardHeader(outgoing),
         const SizedBox(height: 3),
       ],
-      if (includeReplyQuote && message.replyToPreview != null) ...[
+      if (includeForwardHeader && message.hasViaBotAttribution) ...[
+        _viaBotHeader(outgoing),
+        const SizedBox(height: 3),
+      ],
+      if (includeReplyQuote && message.replyPreviewText != null) ...[
         _replyQuote(outgoing),
         const SizedBox(height: 5),
       ],
@@ -2114,6 +2311,7 @@ class _MessageBubbleState extends State<MessageBubble>
     List<RichMessageBlock> blocks,
     bool outgoing, {
     Color? textLinkColor,
+    String blockPath = '',
   }) {
     final widgets = <Widget>[];
     for (var index = 0; index < blocks.length; index++) {
@@ -2123,6 +2321,9 @@ class _MessageBubbleState extends State<MessageBubble>
         block,
         outgoing,
         textLinkColor: textLinkColor,
+        // Nested quotes fold independently, so every block carries the index
+        // path that reaches it inside this message's rich tree.
+        blockPath: blockPath.isEmpty ? '$index' : '$blockPath.$index',
       );
       if (widget != null) {
         widgets.add(
@@ -2140,6 +2341,7 @@ class _MessageBubbleState extends State<MessageBubble>
     RichMessageBlock block,
     bool outgoing, {
     Color? textLinkColor,
+    String blockPath = '',
   }) {
     return switch (block.kind) {
       RichMessageBlockKind.paragraph ||
@@ -2163,9 +2365,13 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.buttonRow => SelectionContainer.disabled(
         child: _richButtonRowBlock(block, outgoing),
       ),
-      RichMessageBlockKind.list => _richListBlock(block, outgoing),
-      RichMessageBlockKind.blockQuote ||
-      RichMessageBlockKind.pullQuote => _richQuoteContainer(block, outgoing),
+      RichMessageBlockKind.list => _richListBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
+      RichMessageBlockKind.blockQuote || RichMessageBlockKind.pullQuote =>
+        _richQuoteContainer(block, outgoing, blockKey: blockPath),
       RichMessageBlockKind.animation ||
       RichMessageBlockKind.audio ||
       RichMessageBlockKind.photo ||
@@ -2174,7 +2380,11 @@ class _MessageBubbleState extends State<MessageBubble>
       RichMessageBlockKind.collage => _richCollageBlock(block, outgoing),
       RichMessageBlockKind.slideshow => _richSlideshowBlock(block, outgoing),
       RichMessageBlockKind.table => _richTableBlock(block, outgoing),
-      RichMessageBlockKind.details => _richDetailsBlock(block, outgoing),
+      RichMessageBlockKind.details => _richDetailsBlock(
+        block,
+        outgoing,
+        blockPath: blockPath,
+      ),
       RichMessageBlockKind.map => _richMapBlock(block, outgoing),
     };
   }
@@ -2270,7 +2480,11 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  Widget _richListBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richListBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final c = _colors;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2311,6 +2525,7 @@ class _MessageBubbleState extends State<MessageBubble>
                     children: _richBlockWidgets(
                       block.listItems[index].blocks,
                       outgoing,
+                      blockPath: '$blockPath.item$index',
                     ),
                   ),
                 ),
@@ -2329,12 +2544,51 @@ class _MessageBubbleState extends State<MessageBubble>
     return '•';
   }
 
-  Widget _richQuoteContainer(RichMessageBlock block, bool outgoing) {
+  /// One line of rich-block body text, measured with the same style, font size
+  /// and text scaler the block's paragraphs are laid out with.
+  double _richQuoteLineHeight() {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: 'M',
+        style: DefaultTextStyle.of(
+          context,
+        ).style.merge(TextStyle(fontSize: _chatFontSize(AppTextSize.body))),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    final height = painter.height;
+    painter.dispose();
+    return height;
+  }
+
+  /// A rich quote reports its measured height after layout, so a short quote
+  /// never builds the affordance and a long one gains it on the next frame.
+  void _handleRichQuoteOverflow(String key, bool overflows) {
+    if (!mounted) return;
+    final changed = overflows
+        ? _foldableRichQuotes.add(key)
+        : _foldableRichQuotes.remove(key);
+    if (changed) setState(() {});
+  }
+
+  void _toggleRichQuoteExpanded(String key) {
+    setState(() {
+      if (!_expandedQuotes.remove(key)) _expandedQuotes.add(key);
+    });
+  }
+
+  Widget _richQuoteContainer(
+    RichMessageBlock block,
+    bool outgoing, {
+    String blockKey = '',
+  }) {
     final base = outgoing ? _outgoingTextColor : _incomingTextColor;
     final link = _messageLinkColor(outgoing);
     final quote = _messageColors == null ? base : _messageQuoteColor(outgoing);
     final quoteLink = !outgoing && _messageColors != null ? quote : link;
-    final body = block.kind == RichMessageBlockKind.pullQuote
+    final isPullQuote = block.kind == RichMessageBlockKind.pullQuote;
+    final body = isPullQuote
         ? _richTextWidgets(block.text, base, quoteLink, outgoing, false, [
             ...block.textEntities,
             if (block.text.isNotEmpty)
@@ -2344,10 +2598,38 @@ class _MessageBubbleState extends State<MessageBubble>
                 type: 'textEntityTypeItalic',
               ),
           ])
-        : _richBlockWidgets(block.children, outgoing, textLinkColor: quoteLink);
-    return Container(
+        : _richBlockWidgets(
+            block.children,
+            outgoing,
+            textLinkColor: quoteLink,
+            blockPath: blockKey,
+          );
+    final key = 'rich:${message.chatId}:${message.id}:$blockKey';
+    // A quote that carries media, a table or a map has no meaningful "three
+    // lines": the cap would slice a photo into a sliver. Only a body made of
+    // text blocks folds, which is also the only case where the entity quote's
+    // behaviour applies.
+    bool isTextOnly(RichMessageBlock child) => switch (child.kind) {
+      RichMessageBlockKind.paragraph ||
+      RichMessageBlockKind.heading ||
+      RichMessageBlockKind.preformatted ||
+      RichMessageBlockKind.footer ||
+      RichMessageBlockKind.thinking ||
+      RichMessageBlockKind.math ||
+      RichMessageBlockKind.divider ||
+      RichMessageBlockKind.anchor => true,
+      RichMessageBlockKind.list => child.listItems.every(
+        (item) => item.blocks.every(isTextOnly),
+      ),
+      _ => false,
+    };
+    final foldable = !isPullQuote && block.children.every(isTextOnly);
+    final overflows = foldable && _foldableRichQuotes.contains(key);
+    final expanded = !foldable || _expandedQuotes.contains(key);
+    final lineHeight = foldable ? _richQuoteLineHeight() : 0.0;
+    final content = Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(10, 7, 8, 7),
+      padding: _richQuotePadding,
       decoration: BoxDecoration(
         color: _messageColors == null
             ? base.withValues(alpha: 0.07)
@@ -2355,12 +2637,43 @@ class _MessageBubbleState extends State<MessageBubble>
         border: Border(left: BorderSide(color: quote, width: 3)),
       ),
       child: Column(
-        crossAxisAlignment: block.kind == RichMessageBlockKind.pullQuote
+        crossAxisAlignment: isPullQuote
             ? CrossAxisAlignment.center
             : CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          ...body,
+          if (foldable)
+            _QuoteFold(
+              maxHeight: _richQuoteFoldLines * lineHeight,
+              collapsed: !expanded,
+              fadeExtent: lineHeight,
+              onOverflowChanged: (overflows) =>
+                  _handleRichQuoteOverflow(key, overflows),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: body,
+              ),
+            )
+          else
+            ...body,
+          if (overflows) ...[
+            const SizedBox(height: 4),
+            SelectionContainer.disabled(
+              child: Text(
+                AppStrings.t(
+                  expanded
+                      ? AppStringKeys.messageBubbleCollapse
+                      : AppStringKeys.messageBubbleExpandQuote,
+                ),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: quote,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
           if (block.caption.isNotEmpty) ...[
             const SizedBox(height: 5),
             ..._richTextWidgets(
@@ -2376,9 +2689,19 @@ class _MessageBubbleState extends State<MessageBubble>
         ],
       ),
     );
+    if (!foldable) return content;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: overflows ? () => _toggleRichQuoteExpanded(key) : null,
+      child: content,
+    );
   }
 
-  Widget _richDetailsBlock(RichMessageBlock block, bool outgoing) {
+  Widget _richDetailsBlock(
+    RichMessageBlock block,
+    bool outgoing, {
+    required String blockPath,
+  }) {
     final base = outgoing ? _outgoingTextColor : _incomingTextColor;
     final link = _messageLinkColor(outgoing);
     return _RichDetailsBlock(
@@ -2399,7 +2722,11 @@ class _MessageBubbleState extends State<MessageBubble>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
-        children: _richBlockWidgets(block.children, outgoing),
+        children: _richBlockWidgets(
+          block.children,
+          outgoing,
+          blockPath: '$blockPath.details',
+        ),
       ),
     );
   }
@@ -2441,7 +2768,20 @@ class _MessageBubbleState extends State<MessageBubble>
       ),
     );
     if (block.hasSpoiler) {
-      media = _RichSpoiler(color: _colors.card, child: media);
+      media = MediaSpoiler(
+        identity: (
+          TdClient.shared.activeSlot,
+          message.chatId,
+          message.id,
+          image.id,
+        ),
+        enabled: true,
+        miniThumbnail: image.miniThumb,
+        width: size.width,
+        height: size.height,
+        borderRadius: BorderRadius.circular(AppRadius.control),
+        child: media,
+      );
     }
     return _richMediaWithCaption(media, block, outgoing);
   }
@@ -2497,7 +2837,20 @@ class _MessageBubbleState extends State<MessageBubble>
       ),
     );
     if (block.hasSpoiler) {
-      media = _RichSpoiler(color: _colors.card, child: media);
+      media = MediaSpoiler(
+        identity: (
+          TdClient.shared.activeSlot,
+          message.chatId,
+          message.id,
+          block.video?.id,
+        ),
+        enabled: true,
+        miniThumbnail: block.image?.miniThumb,
+        width: size.width,
+        height: size.height,
+        borderRadius: BorderRadius.circular(AppRadius.control),
+        child: media,
+      );
     }
     return _richMediaWithCaption(media, block, outgoing);
   }
@@ -2617,7 +2970,7 @@ class _MessageBubbleState extends State<MessageBubble>
                   ),
                   const SizedBox(width: 10),
                   Text(
-                    _durationString(voice.duration),
+                    formatMediaDuration(voice.duration),
                     style: TextStyle(
                       fontSize: 12,
                       color: _colors.textSecondary,
@@ -2703,7 +3056,8 @@ class _MessageBubbleState extends State<MessageBubble>
     final items = <TdFileRef>[];
     final indexes = <int?>[];
     for (final child in media) {
-      final image = child.kind == RichMessageBlockKind.photo
+      final image =
+          child.kind == RichMessageBlockKind.photo && !child.hasSpoiler
           ? child.image
           : null;
       if (image == null) {
@@ -2722,10 +3076,42 @@ class _MessageBubbleState extends State<MessageBubble>
     List<TdFileRef> photoGalleryItems = const [],
     int? photoGalleryIndex,
   }) {
+    final child = _richMediaThumbnailContent(
+      block,
+      outgoing,
+      photoGalleryItems: photoGalleryItems,
+      photoGalleryIndex: photoGalleryIndex,
+    );
+    if (!block.hasSpoiler) return child;
+    return MediaSpoiler(
+      identity: (
+        TdClient.shared.activeSlot,
+        message.chatId,
+        message.id,
+        block.image?.id,
+        block.video?.id,
+      ),
+      enabled: true,
+      miniThumbnail: block.image?.miniThumb,
+      borderRadius: BorderRadius.circular(AppRadius.md),
+      child: child,
+    );
+  }
+
+  Widget _richMediaThumbnailContent(
+    RichMessageBlock block,
+    bool outgoing, {
+    List<TdFileRef> photoGalleryItems = const [],
+    int? photoGalleryIndex,
+  }) {
     if (block.kind == RichMessageBlockKind.photo && block.image != null) {
       return GestureDetector(
         onTap: () {
           final openGallery = widget.onOpenImageGallery;
+          if (block.hasSpoiler && openGallery != null) {
+            openGallery(items: [block.image!], startIndex: 0);
+            return;
+          }
           if (openGallery != null &&
               photoGalleryIndex != null &&
               photoGalleryItems.isNotEmpty) {
@@ -3638,8 +4024,8 @@ class _MessageBubbleState extends State<MessageBubble>
           SizedBox(
             width: 70,
             child: Text(
-              '${_durationString(position.inSeconds)}/'
-              '${total.inSeconds > 0 ? _durationString(total.inSeconds) : '--:--'}',
+              '${formatMediaDuration(position.inSeconds)}/'
+              '${total.inSeconds > 0 ? formatMediaDuration(total.inSeconds) : '--:--'}',
               textAlign: TextAlign.right,
               style: TextStyle(fontSize: 11, color: c.textSecondary),
             ),
@@ -3742,7 +4128,7 @@ class _MessageBubbleState extends State<MessageBubble>
     bool missed = false;
     if (connected) {
       label = AppStrings.t(AppStringKeys.messageBubbleCallDuration, {
-        'value1': _formatCallDuration(message.callDuration),
+        'value1': formatCallDuration(message.callDuration),
       });
     } else {
       switch (message.callDiscardReason) {
@@ -3788,15 +4174,6 @@ class _MessageBubbleState extends State<MessageBubble>
         ),
       ),
     );
-  }
-
-  String _formatCallDuration(int seconds) {
-    final s = seconds < 0 ? 0 : seconds;
-    String two(int v) => v.toString().padLeft(2, '0');
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return h > 0 ? '${two(h)}:${two(m)}:${two(sec)}' : '${two(m)}:${two(sec)}';
   }
 
   /// 转发 attribution shown above forwarded content: `转发自 …`.
@@ -3846,6 +4223,37 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  /// Inline-bot attribution shown above inline-sent content: `via @bot`.
+  Widget _viaBotHeader(bool outgoing) {
+    final textColor = _messageForwardedNameColor(outgoing);
+    return GestureDetector(
+      key: ValueKey('messageViaBotHeader-${message.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTapViaBot != null
+          ? () => widget.onTapViaBot!.call(message)
+          : null,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              AppStrings.t(AppStringKeys.messageBubbleViaBot, {
+                'value1': message.viaBotDisplayName,
+              }),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: textColor,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// 引用 quote block shown above a reply's text.
   Widget _replyQuote(bool outgoing) {
     final labelColor = _messageReplyNameColor(outgoing);
@@ -3854,83 +4262,86 @@ class _MessageBubbleState extends State<MessageBubble>
     final sender = message.replyToSender ?? '';
     final time = DateText.quoteLabel(message.replyToDate ?? 0);
     final targetId = message.replyToMessageId;
-    return Container(
-      key: const ValueKey('messageReplyQuote'),
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 8, 6, 9),
-      decoration: BoxDecoration(
-        color: _replyQuoteBackground(outgoing),
-        borderRadius: const BorderRadius.only(
-          topRight: Radius.circular(AppRadius.control),
-          bottomRight: Radius.circular(AppRadius.control),
+    final openOriginal = targetId == null || widget.onOpenReply == null
+        ? null
+        : () => widget.onOpenReply!.call(targetId);
+    return GestureDetector(
+      key: const ValueKey('messageReplyOpenOriginal'),
+      behavior: HitTestBehavior.opaque,
+      onTap: openOriginal,
+      child: Container(
+        key: const ValueKey('messageReplyQuote'),
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(12, 8, 6, 9),
+        decoration: BoxDecoration(
+          color: _replyQuoteBackground(outgoing),
+          borderRadius: const BorderRadius.only(
+            topRight: Radius.circular(AppRadius.control),
+            bottomRight: Radius.circular(AppRadius.control),
+          ),
+          border: _messageColors == null
+              ? null
+              : Border(left: BorderSide(color: line, width: 3)),
         ),
-        border: _messageColors == null
-            ? null
-            : Border(left: BorderSide(color: line, width: 3)),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (message.replyToImage != null) ...[
-            SizedBox(
-              key: const ValueKey('messageReplyMediaPreview'),
-              width: 44,
-              height: 44,
-              child: TDImage(
-                photo: message.replyToImage,
-                cornerRadius: 6,
-                cacheWidth: _cachePx(44),
-                cacheHeight: _cachePx(44),
-              ),
-            ),
-            const SizedBox(width: 9),
-          ],
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text.rich(
-                  TextSpan(
-                    children: [
-                      if (sender.isNotEmpty)
-                        TextSpan(
-                          text: sender,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                      if (time.isNotEmpty)
-                        TextSpan(text: sender.isEmpty ? time : ' $time'),
-                    ],
+        child: IgnorePointer(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (message.replyToImage != null) ...[
+                SizedBox(
+                  key: const ValueKey('messageReplyMediaPreview'),
+                  width: 44,
+                  height: 44,
+                  child: TDImage(
+                    photo: message.replyToImage,
+                    cornerRadius: 6,
+                    cacheWidth: _cachePx(44),
+                    cacheHeight: _cachePx(44),
                   ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 14, color: labelColor),
                 ),
-                if ((message.replyToPreview ?? '').isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    message.replyToPreview!,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 14, height: 1.22, color: faded),
-                  ),
-                ],
+                const SizedBox(width: 9),
               ],
-            ),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text.rich(
+                      TextSpan(
+                        children: [
+                          if (sender.isNotEmpty)
+                            TextSpan(
+                              text: sender,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          if (time.isNotEmpty)
+                            TextSpan(text: sender.isEmpty ? time : ' $time'),
+                        ],
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 14, color: labelColor),
+                    ),
+                    if ((message.replyPreviewText ?? '').isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      _replyPreviewText(faded, outgoing),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(6, 1, 4, 9),
+                child: AppArrowUpToLineIcon(
+                  key: const ValueKey('messageReplyNavigateUpIcon'),
+                  color: faded,
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 6),
-          GestureDetector(
-            key: const ValueKey('messageReplyOpenOriginal'),
-            behavior: HitTestBehavior.opaque,
-            onTap: targetId == null
-                ? null
-                : () => widget.onOpenReply?.call(targetId),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(6, 1, 4, 9),
-              child: AppIcon(HeroAppIcons.arrowUp, size: 18, color: faded),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -3982,6 +4393,36 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
+  /// Spaces one rendered text for display, when 盘古之白 is on.
+  ///
+  /// The stored message is never rewritten: copy, quote, edit, forward and
+  /// search all keep reading [ChatMessage.text]. Only what the bubble paints
+  /// changes, together with the entity ranges that style it.
+  PanguDisplay _displaySpacing(String text, List<MessageTextEntity> entities) {
+    if (!_theme.panguOnReceive) return PanguDisplay(text, entities, const []);
+    return _panguSpacing.resolve(text, entities);
+  }
+
+  /// The quoted reply's two-line preview, spaced like the body it answers.
+  Widget _replyPreviewText(Color faded, bool outgoing) {
+    final spaced = _displaySpacing(
+      message.replyPreviewText ?? '',
+      message.replyPreviewEntities,
+    );
+    return _richText(
+      spaced.text,
+      faded,
+      faded,
+      0,
+      spaced.text.length,
+      outgoing,
+      false,
+      maxLines: 2,
+      entities: spaced.entities,
+      fontSize: 14,
+    );
+  }
+
   List<Widget> _richTextWidgets(
     String text,
     Color base,
@@ -3994,18 +4435,23 @@ class _MessageBubbleState extends State<MessageBubble>
     final resolvedFontSize = fontSize == AppTextSize.body
         ? AppTextSize.messageBody()
         : fontSize;
-    final sourceEntities = entities ?? message.textEntities;
+    // 盘古之白 is a display pass: the spaced text and its shifted entities are
+    // resolved once here so every slice below — inline run, quote block, code
+    // block — works on the same pair. The stored message keeps its own text.
+    final spaced = _displaySpacing(text, entities ?? message.textEntities);
+    final sourceText = spaced.text;
+    final sourceEntities = spaced.entities;
     final blocks =
         sourceEntities.where((e) => e.isBlockQuote || e.isPreBlock).toList()
           ..sort((a, b) => a.offset.compareTo(b.offset));
     if (blocks.isEmpty) {
       return [
         _richText(
-          text,
+          sourceText,
           base,
           link,
           0,
-          text.length,
+          sourceText.length,
           outgoing,
           appendMeta,
           entities: sourceEntities,
@@ -4018,13 +4464,13 @@ class _MessageBubbleState extends State<MessageBubble>
     var cursor = 0;
     var metaAdded = false;
     for (final block in blocks) {
-      final start = block.offset.clamp(0, text.length).toInt();
-      final end = block.end.clamp(start, text.length).toInt();
+      final start = block.offset.clamp(0, sourceText.length).toInt();
+      final end = block.end.clamp(start, sourceText.length).toInt();
       if (end <= cursor) continue;
       if (start > cursor) {
         widgets.add(
           _richText(
-            text,
+            sourceText,
             base,
             link,
             cursor,
@@ -4041,7 +4487,7 @@ class _MessageBubbleState extends State<MessageBubble>
         block.isPreBlock
             ? _preBlock(
                 block,
-                text,
+                sourceText,
                 start,
                 end,
                 base,
@@ -4051,7 +4497,7 @@ class _MessageBubbleState extends State<MessageBubble>
               )
             : _quoteBlock(
                 block,
-                text,
+                sourceText,
                 start,
                 end,
                 base,
@@ -4063,15 +4509,15 @@ class _MessageBubbleState extends State<MessageBubble>
       );
       cursor = end;
     }
-    if (cursor < text.length) {
+    if (cursor < sourceText.length) {
       widgets.add(const SizedBox(height: 5));
       widgets.add(
         _richText(
-          text,
+          sourceText,
           base,
           link,
           cursor,
-          text.length,
+          sourceText.length,
           outgoing,
           appendMeta,
           entities: sourceEntities,
@@ -4084,7 +4530,10 @@ class _MessageBubbleState extends State<MessageBubble>
       widgets.add(
         Align(
           alignment: Alignment.centerRight,
-          child: RichText(text: TextSpan(children: [_metaSpan(outgoing)])),
+          child: RichText(
+            textScaler: MediaQuery.textScalerOf(context),
+            text: TextSpan(children: [_metaSpan(outgoing)]),
+          ),
         ),
       );
     }
@@ -4115,13 +4564,33 @@ class _MessageBubbleState extends State<MessageBubble>
       outgoing,
     );
     if (appendMeta) children.add(_metaSpan(outgoing));
-    final style = DefaultTextStyle.of(
-      context,
-    ).style.merge(TextStyle(fontSize: effectiveFontSize, color: base));
+    final hasCustomEmoji = (entities ?? message.textEntities).any(
+      (e) =>
+          !e.isBlockQuote &&
+          e.isCustomEmoji &&
+          e.customEmojiId != null &&
+          e.offset < end &&
+          e.end > start,
+    );
+    final style = DefaultTextStyle.of(context).style.merge(
+      TextStyle(
+        fontSize: effectiveFontSize,
+        color: base,
+        height: hasCustomEmoji ? 1.0 : null,
+      ),
+    );
     return Builder(
       builder: (context) => RichText(
+        textScaler: MediaQuery.textScalerOf(context),
         maxLines: maxLines,
         overflow: maxLines == null ? TextOverflow.clip : TextOverflow.fade,
+        textHeightBehavior: hasCustomEmoji
+            ? const TextHeightBehavior(
+                applyHeightToFirstAscent: false,
+                applyHeightToLastDescent: false,
+                leadingDistribution: TextLeadingDistribution.even,
+              )
+            : null,
         text: TextSpan(style: style, children: children),
         selectionRegistrar: SelectionContainer.maybeOf(context),
         selectionColor:
@@ -4346,7 +4815,7 @@ class _MessageBubbleState extends State<MessageBubble>
     double fontSize,
     bool outgoing,
   ) {
-    final spoilerKey = _spoilerKey(active);
+    final spoilerKey = active.spoilerKey;
     final spoilerHidden =
         spoilerKey != null && !_revealedSpoilers.contains(spoilerKey);
     if (spoilerHidden) {
@@ -4383,30 +4852,27 @@ class _MessageBubbleState extends State<MessageBubble>
         ),
       ];
     }
-    final customEmojiId = _customEmojiId(effectiveActive);
+    final customEmojiId = effectiveActive.customEmojiId;
     if (customEmojiId != null) {
       return [
         WidgetSpan(
           alignment: PlaceholderAlignment.middle,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 0.5),
-            child: SelectableCustomEmojiView(
-              id: customEmojiId,
-              fallbackText: segment,
-              size: math.max(20, fontSize * 1.15),
-              color: style.color ?? base,
-            ),
+          child: SelectableCustomEmojiView(
+            id: customEmojiId,
+            fallbackText: segment,
+            size: math.max(20, (fontSize * 1.15).roundToDouble()),
+            color: style.color ?? base,
           ),
         ),
       ];
     }
-    if (_hasMath(effectiveActive)) {
+    if (effectiveActive.hasMathematicalExpression) {
       return [_inlineMathSpan(segment, style, fontSize)];
     }
     if (_hasInlineCode(effectiveActive)) {
       return [_inlineCodeSpan(segment, style, fontSize)];
     }
-    final userId = _entityMentionUserId(effectiveActive);
+    final userId = effectiveActive.mentionUserId;
     if (userId != null) {
       final recognizer = TapGestureRecognizer()
         ..onTap = () {
@@ -4431,7 +4897,7 @@ class _MessageBubbleState extends State<MessageBubble>
         return [TextSpan(text: segment, style: style)];
       }
       final recognizer = TapGestureRecognizer()
-        ..onTap = () => widget.onHashtagTap?.call(_normalizeHashtag(segment));
+        ..onTap = () => widget.onHashtagTap?.call(normalizedHashtag(segment));
       _linkRecognizers.add(recognizer);
       return [TextSpan(text: segment, style: style, recognizer: recognizer)];
     }
@@ -4489,30 +4955,10 @@ class _MessageBubbleState extends State<MessageBubble>
     return null;
   }
 
-  int? _customEmojiId(List<MessageTextEntity> active) {
-    for (final entity in active.reversed) {
-      if (entity.isCustomEmoji && entity.customEmojiId != null) {
-        return entity.customEmojiId;
-      }
-    }
-    return null;
-  }
-
-  bool _hasMath(List<MessageTextEntity> active) {
-    return active.any((e) => e.isMathematicalExpression);
-  }
-
   bool _hasPreCode(List<MessageTextEntity> active) {
     return active.any(
       (e) => e.type == 'textEntityTypePre' || e.type == 'textEntityTypePreCode',
     );
-  }
-
-  String? _spoilerKey(List<MessageTextEntity> active) {
-    for (final e in active) {
-      if (e.type == 'textEntityTypeSpoiler') return '${e.offset}:${e.length}';
-    }
-    return null;
   }
 
   TextStyle _entityStyle(
@@ -4576,7 +5022,7 @@ class _MessageBubbleState extends State<MessageBubble>
     final fallbackUnderline =
         isLink &&
         !active.any((entity) => entity.type == 'textEntityTypeSpoiler') &&
-        _underlinesDisabledThemeLinks;
+        _underlinesLinks(base, link);
     if (fallbackUnderline && !decorations.contains(TextDecoration.underline)) {
       decorations.add(TextDecoration.underline);
     }
@@ -4617,20 +5063,11 @@ class _MessageBubbleState extends State<MessageBubble>
         case 'textEntityTypeEmailAddress':
           return 'mailto:$segment';
         case 'textEntityTypePhoneNumber':
-          return 'tel:${segment.replaceAll(RegExp(r'[^0-9+]'), '')}';
+          return telephoneUri(segment);
         case 'textEntityTypeBankCardNumber':
           return null;
         case 'textEntityTypeMentionName':
           return null;
-      }
-    }
-    return null;
-  }
-
-  int? _entityMentionUserId(List<MessageTextEntity> active) {
-    for (final e in active.reversed) {
-      if (e.type == 'textEntityTypeMentionName' && e.userId != null) {
-        return e.userId;
       }
     }
     return null;
@@ -4665,7 +5102,7 @@ class _MessageBubbleState extends State<MessageBubble>
       final recognizer = TapGestureRecognizer()
         ..onTap = () {
           if (isHashtag) {
-            widget.onHashtagTap?.call(_normalizeHashtag(matched));
+            widget.onHashtagTap?.call(normalizedHashtag(matched));
           } else {
             openLink(context, target);
           }
@@ -4687,7 +5124,7 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   TextStyle _autoLinkStyle(TextStyle baseStyle, Color link) {
-    if (!_underlinesDisabledThemeLinks) {
+    if (!_underlinesLinks(baseStyle.color ?? _colors.textPrimary, link)) {
       return baseStyle.copyWith(color: link);
     }
     final existing = baseStyle.decoration;
@@ -4705,11 +5142,6 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  String _normalizeHashtag(String tag) {
-    final trimmed = tag.trim();
-    return trimmed.startsWith('#') ? trimmed : '#$trimmed';
-  }
-
   // MARK: - Image
 
   int _cachePx(double logical) =>
@@ -4719,15 +5151,8 @@ class _MessageBubbleState extends State<MessageBubble>
     final geometry = _imagePreviewGeometry();
     final imageSize = geometry.contentSize;
     final caption = _caption();
-    final widensForCaption =
-        caption != null && _usesBlurredImageFrame(imageSize);
-    final frameSize = widensForCaption
-        ? Size(
-            _mediaMaxWidth(),
-            math.max(imageSize.height, geometry.frameSize.height),
-          )
-        : geometry.frameSize;
-    final usesBlurredFrame = geometry.needsBlurredFill || widensForCaption;
+    final frameSize = geometry.frameSize;
+    final usesBlurredFrame = geometry.needsBlurredFill;
     final grouped = _groupsMediaCaption(caption);
     final mediaRadius = grouped && _showsMessageBubbleSurface ? 0.0 : 10.0;
     final mediaBorderRadius = _messageBorderRadius(mediaRadius);
@@ -4804,7 +5229,14 @@ class _MessageBubbleState extends State<MessageBubble>
             ],
           );
     return _mediaWithCaption(
-      media: mediaWithApplyAction,
+      media: MessageMediaSpoiler(
+        message: message,
+        width: frameSize.width,
+        height: frameSize.height,
+        borderRadius: mediaBorderRadius,
+        child: mediaWithApplyAction,
+      ),
+      mediaWidth: frameSize.width,
       caption: caption,
       outgoing: outgoing,
     );
@@ -4869,21 +5301,24 @@ class _MessageBubbleState extends State<MessageBubble>
 
   Widget _mediaWithCaption({
     required Widget media,
+    required double mediaWidth,
     required String? caption,
     required bool outgoing,
   }) {
     final hasForwardHeader = message.hasForwardAttribution;
-    final hasReplyQuote = message.replyToPreview != null;
+    final hasViaBotHeader = message.hasViaBotAttribution;
+    final hasAttributionHeader = hasForwardHeader || hasViaBotHeader;
+    final hasReplyQuote = message.replyPreviewText != null;
     if (!_groupsMediaCaption(caption)) {
-      final attributedMedia = hasForwardHeader || hasReplyQuote
+      final attributedMedia = hasAttributionHeader || hasReplyQuote
           ? _bubbleBackground(
               key: ValueKey(
-                hasForwardHeader
+                hasAttributionHeader
                     ? 'messageForwardedMedia-${message.id}'
                     : 'messageRepliedMedia-${message.id}',
               ),
               outgoing: outgoing,
-              constraints: BoxConstraints(maxWidth: _mediaMaxWidth()),
+              constraints: BoxConstraints.tightFor(width: mediaWidth),
               padding: EdgeInsets.zero,
               borderRadius: _messageBorderRadius(8),
               child: Column(
@@ -4892,14 +5327,29 @@ class _MessageBubbleState extends State<MessageBubble>
                 children: [
                   if (hasForwardHeader)
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(10, 7, 10, 6),
+                      padding: EdgeInsets.fromLTRB(
+                        10,
+                        7,
+                        10,
+                        hasViaBotHeader ? 2 : 6,
+                      ),
                       child: _forwardHeader(outgoing),
+                    ),
+                  if (hasViaBotHeader)
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        10,
+                        hasForwardHeader ? 0 : 7,
+                        10,
+                        6,
+                      ),
+                      child: _viaBotHeader(outgoing),
                     ),
                   if (hasReplyQuote)
                     Padding(
                       padding: EdgeInsets.fromLTRB(
                         6,
-                        hasForwardHeader ? 0 : 6,
+                        hasAttributionHeader ? 0 : 6,
                         6,
                         6,
                       ),
@@ -4922,7 +5372,7 @@ class _MessageBubbleState extends State<MessageBubble>
             _textBubble(
               caption,
               outgoing,
-              includeForwardHeader: !hasForwardHeader,
+              includeForwardHeader: !hasAttributionHeader,
               includeReplyQuote: false,
             ),
           ],
@@ -4947,6 +5397,10 @@ class _MessageBubbleState extends State<MessageBubble>
         ? message.translationEntities
         : _activeTextEntities;
     return Container(
+      // The media owns the attached bubble's width. Letting the caption (or
+      // its translation/attribution) size this column leaves an empty strip
+      // beside portrait previews, which have a smaller fixed width.
+      width: mediaWidth,
       decoration: _showsMessageBubbleSurface
           ? BoxDecoration(
               color: outgoing ? _outgoingBubbleColor : _incomingBubbleColor,
@@ -4963,12 +5417,22 @@ class _MessageBubbleState extends State<MessageBubble>
         children: [
           if (hasForwardHeader)
             Padding(
-              padding: const EdgeInsets.fromLTRB(10, 7, 10, 6),
+              padding: EdgeInsets.fromLTRB(10, 7, 10, hasViaBotHeader ? 2 : 6),
               child: _forwardHeader(outgoing),
+            ),
+          if (hasViaBotHeader)
+            Padding(
+              padding: EdgeInsets.fromLTRB(10, hasForwardHeader ? 0 : 7, 10, 6),
+              child: _viaBotHeader(outgoing),
             ),
           if (hasReplyQuote)
             Padding(
-              padding: EdgeInsets.fromLTRB(6, hasForwardHeader ? 0 : 6, 6, 6),
+              padding: EdgeInsets.fromLTRB(
+                6,
+                hasAttributionHeader ? 0 : 6,
+                6,
+                6,
+              ),
               child: _replyQuote(outgoing),
             ),
           media,
@@ -4996,17 +5460,22 @@ class _MessageBubbleState extends State<MessageBubble>
                       ),
                     )
                   else
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: _richTextWidgets(
-                        displayCaption,
-                        baseColor,
-                        linkColor,
-                        outgoing,
-                        false,
-                        captionEntities,
+                    _desktopQuoteSource(
+                      message,
+                      displayCaption,
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: _richTextWidgets(
+                          displayCaption,
+                          baseColor,
+                          linkColor,
+                          outgoing,
+                          false,
+                          captionEntities,
+                        ),
                       ),
+                      entities: captionEntities,
                     ),
                   if (_showsTranslationBlockFor(message)) ...[
                     const SizedBox(height: 7),
@@ -5124,7 +5593,7 @@ class _MessageBubbleState extends State<MessageBubble>
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        _durationString(dur),
+                        formatMediaDuration(dur),
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 11,
@@ -5147,7 +5616,14 @@ class _MessageBubbleState extends State<MessageBubble>
       ),
     );
     return _mediaWithCaption(
-      media: media,
+      media: MessageMediaSpoiler(
+        message: message,
+        width: size.width,
+        height: size.height,
+        borderRadius: _messageBorderRadius(mediaRadius),
+        child: media,
+      ),
+      mediaWidth: size.width,
       caption: caption,
       outgoing: outgoing,
     );
@@ -5181,7 +5657,14 @@ class _MessageBubbleState extends State<MessageBubble>
       ),
     );
     return _mediaWithCaption(
-      media: media,
+      media: MessageMediaSpoiler(
+        message: message,
+        width: size.width,
+        height: size.height,
+        borderRadius: _messageBorderRadius(mediaRadius),
+        child: media,
+      ),
+      mediaWidth: size.width,
       caption: caption,
       outgoing: outgoing,
     );
@@ -5203,15 +5686,6 @@ class _MessageBubbleState extends State<MessageBubble>
       availableWidth: _mediaMaxWidth(),
       maxHeight: telegramChatMediaPreviewMaxHeight,
     );
-  }
-
-  bool _usesBlurredImageFrame(Size imageSize) {
-    final w = message.imageWidth;
-    final h = message.imageHeight;
-    if (w == null || h == null || w <= 0 || h <= 0) return false;
-    final maxWidth = _mediaMaxWidth();
-    final sourceAspect = w / h;
-    return sourceAspect <= 0.68 && imageSize.width < maxWidth * 0.78;
   }
 
   /// The height budget a rich block's media shares with ordinary chat media:
@@ -5277,8 +5751,8 @@ class _MessageBubbleState extends State<MessageBubble>
             : 0.0;
         final played = _voice.isPlaying || _voice.position > Duration.zero;
         final timeText = played
-            ? _durationString(_voice.position.inSeconds)
-            : _durationString(voice.duration);
+            ? formatMediaDuration(_voice.position.inSeconds)
+            : formatMediaDuration(voice.duration);
         return _bubbleBackground(
           outgoing: outgoing,
           constraints: const BoxConstraints.tightFor(width: 210),
@@ -5435,9 +5909,6 @@ class _MessageBubbleState extends State<MessageBubble>
     );
   }
 
-  static String _durationString(int seconds) =>
-      '${seconds ~/ 60}:${(seconds % 60).toString().padLeft(2, '0')}';
-
   // MARK: - Location
 
   Widget _locationBubble(MessageLocation location) {
@@ -5593,21 +6064,26 @@ class _MessageBubbleState extends State<MessageBubble>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    KeyedSubtree(
-                      key: replacesOriginal
-                          ? const ValueKey('messageTranslatedOnlyText')
-                          : null,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: _richTextWidgets(
-                          displayCaption,
-                          displayCaptionColor,
-                          displayCaptionLink,
-                          outgoing,
-                          false,
-                          displayCaptionEntities,
+                    _desktopQuoteSource(
+                      captionSource,
+                      replacesOriginal ? '' : displayCaption,
+                      KeyedSubtree(
+                        key: replacesOriginal
+                            ? const ValueKey('messageTranslatedOnlyText')
+                            : null,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: _richTextWidgets(
+                            displayCaption,
+                            displayCaptionColor,
+                            displayCaptionLink,
+                            outgoing,
+                            false,
+                            displayCaptionEntities,
+                          ),
                         ),
                       ),
+                      entities: displayCaptionEntities,
                     ),
                     if (translationSource != null &&
                         _showsTranslationBlockFor(translationSource)) ...[
@@ -5658,9 +6134,15 @@ class _MessageBubbleState extends State<MessageBubble>
     return GestureDetector(
       key: ValueKey('messageDocumentAlbumFile-${source.id}'),
       behavior: HitTestBehavior.opaque,
-      onTap: () => Navigator.of(
-        context,
-      ).push(MaterialPageRoute(builder: (_) => FileDetailView(doc: doc))),
+      onTap: () => Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => FileDetailView(
+            doc: doc,
+            chatId: source.chatId ?? message.chatId,
+            messageId: source.id,
+          ),
+        ),
+      ),
       onLongPress: () => _handleGroupedFileLongPress(source, itemKey),
       onSecondaryTapUp: (details) =>
           _handleGroupedFileSecondaryTap(source, details.globalPosition),
@@ -5708,6 +6190,7 @@ class _MessageBubbleState extends State<MessageBubble>
   }
 
   void _handleGroupedFileLongPress(ChatMessage source, GlobalKey itemKey) {
+    if (_claimDesktopTouchLongPress(source, MessageActionSource.normal)) return;
     final box = itemKey.currentContext?.findRenderObject() as RenderBox?;
     final bounds = box != null && box.hasSize
         ? box.localToGlobal(Offset.zero) & box.size
@@ -5851,49 +6334,6 @@ class _RichDetailsBlockState extends State<_RichDetailsBlock> {
             ),
         ],
       ),
-    );
-  }
-}
-
-class _RichSpoiler extends StatefulWidget {
-  const _RichSpoiler({required this.color, required this.child});
-
-  final Color color;
-  final Widget child;
-
-  @override
-  State<_RichSpoiler> createState() => _RichSpoilerState();
-}
-
-class _RichSpoilerState extends State<_RichSpoiler> {
-  bool _revealed = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return Stack(
-      children: [
-        widget.child,
-        if (!_revealed)
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _revealed = true),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: widget.color,
-                  borderRadius: BorderRadius.circular(AppRadius.control),
-                ),
-                child: Center(
-                  child: AppIcon(
-                    HeroAppIcons.eye,
-                    size: 22,
-                    color: context.colors.textSecondary,
-                  ),
-                ),
-              ),
-            ),
-          ),
-      ],
     );
   }
 }
@@ -6114,4 +6554,154 @@ class _MessageDeliveryPainter extends CustomPainter {
   @override
   bool shouldRepaint(_MessageDeliveryPainter oldDelegate) =>
       oldDelegate.isSending != isSending || oldDelegate.color != color;
+}
+
+/// Folds a rich quote body to [maxHeight]. The child is laid out with an
+/// unbounded height at the incoming width, so the fold follows the real layout
+/// instead of a character count or an intrinsic pass, and while [collapsed] it
+/// paints clipped to the cap with a short bottom fade. The measurement is
+/// reported after the frame — through [onOverflowChanged] — so the caller only
+/// builds an affordance when there is something to fold.
+class _QuoteFold extends SingleChildRenderObjectWidget {
+  const _QuoteFold({
+    required this.maxHeight,
+    required this.collapsed,
+    required this.fadeExtent,
+    required this.onOverflowChanged,
+    super.child,
+  });
+
+  final double maxHeight;
+  final bool collapsed;
+  final double fadeExtent;
+  final ValueChanged<bool> onOverflowChanged;
+
+  @override
+  _RenderQuoteFold createRenderObject(BuildContext context) => _RenderQuoteFold(
+    maxHeight: maxHeight,
+    collapsed: collapsed,
+    fadeExtent: fadeExtent,
+    onOverflowChanged: onOverflowChanged,
+  );
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderQuoteFold renderObject) {
+    renderObject
+      ..maxHeight = maxHeight
+      ..collapsed = collapsed
+      ..fadeExtent = fadeExtent
+      ..onOverflowChanged = onOverflowChanged;
+  }
+}
+
+class _RenderQuoteFold extends RenderProxyBox {
+  _RenderQuoteFold({
+    required this._maxHeight,
+    required this._collapsed,
+    required this._fadeExtent,
+    required this._onOverflowChanged,
+  });
+
+  double get maxHeight => _maxHeight;
+  double _maxHeight;
+  set maxHeight(double value) {
+    if (value == _maxHeight) return;
+    _maxHeight = value;
+    markNeedsLayout();
+  }
+
+  bool get collapsed => _collapsed;
+  bool _collapsed;
+  set collapsed(bool value) {
+    if (value == _collapsed) return;
+    _collapsed = value;
+    markNeedsLayout();
+  }
+
+  double get fadeExtent => _fadeExtent;
+  double _fadeExtent;
+  set fadeExtent(double value) {
+    if (value == _fadeExtent) return;
+    _fadeExtent = value;
+    markNeedsPaint();
+  }
+
+  set onOverflowChanged(ValueChanged<bool> value) {
+    if (value == _onOverflowChanged) return;
+    _onOverflowChanged = value;
+  }
+
+  ValueChanged<bool> _onOverflowChanged;
+  bool _overflows = false;
+  bool _reportedOverflow = false;
+
+  @override
+  void performLayout() {
+    final child = this.child;
+    if (child == null) {
+      size = constraints.smallest;
+      return;
+    }
+    child.layout(
+      BoxConstraints(
+        minWidth: constraints.minWidth,
+        maxWidth: constraints.maxWidth,
+      ),
+      parentUsesSize: true,
+    );
+    final bodyHeight = child.size.height;
+    _overflows = bodyHeight > _maxHeight + precisionErrorTolerance;
+    size = constraints.constrain(
+      Size(
+        child.size.width,
+        _overflows && _collapsed ? _maxHeight : bodyHeight,
+      ),
+    );
+    if (_overflows != _reportedOverflow) {
+      _reportedOverflow = _overflows;
+      final report = _onOverflowChanged;
+      // The caller rebuilds to add or drop the affordance, and a layout-time
+      // setState is illegal: the report lands right after this frame.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (attached) report(_overflows);
+      });
+    }
+  }
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    final child = this.child;
+    if (child == null) return;
+    if (!_overflows || !_collapsed) {
+      context.paintChild(child, offset);
+      return;
+    }
+    context.pushClipRect(needsCompositing, offset, Offset.zero & size, (
+      PaintingContext context,
+      Offset clippedOffset,
+    ) {
+      final fadeTop = math.max(0.0, size.height - _fadeExtent);
+      if (fadeTop <= 0) {
+        context.paintChild(child, clippedOffset);
+        return;
+      }
+      final bounds = clippedOffset & size;
+      final canvas = context.canvas;
+      canvas.saveLayer(bounds, Paint());
+      context.paintChild(child, clippedOffset);
+      // Alpha-only fade: the body thins out towards the cut without assuming
+      // which fill sits behind the quote.
+      canvas.drawRect(
+        bounds,
+        Paint()
+          ..blendMode = BlendMode.dstIn
+          ..shader = ui.Gradient.linear(
+            Offset(bounds.left, bounds.top + fadeTop),
+            Offset(bounds.left, bounds.bottom),
+            const [Color(0xFFFFFFFF), Color(0x00FFFFFF)],
+          ),
+      );
+      canvas.restore();
+    });
+  }
 }

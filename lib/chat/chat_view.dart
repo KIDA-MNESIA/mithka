@@ -7,6 +7,7 @@
 //
 
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
@@ -20,15 +21,23 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app/active_conversation.dart';
 import '../app/adaptive_split_layout.dart';
+import '../app/app_navigator.dart';
+import '../app/chat_pane.dart';
 import '../app/desktop_video_window.dart';
+import '../app/ipad_window_chrome.dart';
 import '../app/primary_chat_launcher.dart';
 import '../app/video_split_controller.dart';
+import '../auth/account_store.dart';
 import '../auth/telegram_country_names.dart';
 import '../call/call_manager.dart';
-import '../channels/topic_chat_view.dart';
+import '../channels/topic_list_actions.dart';
+import '../channels/topic_list_host.dart';
+import '../channels/topic_list_row.dart';
+import '../channels/topic_navigation.dart';
 import '../chats/search_token_views.dart';
 import '../communities/community_models.dart';
 import '../communities/community_view.dart';
+import '../components/app_confirm_dialog.dart';
 import '../components/app_dialog.dart';
 import '../components/app_icons.dart';
 import '../components/app_interactive_surface.dart';
@@ -38,22 +47,27 @@ import '../components/photo_avatar.dart';
 import '../components/toast.dart';
 import '../components/ui_components.dart';
 import '../media/app_asset_picker.dart';
+import '../media/media_metadata.dart';
 import '../moments/story_viewer_view.dart';
 import '../notifications/notification_controller.dart';
+import '../platform/desktop_clipboard_images.dart';
 import '../profile/profile_detail_view.dart';
 import '../settings/ai_endpoint_style.dart';
 import '../settings/ai_settings_controller.dart';
 import '../settings/apple_pcc_api.dart';
 import '../settings/blocked_user_service.dart';
 import '../settings/business_tools_views.dart';
+import '../settings/hidden_sender_store.dart';
 import '../settings/quick_reaction_settings_view.dart';
 import '../settings/sensitive_content_controller.dart';
-import '../settings/topic_group_display_mode.dart';
 import '../settings/translation_api.dart';
 import '../settings/translation_controller.dart';
+import '../tdlib/forum_topic_index.dart';
 import '../tdlib/json_helpers.dart';
 import '../tdlib/td_client.dart';
+import '../tdlib/td_image_loader.dart';
 import '../tdlib/td_models.dart';
+import '../tdlib/td_requests.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_theme.dart';
 import '../theme/date_text.dart';
@@ -91,20 +105,29 @@ import 'chat_wallpaper.dart';
 import 'checklist_composer_view.dart';
 import 'custom_emoji.dart';
 import 'emoji_store.dart';
+import 'forum_topic_transcript.dart';
+import 'forward_markdown.dart';
 import 'forward_options.dart';
 import 'group_remark_controller.dart';
+import 'hide_sender_dialog.dart';
 import 'image_media_album_bubble.dart';
 import 'image_preview.dart';
 import 'internal_chat_link_router.dart';
 import 'link_handler.dart';
 import 'media_album_layout.dart';
+import 'media_download_service.dart';
 import 'media_library_saver.dart';
 import 'media_send_preview_view.dart';
+import 'media_spoiler.dart';
 import 'message_action_menu.dart';
+import 'message_action_menu_presentation.dart';
 import 'message_bubble.dart';
 import 'message_bubble_repository_view.dart';
+import 'message_quote_selection_dialog.dart';
 import 'message_reaction_availability.dart';
 import 'message_replies_sheet.dart';
+import 'message_swipe_reply.dart';
+import 'message_text_quote.dart';
 import 'message_translation_cache.dart';
 import 'music_player_controller.dart';
 import 'openai_compatible_unread_summary_provider.dart';
@@ -117,6 +140,7 @@ import 'sticker_viewer.dart';
 import 'telegram_ai_service.dart';
 import 'telegram_cocoon_unread_summary_provider.dart';
 import 'telegram_mini_app_view.dart';
+import 'transcript_entry_boundary.dart';
 import 'transcript_pivot_partition.dart';
 import 'translation_fallback.dart';
 import 'unread_chat_summary_models.dart';
@@ -128,6 +152,86 @@ import 'video_player_view.dart';
 @visibleForTesting
 bool chatTranscriptAllowsCommentAttachment({required bool isChannel}) =>
     isChannel;
+
+@visibleForTesting
+bool chatViewRequiresFullSync({
+  required int previousRevision,
+  required int nextRevision,
+}) => previousRevision != nextRevision;
+
+/// Whether a model notification should still synchronize the transcript.
+///
+/// A covered transcript defers until its tickers come back. One that has already
+/// captured its exit state is only animating out, and its own exit work is what
+/// notifies the model: marking the conversation read notifies once, then the
+/// local `updateChatReadInbox` it emits notifies again, so both land inside the
+/// closing transition. Synchronizing there walks the transcript and rebuilds a
+/// page nobody will see again, which is the stutter behind closing a chat.
+@visibleForTesting
+bool chatViewSyncsModelNotification({
+  required bool viewTickerEnabled,
+  required bool exitStatePrepared,
+}) => viewTickerEnabled && !exitStatePrepared;
+
+/// Rebuilds a narrow chat fragment only while its route is active. Hidden
+/// split-view/tab routes deliberately detach from high-frequency TDLib bubble
+/// and header updates; their next TickerMode build reads the latest model.
+class _ActiveChatListenableBuilder extends StatefulWidget {
+  const _ActiveChatListenableBuilder({
+    required this.listenable,
+    required this.builder,
+  });
+
+  final Listenable listenable;
+  final WidgetBuilder builder;
+
+  @override
+  State<_ActiveChatListenableBuilder> createState() =>
+      _ActiveChatListenableBuilderState();
+}
+
+class _ActiveChatListenableBuilderState
+    extends State<_ActiveChatListenableBuilder> {
+  bool _listening = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _setListening(TickerMode.valuesOf(context).enabled);
+  }
+
+  @override
+  void didUpdateWidget(covariant _ActiveChatListenableBuilder oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_listening && !identical(oldWidget.listenable, widget.listenable)) {
+      oldWidget.listenable.removeListener(_handleChange);
+      widget.listenable.addListener(_handleChange);
+    }
+  }
+
+  void _setListening(bool value) {
+    if (_listening == value) return;
+    _listening = value;
+    if (value) {
+      widget.listenable.addListener(_handleChange);
+    } else {
+      widget.listenable.removeListener(_handleChange);
+    }
+  }
+
+  void _handleChange() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.builder(context);
+
+  @override
+  void dispose() {
+    if (_listening) widget.listenable.removeListener(_handleChange);
+    super.dispose();
+  }
+}
 
 @visibleForTesting
 Future<T?> showReactionUsersModal<T>(
@@ -489,7 +593,7 @@ class _MessageDeleteOptionsDialogState
       child: Material(
         color: Colors.transparent,
         child: Container(
-          width: math.min(MediaQuery.of(context).size.width - 40, 420),
+          width: math.min(MediaQuery.sizeOf(context).width - 40, 420),
           padding: const EdgeInsets.fromLTRB(24, 24, 24, 18),
           decoration: BoxDecoration(
             color: c.card,
@@ -796,6 +900,26 @@ class ChatViewExitController {
   void prepareExit() => _prepareExit?.call();
 }
 
+/// Lets an adaptive parent ask the transcript it already shows to reveal the
+/// newest message.
+///
+/// Tapping the conversation that is already open in the split pane has nothing
+/// to navigate to, so it has to mean "take me to the latest message" instead of
+/// rebuilding the same pane and leaving the reader wherever they had scrolled.
+class ChatRevealLatestController {
+  VoidCallback? _revealLatest;
+
+  /// Registers the currently visible chat and returns a matching detacher.
+  VoidCallback register(VoidCallback revealLatest) {
+    _revealLatest = revealLatest;
+    return () {
+      if (identical(_revealLatest, revealLatest)) _revealLatest = null;
+    };
+  }
+
+  void revealLatest() => _revealLatest?.call();
+}
+
 /// Keeps the chat header full-width while reserving a trailing context pane
 /// only below it. This avoids the empty header gutter produced by placing the
 /// context pane beside the entire chat view.
@@ -858,6 +982,7 @@ class ChatView extends StatefulWidget {
     super.key,
     required this.chatId,
     required this.title,
+    this.forumTopicId,
     this.initialMessageId,
     this.seedMessage,
     this.showBackButton = true,
@@ -869,16 +994,21 @@ class ChatView extends StatefulWidget {
     this.trailingPane,
     this.trailingPaneWidth = 0,
     this.requestComposerFocusOnReady = false,
-    this.onOpenTopicMode,
+    this.onOpenTopicTranscript,
     this.onChatKindResolved,
     this.onInfoPressed,
     this.onOpenFullInfo,
     this.onOpenUserProfile,
     this.onBack,
     this.exitController,
+    this.revealLatestController,
   });
   final int chatId;
   final String title;
+
+  /// When set, the transcript renders this single forum topic as an ordinary
+  /// chat (topics always fold into the chat transcript now).
+  final int? forumTopicId;
   final int? initialMessageId;
   final ChatMessage? seedMessage;
   final bool showBackButton;
@@ -890,13 +1020,21 @@ class ChatView extends StatefulWidget {
   final Widget? trailingPane;
   final double trailingPaneWidth;
   final bool requestComposerFocusOnReady;
-  final ValueChanged<int?>? onOpenTopicMode;
+
+  /// Lets an owning shell switch this chat to a topic transcript (or the
+  /// whole chat for null), so the new transcript is built with the shell's
+  /// current wiring.
+  final ValueChanged<int?>? onOpenTopicTranscript;
   final ValueChanged<ChatKind>? onChatKindResolved;
   final VoidCallback? onInfoPressed;
   final VoidCallback? onOpenFullInfo;
   final void Function(int userId, String name)? onOpenUserProfile;
   final VoidCallback? onBack;
   final ChatViewExitController? exitController;
+
+  /// Lets an owning shell ask this transcript — the one already on screen — to
+  /// show its newest message.
+  final ChatRevealLatestController? revealLatestController;
 
   @override
   State<ChatView> createState() => _ChatViewState();
@@ -1026,6 +1164,23 @@ class _TranscriptEntry {
   );
 }
 
+/// Where the reader was standing when an in-transcript jump (a reply quote tap
+/// or View in Chat) took them to another message. While this is live the
+/// floating arrow returns here instead of the newest message.
+class _ChatJumpOrigin {
+  const _ChatJumpOrigin({
+    required this.messageId,
+    required this.viewportOffset,
+  });
+
+  /// Topmost fully visible row (or the closest partially visible one above it)
+  /// at the moment the jump was requested.
+  final int messageId;
+
+  /// That row's top in viewport-local pixels, restored as-is on return.
+  final double viewportOffset;
+}
+
 class _ChatScrollSnapshot {
   const _ChatScrollSnapshot({
     required this.pixels,
@@ -1066,7 +1221,7 @@ class _KeyboardInsetProbe extends StatelessWidget {
 
 class _ChatViewState extends State<ChatView> {
   late final bool _openAtLatest;
-  late final ({int accountSlot, int chatId}) _sessionKey;
+  late final ({int accountSlot, int chatId, int? forumTopicId}) _sessionKey;
   late _ChatScrollSnapshot? _sessionScrollSnapshot;
   late final ChatSessionRenderState? _sessionRenderState;
   late bool _olderHistoryExhaustedHint;
@@ -1085,11 +1240,14 @@ class _ChatViewState extends State<ChatView> {
   final _firstContactLayoutKey = GlobalKey();
   Map<int, GlobalKey> _entryVisibilityKeys = <int, GlobalKey>{};
   Map<int, _TranscriptEntry> _trackedTranscriptEntries = const {};
+  final Map<int, RenderBox> _mountedTranscriptEntries = {};
+  bool _bottomGapCorrectionScheduled = false;
   TranscriptPivot? _transcriptPivot;
   bool _transcriptPivotFrozen = false;
   bool _transcriptPivotFreezeScheduled = false;
   late int _historyWindowRevision;
   late int _historyWindowInvalidationRevision;
+  late int _fullViewRevision;
   final Set<int> _expandedBlockedRunIds = <int>{};
   final Set<int> _showOriginalTranslationMessageIds = <int>{};
   int? _desktopStickerSetId;
@@ -1098,6 +1256,9 @@ class _ChatViewState extends State<ChatView> {
   bool _modelDirtyWhileInactive = false;
   bool _reactivationSyncScheduled = false;
   ChatMessage? _actionTarget;
+  int? _desktopQuoteMessageId;
+  MessageTextQuote? _desktopQuote;
+  MessageTextQuote? _actionQuote;
   Rect? _actionRect; // bounds in the action-overlay Stack's coordinate space
   final GlobalKey _actionOverlayKey = GlobalKey();
   GlobalKey<SelectionAreaState>? _mobileTextSelectionAreaKey;
@@ -1109,6 +1270,12 @@ class _ChatViewState extends State<ChatView> {
   String _reactionTab = 'standard'; // 'standard' or a custom-emoji pack id
   MessageReactionAvailability? _actionReactionAvailability;
   int _actionReactionAvailabilityGeneration = 0;
+  bool? _actionMessageLinkAvailable;
+  bool? _actionCanReply;
+  int _actionPropertiesGeneration = 0;
+  Offset?
+  _actionAnchor; // overlay-space point the HUD grows from / collapses to
+  Widget? _actionOverlaySnapshot; // last visible overlay, replayed during exit
   int _lastCount = 0;
   bool _didInitialScroll = false; // one-time entry positioning has run
   bool _showJumpDown = false; // scrolled up → show jump-to-bottom button
@@ -1116,8 +1283,22 @@ class _ChatViewState extends State<ChatView> {
   Timer? _bannerTimer; // auto-hides the banner a few seconds after it appears
   Timer? _readSyncTimer;
   Timer? _handoffUpdateTimer;
+  Timer? _linkedMessageHighlightFadeTimer;
+  Timer? _linkedMessageHighlightClearTimer;
   int? _scrollTargetId;
   int _scrollTargetGeneration = 0;
+
+  /// See [_ChatJumpOrigin]. Live from the moment a reply/View in Chat jump
+  /// starts until the arrow consumes it, the user drags the transcript away
+  /// from the jump target, or the session ends.
+  _ChatJumpOrigin? _jumpOrigin;
+  // Unlike the target generation, this survives a successful target clear so
+  // post-layout corrections can still be cancelled by a newer user intent.
+  int _jumpOriginReturnGeneration = 0;
+
+  /// Scroll offset when the drag that may abandon [_jumpOrigin] began. Null
+  /// outside such a drag, so programmatic scrolls cannot measure against it.
+  double? _jumpOriginDragBaseline;
   int _transcriptGestureGeneration = 0;
   int? _lastNewestMessageId;
   int? _lastOldestMessageId;
@@ -1144,6 +1325,8 @@ class _ChatViewState extends State<ChatView> {
   /// survives the jump that put it there, so the bubble stays marked while the
   /// user steps through the rest of the results.
   int? _searchHighlightId;
+  int? _linkedMessageHighlightId;
+  bool _linkedMessageHighlightActive = false;
   double _keyboardInset = 0;
   // Bumped once per ChatView build; the shell LayoutBuilder reuses its subtree
   // whenever the generation and the available width are both unchanged.
@@ -1196,6 +1379,7 @@ class _ChatViewState extends State<ChatView> {
   bool _maintainRestoredBottom = false;
   final _restoredBottomCorrection = ChatBottomCorrectionCoordinator();
   bool _openingUnreadMention = false;
+  bool _openingUnreadReaction = false;
   bool _openingUnreadSummary = false;
   bool _exitStatePrepared = false;
   bool _notificationVisibilityRegistered = false;
@@ -1210,6 +1394,8 @@ class _ChatViewState extends State<ChatView> {
   final Set<int> _autoTranslatedMessageIds = <int>{};
   bool _sendFailureDialogVisible = false;
   VoidCallback? _detachExitController;
+  VoidCallback? _detachRevealLatestController;
+  VoidCallback? _detachPaneBackHandler;
   final ChatSessionCacheWriteGate _sessionCacheWriteGate =
       ChatSessionCacheWriteGate();
 
@@ -1218,7 +1404,10 @@ class _ChatViewState extends State<ChatView> {
   static const _initialTargetAlignment = 0.30;
   static const _initialUnreadAlignment = 0.12;
   static const _pendingTranscriptOrderId = 0x7FFFFFFFFFFFFFFF;
-  static final Map<({int accountSlot, int chatId}), _ChatScrollSnapshot>
+  static final Map<
+    ({int accountSlot, int chatId, int? forumTopicId}),
+    _ChatScrollSnapshot
+  >
   _sessionScrollSnapshots = {};
   static final ChatSessionCache _sessionCache = ChatSessionCache();
   late final ChatAutoScrollPolicy _autoScrollPolicy;
@@ -1251,6 +1440,9 @@ class _ChatViewState extends State<ChatView> {
   void initState() {
     super.initState();
     _detachExitController = widget.exitController?.register(_prepareExitState);
+    _detachRevealLatestController = widget.revealLatestController?.register(
+      _onRevealLatestRequested,
+    );
     _wallpaperController.addListener(_onWallpaperChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -1263,11 +1455,13 @@ class _ChatViewState extends State<ChatView> {
     _sessionKey = (
       accountSlot: TdClient.shared.activeSlot,
       chatId: widget.chatId,
+      forumTopicId: widget.forumTopicId,
     );
     _sessionRenderState = widget.initialMessageId == null
         ? _sessionCache.read(
             accountSlot: _sessionKey.accountSlot,
             chatId: _sessionKey.chatId,
+            forumTopicId: _sessionKey.forumTopicId,
           )
         : null;
     _olderHistoryExhaustedHint =
@@ -1340,6 +1534,7 @@ class _ChatViewState extends State<ChatView> {
     )..addListener(_onScroll);
     _vm = ChatViewModel(
       chatId: widget.chatId,
+      forumTopicId: widget.forumTopicId,
       title: widget.title,
       markReadOnOpen: _shouldOpenAtBottom,
       initialMessageId: widget.initialMessageId,
@@ -1370,6 +1565,7 @@ class _ChatViewState extends State<ChatView> {
     unawaited(_loadBotApiWarningDismissal());
     _historyWindowRevision = _vm.historyWindowRevision;
     _historyWindowInvalidationRevision = _vm.historyWindowInvalidationRevision;
+    _fullViewRevision = _vm.fullViewRevision;
     unawaited(
       TelegramCountryNames.shared
           .load()
@@ -1399,6 +1595,7 @@ class _ChatViewState extends State<ChatView> {
       onActivateResult: _openSearchResult,
     )..addListener(_onSearchChanged);
     _vm.addListener(_onModel);
+    _vm.addListener(_publishTopicList);
     _setScrollTarget(widget.initialMessageId);
     _vm.onAppear();
     _readSyncTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -1422,14 +1619,170 @@ class _ChatViewState extends State<ChatView> {
   @override
   void didUpdateWidget(covariant ChatView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (identical(oldWidget.exitController, widget.exitController)) return;
-    _detachExitController?.call();
-    _detachExitController = widget.exitController?.register(_prepareExitState);
+    if (oldWidget.chatId != widget.chatId ||
+        oldWidget.forumTopicId != widget.forumTopicId) {
+      // A switch to another conversation or topic invalidates every recorded
+      // reading position, this one included.
+      _forgetJumpOrigin();
+    }
+    if (!identical(oldWidget.exitController, widget.exitController)) {
+      _detachExitController?.call();
+      _detachExitController = widget.exitController?.register(
+        _prepareExitState,
+      );
+    }
+    if (!identical(
+      oldWidget.revealLatestController,
+      widget.revealLatestController,
+    )) {
+      _detachRevealLatestController?.call();
+      _detachRevealLatestController = widget.revealLatestController?.register(
+        _onRevealLatestRequested,
+      );
+    }
   }
+
+  /// Whether this chat's topics are known — resolved live or seeded from the
+  /// process-wide index — so a pane rebuilt for another topic keeps its rail
+  /// instead of flashing an "All"-only strip until getChat resolves.
+  bool get _topicsKnown =>
+      _vm.supportsTopics ||
+      ForumTopicIndex.shared.knowsTopics(
+        _sessionKey.accountSlot,
+        widget.chatId,
+      );
+
+  // The split shell's topic-list relay: while this transcript lives in a
+  // sidebar-placement shell, its topic list is handed to the shell, which
+  // overlays it on the chat list column the way Telegram iOS does. The shell
+  // owns that pane, so topic switches keep its scroll position.
+  TopicListHost? _shellTopicListHost;
+  TopicListAttachment? _publishedAttachment;
+  bool _topicListOverlaid = false;
+
+  /// Wide split shells overlay this transcript's topic list on the chat list
+  /// column, so the in-pane rail stays out of the conversation there.
+  void _syncTopicListHostScope() {
+    _shellTopicListHost =
+        TopicListPlacementScope.of(context) == TopicListPlacement.sidebar
+        ? context.read<TopicListHost?>()
+        : null;
+  }
+
+  /// Publishes (or retracts) this transcript's topic list with the shell's
+  /// relay. Publishing an unchanged list is a no-op, so the shell's pane —
+  /// and its scroll position — survives every topic switch.
+  void _publishTopicList() {
+    if (!mounted) return;
+    final host = _shellTopicListHost;
+    // Forums hand their topic list to the shell the way Telegram iOS does;
+    // bot-topic chats keep the in-pane rail they already had. A pane rebuilt
+    // for another topic of the same forum inherits the outgoing attachment's
+    // verdict, because its fresh view model only learns isForum after an
+    // async getChat — without the handoff the shell would drop the overlay
+    // mid-switch and lose the pane's scroll. A fresh pane for a chat whose
+    // topics the shared index already knows is equally a forum: the index
+    // only fills from forum topic traffic, so it is evidence enough to keep
+    // the list on the chat list column while getChat is still in flight.
+    final prior = host?.attachment;
+    final takesOverForumList = prior?.chatId == widget.chatId;
+    final indexKnowsTopics = ForumTopicIndex.shared.knowsTopics(
+      _vm.accountSlot,
+      widget.chatId,
+    );
+    final overlaid =
+        host != null &&
+        (takesOverForumList || _vm.isForum || indexKnowsTopics) &&
+        !_vm.hasForumTabs;
+    _topicListOverlaid = overlaid;
+    final attachment = overlaid ? _topicListAttachment() : null;
+    final previous = _publishedAttachment;
+    if (attachment != null &&
+        previous != null &&
+        previous.sameContent(attachment)) {
+      return;
+    }
+    _publishedAttachment = attachment;
+    // The shell's sidebar listens to the host; publishing mid-build would
+    // mark an already-built ancestor dirty.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (attachment != null) {
+        if (mounted) host?.publish(attachment);
+        return;
+      }
+      if (previous != null) host?.unpublish(previous);
+    });
+  }
+
+  TopicListAttachment _topicListAttachment() => TopicListAttachment(
+    chatId: widget.chatId,
+    title: _vm.peerTitle.isEmpty ? widget.title : _vm.peerTitle,
+    usesSquareAvatar: _vm.isGroup || _vm.isChannel,
+    photo: _vm.peerPhoto,
+    topics: _topicListRows(),
+    selectedTopicId: widget.forumTopicId,
+    onSelect: _openTopicTranscript,
+    onCreateTopic: _vm.canCreateForumTopics ? _openCreateTopicDialog : null,
+    onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
+    onTopicMenu: _showTopicRowMenu,
+  );
+
+  bool get _hasUnreadTopics =>
+      _vm.forumTopics.any((topic) => topic.unreadCount > 0);
+
+  /// The rows handed to the shell. A pane rebuilt for another topic seeds
+  /// from the shared index first, which knows identities and counters but
+  /// not previews; the rows already published for this chat fill those in so
+  /// the overlay never flashes to bare rows mid-switch.
+  List<TopicNavigationItem> _topicListRows() {
+    final prior = _shellTopicListHost?.attachment;
+    final previousRows = prior?.chatId == widget.chatId
+        ? {for (final item in prior!.topics) item.id: item}
+        : null;
+    return [
+      for (final topic in _vm.forumTopics)
+        _topicNavigationItem(topic, prior: previousRows?[topic.id]),
+    ];
+  }
+
+  TopicNavigationItem _topicNavigationItem(
+    ForumTopicOption topic, {
+    TopicNavigationItem? prior,
+  }) => TopicNavigationItem(
+    id: topic.id,
+    name: topic.name,
+    iconCustomEmojiId: topic.iconCustomEmojiId,
+    iconColor: topic.iconColor,
+    unreadCount: topic.unreadCount,
+    isMuted: topic.isMuted,
+    // A fresh model page can explicitly unpin a topic; the previously
+    // published marker must not turn that false back into true.
+    isPinned: topic.isPinned,
+    isGeneral: topic.isGeneral || (prior?.isGeneral ?? false),
+    isClosed: topic.isClosed || (prior?.isClosed ?? false),
+    lastPreview: topic.lastPreview.isNotEmpty
+        ? topic.lastPreview
+        : prior?.lastPreview ?? '',
+    lastSender: topic.lastPreview.isNotEmpty
+        ? topic.lastSender
+        : prior?.lastSender,
+    lastMessageDate: topic.lastMessageDate != 0
+        ? topic.lastMessageDate
+        : prior?.lastMessageDate ?? 0,
+  );
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _detachPaneBackHandler?.call();
+    _detachPaneBackHandler = ChatPane.registerBackHandler(context, () {
+      if (_search.isActive) {
+        _closeSearch();
+        return true;
+      }
+      _prepareExitState();
+      return false;
+    });
     final tickerEnabled = TickerMode.valuesOf(context).enabled;
     final reactivated = !_viewTickerEnabled && tickerEnabled;
     _viewTickerEnabled = tickerEnabled;
@@ -1469,6 +1822,8 @@ class _ChatViewState extends State<ChatView> {
       );
     }
     _scheduleHandoffRefresh();
+    _syncTopicListHostScope();
+    _publishTopicList();
   }
 
   int? _handoffMessageId() {
@@ -1539,7 +1894,13 @@ class _ChatViewState extends State<ChatView> {
         isNearOldest(pos, threshold: 500)) {
       unawaited(_loadOlderFromScroll());
     }
-    final nearBottom = _isNearBottom(80);
+    if (_initialTranscriptReady &&
+        _scrollTargetId == null &&
+        pos.userScrollDirection == ScrollDirection.reverse &&
+        _isNearBottom(500)) {
+      unawaited(_vm.loadNewer());
+    }
+    final nearBottom = _vm.historyReachesLatest && _isNearBottom(80);
     if (_isAtLoadedBottom(1)) {
       _autoScrollPolicy.returnToBottom();
       if (!_hasTranscriptPointerDown) {
@@ -1569,9 +1930,10 @@ class _ChatViewState extends State<ChatView> {
       _lastTranscriptUserScrollDirection = ScrollDirection.idle;
       final protectedRestoredPosition = _restoredPositionGuard
           .finishUserScroll();
+      _releaseJumpOriginAfterDrag();
       _returnToLatestCoordinator.userDragEnded();
       if (endedTowardLatest && !protectedRestoredPosition) {
-        _requestAutomaticReturnToLatestIfNearLatest();
+        unawaited(_continueHistoryIfNearLatest());
       }
     } else if (_initialTranscriptReady) {
       // Once an older-page request is in flight, a turn toward the latest
@@ -1585,6 +1947,9 @@ class _ChatViewState extends State<ChatView> {
       _lastTranscriptUserScrollDirection = notification.direction;
       _restoredPositionGuard.noteUserScroll();
       _claimTranscriptViewport();
+      // A real drag is the only thing that can carry the reader away from the
+      // jump target; measure how far it went when it ends.
+      _noteJumpOriginDragStart();
     }
     return false;
   }
@@ -1610,6 +1975,7 @@ class _ChatViewState extends State<ChatView> {
     } else if (notification is ScrollEndNotification) {
       _olderHistoryPull.reset();
       _scheduleLoadedOlderReveal();
+      _scheduleTranscriptBottomGapCorrection();
       _saveSessionScrollSnapshot();
       _scheduleHandoffRefresh();
     }
@@ -1704,6 +2070,7 @@ class _ChatViewState extends State<ChatView> {
     _scheduleShortTranscriptFill();
     _scheduleSessionScrollAnchorMaintenance();
     _scheduleRestoredBottomCorrection();
+    _scheduleTranscriptBottomGapCorrection();
     if (!_hasTranscriptPointerDown && _isAtLoadedBottom(1)) {
       _transcriptViewportClaimedByUser = false;
     }
@@ -1711,6 +2078,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _claimTranscriptViewport() {
+    ++_jumpOriginReturnGeneration;
     ++_transcriptGestureGeneration;
     if (_scrollTargetId != null) {
       setState(_invalidateScrollNavigation);
@@ -1800,6 +2168,7 @@ class _ChatViewState extends State<ChatView> {
   void _prepareExitState() {
     if (_exitStatePrepared) return;
     _exitStatePrepared = true;
+    _forgetJumpOrigin();
     final sessionReopenPending = _sessionReopenPending;
     _cancelSessionReopenNavigation();
     if (!sessionReopenPending && !_maintainSessionScrollAnchor) {
@@ -1832,7 +2201,8 @@ class _ChatViewState extends State<ChatView> {
     }
     _sessionCache.store(
       accountSlot: _sessionKey.accountSlot,
-      chatId: widget.chatId,
+      chatId: _sessionKey.chatId,
+      forumTopicId: _sessionKey.forumTopicId,
       messages: _vm.messages,
       anchoredHistory: _vm.anchoredHistory,
       olderHistoryExhausted: olderHistoryExhausted,
@@ -1889,10 +2259,9 @@ class _ChatViewState extends State<ChatView> {
     double? visibleAnchorTop;
     int? partialAnchorMessageId;
     double? partialAnchorTop;
-    for (final entry in _trackedTranscriptEntries.entries) {
-      final itemContext = _entryVisibilityKeys[entry.key]?.currentContext;
-      final itemRenderObject = itemContext?.findRenderObject();
-      if (itemRenderObject is! RenderBox || !itemRenderObject.attached) {
+    for (final entry in _mountedTranscriptEntries.entries) {
+      final itemRenderObject = entry.value;
+      if (!itemRenderObject.attached) {
         continue;
       }
       final itemTop = itemRenderObject
@@ -1942,10 +2311,9 @@ class _ChatViewState extends State<ChatView> {
     var changed = false;
     final newlyVisible = <ChatMessage>[];
 
-    for (final entry in _trackedTranscriptEntries.entries) {
-      final itemContext = _entryVisibilityKeys[entry.key]?.currentContext;
-      final itemRenderObject = itemContext?.findRenderObject();
-      if (itemRenderObject is! RenderBox || !itemRenderObject.attached) {
+    for (final entry in _mountedTranscriptEntries.entries) {
+      final itemRenderObject = entry.value;
+      if (!itemRenderObject.attached) {
         continue;
       }
       final itemOrigin = itemRenderObject.localToGlobal(
@@ -1955,7 +2323,9 @@ class _ChatViewState extends State<ChatView> {
       final itemRect = itemOrigin & itemRenderObject.size;
       if (!itemRect.overlaps(viewportRect)) continue;
 
-      for (final message in entry.value.messages) {
+      for (final message
+          in _trackedTranscriptEntries[entry.key]?.messages ??
+              const <ChatMessage>[]) {
         if (message.isOutgoing || message.isService) continue;
         final observation = _unreadProgress.observeVisibleIncoming(
           messageId: message.id,
@@ -1989,18 +2359,69 @@ class _ChatViewState extends State<ChatView> {
         (position.pixels - position.minScrollExtent).abs() <= 1) {
       return true;
     }
-    return isNearLatest(position, threshold: threshold);
+    return (_loadedBottomOffset - position.pixels).abs() <= threshold;
   }
 
   double get _loadedBottomOffset {
     final position = _scroll.position;
-    return _showingFullyVisibleFirstContactHistory
-        ? position.minScrollExtent
-        : position.maxScrollExtent;
+    if (_showingFullyVisibleFirstContactHistory) {
+      return position.minScrollExtent;
+    }
+    if (_vm.isLoadingLatest) return position.maxScrollExtent;
+    final latestId = _transcriptCache?.lastOrNull?.last.id;
+    final latest = _mountedTranscriptEntries[latestId];
+    final viewport = _transcriptViewportKey.currentContext?.findRenderObject();
+    if (latest != null &&
+        latest.attached &&
+        latest.hasSize &&
+        viewport is RenderBox &&
+        viewport.attached &&
+        viewport.hasSize) {
+      final bottom = latest
+          .localToGlobal(Offset(0, latest.size.height), ancestor: viewport)
+          .dy;
+      // A center sliver clamps maxScrollExtent to zero even when its short
+      // final arm ends above the viewport bottom. Its real latest edge can
+      // be negative, with older messages filling the space above it.
+      return clampScrollOffset(
+        position,
+        position.pixels + bottom + 8 - viewport.size.height,
+      );
+    }
+    return position.maxScrollExtent;
+  }
+
+  void _scheduleTranscriptBottomGapCorrection() {
+    if (_bottomGapCorrectionScheduled) return;
+    _bottomGapCorrectionScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _bottomGapCorrectionScheduled = false;
+      if (!mounted ||
+          !_initialTranscriptReady ||
+          !_scroll.hasClients ||
+          !_scroll.position.hasContentDimensions ||
+          _hasTranscriptPointerDown ||
+          _isUserScrolling ||
+          _scrollTargetId != null ||
+          _maintainSessionScrollAnchor ||
+          _showingFullyVisibleFirstContactHistory) {
+        return;
+      }
+      final target = _loadedBottomOffset;
+      if (_scroll.position.pixels <= target + 1) return;
+      // Clamp only the empty trailing area after a resize or finished drag.
+      // Keep the pivot and the current history window; fetching latest here
+      // would discard an unread/search destination.
+      _cancelBottomFollow();
+      _scroll.jumpTo(target);
+      _saveSessionScrollSnapshot();
+    });
   }
 
   bool _isAtLoadedBottom([double threshold = 24]) {
-    return !_vm.anchoredHistory && _isNearBottom(threshold);
+    return _vm.historyReachesLatest &&
+        !_vm.anchoredHistory &&
+        _isNearBottom(threshold);
   }
 
   void _clearBottomIndicatorsIfNeeded() {
@@ -2062,6 +2483,7 @@ class _ChatViewState extends State<ChatView> {
     _scheduleTranscriptPivotFreeze();
     _scheduleUnreadProgressUpdate();
     _scheduleShortFirstContactReveal();
+    _scheduleTranscriptBottomGapCorrection();
   }
 
   void _scheduleScrollToBottom({
@@ -2156,7 +2578,86 @@ class _ChatViewState extends State<ChatView> {
   bool get _showReturnToLatestProgress =>
       _returnToLatestCoordinator.showProgress;
 
+  /// Records where the reader is standing before an in-transcript jump. A
+  /// chain of jumps keeps the FIRST origin: that is the place the reader
+  /// actually left, and every later jump is only a detour away from it.
+  void _captureJumpOrigin() {
+    if (_jumpOrigin != null || _scrollTargetId != null) return;
+    if (!mounted || !_initialTranscriptReady || !_scroll.hasClients) return;
+    // Already at the newest edge: the arrow's existing meaning is still the
+    // right one, so there is nothing to remember.
+    if (_isAtLoadedBottom(80)) return;
+    final anchor = _captureSessionScrollAnchor();
+    if (anchor == null) return;
+    _jumpOrigin = _ChatJumpOrigin(
+      messageId: anchor.messageId,
+      viewportOffset: anchor.viewportOffset,
+    );
+  }
+
+  void _forgetJumpOrigin() {
+    ++_jumpOriginReturnGeneration;
+    _jumpOrigin = null;
+    _jumpOriginDragBaseline = null;
+  }
+
+  /// Remembers where the viewport stood when a real drag began. A tap (reply
+  /// quote, timestamp) produces no scroll notification, so it can never be
+  /// mistaken for the drag that abandons the origin.
+  void _noteJumpOriginDragStart() {
+    if (_jumpOrigin == null || !_hasTranscriptPointerDown) return;
+    _jumpOriginDragBaseline ??= _scroll.hasClients
+        ? _scroll.position.pixels
+        : null;
+  }
+
+  /// Drops the origin once a drag has carried the viewport a meaningful
+  /// distance away from the jump target. A small nudge to read the quoted
+  /// neighbourhood keeps the arrow pointing back at where the reader left.
+  void _releaseJumpOriginAfterDrag() {
+    final baseline = _jumpOriginDragBaseline;
+    _jumpOriginDragBaseline = null;
+    if (baseline == null || _jumpOrigin == null || !_scroll.hasClients) return;
+    final viewport = _transcriptViewportKey.currentContext?.findRenderObject();
+    final viewportHeight = viewport is RenderBox && viewport.attached
+        ? viewport.size.height
+        : 0.0;
+    final threshold = math.max(120.0, viewportHeight * 0.35);
+    if ((_scroll.position.pixels - baseline).abs() >= threshold) {
+      _forgetJumpOrigin();
+    }
+  }
+
+  /// The floating arrow: returns to the message the reader left while a jump
+  /// origin is live, and to the newest message otherwise.
   void _onReturnToLatestTapped() {
+    final origin = _jumpOrigin;
+    if (origin != null) {
+      // A tap always consumes the origin, even when its row can no longer be
+      // reached: a stale origin must never outlive the tap that asked for it.
+      _jumpOrigin = null;
+      unawaited(_returnToJumpOrigin(origin));
+      return;
+    }
+    _requestReturnToLatest(userInitiated: true);
+  }
+
+  /// The shell asked for the newest message — because the reader tapped the
+  /// conversation that is already open, or re-opened it from a link. This is
+  /// the same intent as tapping the return-to-latest arrow, so it goes through
+  /// the same coordinator: an anchored history window loads the latest page
+  /// first, and a plain scroll-up just animates back to the edge.
+  void _onRevealLatestRequested() {
+    if (!mounted) return;
+    if (!_scroll.hasClients) {
+      // The pane is still laying out (a fresh selection being built), so there
+      // is no viewport to move yet. Re-ask once the frame is done instead of
+      // leaving a pending intent that would fire on some later scroll.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _requestReturnToLatest(userInitiated: true);
+      });
+      return;
+    }
     _requestReturnToLatest(userInitiated: true);
   }
 
@@ -2193,9 +2694,60 @@ class _ChatViewState extends State<ChatView> {
     _markReadAtBottomIfNeeded();
   }
 
+  Future<void> _returnToJumpOrigin(_ChatJumpOrigin origin) async {
+    final restoration = _restoreJumpOrigin(origin);
+    final generation = _jumpOriginReturnGeneration;
+    final restored = await restoration;
+    // The origin's row can vanish between the tap and the layout (a paged
+    // window replaced under it); keep the arrow's old contract as the fallback
+    // rather than swallowing the tap.
+    if (!restored && mounted && generation == _jumpOriginReturnGeneration) {
+      _requestReturnToLatest(userInitiated: true);
+    }
+  }
+
+  Future<bool> _restoreJumpOrigin(_ChatJumpOrigin origin) async {
+    if (!mounted || !_scroll.hasClients) return false;
+    if (!_vm.messages.any((message) => message.id == origin.messageId)) {
+      return false;
+    }
+    _cancelSessionScrollAnchorMaintenance();
+    _maintainRestoredBottom = false;
+    _restoredPositionGuard.cancel();
+    _cancelBottomFollow();
+    _stopActiveTranscriptScroll();
+    // A re-pivot makes raw pixels meaningless, so approach the origin with the
+    // alignment fraction it had and then correct by measurement.
+    final viewport = _transcriptViewportKey.currentContext?.findRenderObject();
+    final viewportHeight = viewport is RenderBox && viewport.attached
+        ? viewport.size.height
+        : null;
+    final alignment = viewportHeight == null || viewportHeight <= 0
+        ? 0.0
+        : (origin.viewportOffset / viewportHeight).clamp(0.0, 1.0);
+    final navigation = _scrollToMessageAndReport(
+      origin.messageId,
+      alignment: alignment,
+      forceAlignment: true,
+    );
+    final generation = _jumpOriginReturnGeneration;
+    final reached = await navigation;
+    if (!reached || !mounted || generation != _jumpOriginReturnGeneration) {
+      return false;
+    }
+    _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || generation != _jumpOriginReturnGeneration) return false;
+    _restoreMessageViewportOffset(origin.messageId, origin.viewportOffset);
+    _saveSessionScrollSnapshot();
+    return true;
+  }
+
   void _requestReturnToLatest({bool userInitiated = false}) {
     if (!userInitiated && _hasTranscriptPointerDown) return;
     if (userInitiated) {
+      // Returning to the newest message abandons the jump origin by design.
+      _forgetJumpOrigin();
       _transcriptViewportClaimedByUser = false;
       _cancelSessionReopenNavigation(userClaimedViewport: true);
       _restoredPositionGuard.cancel();
@@ -2211,9 +2763,9 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
-  void _requestAutomaticReturnToLatestIfNearLatest() {
-    if (!shouldRequestAutomaticReturnToLatest(
-      anchoredHistory: _vm.anchoredHistory,
+  Future<void> _continueHistoryIfNearLatest() async {
+    if (!shouldContinueAnchoredHistory(
+      anchoredHistory: _vm.anchoredHistory || !_vm.historyReachesLatest,
       restoredPositionProtected: _restoredPositionGuard.blocksAutomaticReturn,
       pointerDown: _hasTranscriptPointerDown,
       hasScrollTarget: _scrollTargetId != null,
@@ -2223,7 +2775,12 @@ class _ChatViewState extends State<ChatView> {
     )) {
       return;
     }
-    _requestReturnToLatest();
+    if (!_vm.historyReachesLatest) {
+      await _vm.loadNewer();
+      return;
+    }
+    _vm.resumeLatestHistoryIfLoaded();
+    _onScroll();
   }
 
   void _markReadAtBottomIfNeeded() {
@@ -2335,6 +2892,8 @@ class _ChatViewState extends State<ChatView> {
   /// boundary may already point at the newest message after the chat is marked
   /// read, so it cannot be used to resolve this button later.
   Future<void> _jumpToFirstUnread() async {
+    // Choosing a different destination drops the recorded jump origin.
+    _forgetJumpOrigin();
     _claimTranscriptViewport();
     await _jumpToFirstUnreadImpl();
   }
@@ -2395,6 +2954,7 @@ class _ChatViewState extends State<ChatView> {
       targetMessageId,
       alignment: _initialUnreadAlignment,
       forceAlignment: true,
+      alignUnreadDivider: _isEntryUnreadMessage(targetMessageId),
       isCancelled: isCancelled,
     );
     return didReachTarget && !isCancelled();
@@ -2582,12 +3142,26 @@ class _ChatViewState extends State<ChatView> {
 
   void _onModel() {
     if (!mounted) return;
-    _syncProtectedContentSelectionState();
-    _reportChatKindIfReady();
-    if (!_viewTickerEnabled) {
-      _modelDirtyWhileInactive = true;
+    final nextFullViewRevision = _vm.fullViewRevision;
+    final requiresFullViewSync = chatViewRequiresFullSync(
+      previousRevision: _fullViewRevision,
+      nextRevision: nextFullViewRevision,
+    );
+    if (!chatViewSyncsModelNotification(
+      viewTickerEnabled: _viewTickerEnabled,
+      exitStatePrepared: _exitStatePrepared,
+    )) {
+      // A covered transcript still owes the sync once it is visible again; one
+      // that is on its way out never does.
+      if (!_viewTickerEnabled && requiresFullViewSync) {
+        _modelDirtyWhileInactive = true;
+      }
       return;
     }
+    if (!requiresFullViewSync) return;
+    _fullViewRevision = nextFullViewRevision;
+    _syncProtectedContentSelectionState();
+    _reportChatKindIfReady();
     _modelDirtyWhileInactive = false;
     _scheduleHandoffRefresh();
     if (!_sendFailureDialogVisible) {
@@ -2606,16 +3180,23 @@ class _ChatViewState extends State<ChatView> {
     // _isTranscriptShort walks every cached entry; nothing below moves the
     // scroll position or the pivot, so one measurement serves all three tests.
     final latestArmIsShort = _isTranscriptShort();
+    final hasPendingMessageTarget =
+        _scrollTargetId != null ||
+        widget.initialMessageId != null ||
+        (_didInitialScroll && !_initialTranscriptReady);
     final hydratedShortTranscript = shouldRebaseForHydratedOlderPage(
       prependedOlder: prependedOlder,
       latestArmWasShort: latestArmIsShort,
       historyFillInFlight: _isFillingShortTranscript || _loadingOlderFromScroll,
       revealRequested: _revealLoadedOlderPage,
+      hasPendingMessageTarget: hasPendingMessageTarget,
     );
-    final followingLatest =
-        !_autoScrollPolicy.preservesViewport &&
-        !_maintainSessionScrollAnchor &&
-        !_transcriptViewportClaimedByUser;
+    final followingLatest = transcriptFollowsLatestEdge(
+      preservesViewport: _autoScrollPolicy.preservesViewport,
+      maintainsSessionAnchor: _maintainSessionScrollAnchor,
+      viewportClaimedByUser: _transcriptViewportClaimedByUser,
+      hasPendingMessageTarget: hasPendingMessageTarget,
+    );
     final hasMessageOlderThanPivot =
         _transcriptPivot != null &&
         _vm.messages.any(
@@ -2637,7 +3218,7 @@ class _ChatViewState extends State<ChatView> {
       viewportClaimedByUser: _transcriptViewportClaimedByUser,
     );
     final wasPinnedToLoadedBottom =
-        _didInitialScroll &&
+        _initialTranscriptReady &&
         !_hasTranscriptPointerDown &&
         !_isUserScrolling &&
         !_transcriptViewportClaimedByUser &&
@@ -2690,6 +3271,7 @@ class _ChatViewState extends State<ChatView> {
         expandedInitialWindow ||
         hydratedShortTranscript ||
         (!_transcriptPivotFrozen &&
+            !hasPendingMessageTarget &&
             _vm.initialLoaded &&
             !identical(_transcriptCacheMessages, _vm.messages));
     if (shouldResetParkedPivot) {
@@ -2737,7 +3319,7 @@ class _ChatViewState extends State<ChatView> {
       _lastNewestMessageId = newest?.id ?? _lastNewestMessageId;
       _lastOldestMessageId = oldest?.id ?? _lastOldestMessageId;
       final shouldAutoScroll =
-          _didInitialScroll &&
+          _initialTranscriptReady &&
           _scrollTargetId == null &&
           !_vm.anchoredHistory &&
           appendedNewest &&
@@ -2771,7 +3353,7 @@ class _ChatViewState extends State<ChatView> {
     if (target != null) {
       _setScrollTarget(target, forceNavigation: true);
       final navigationGeneration = _scrollTargetGeneration;
-      if (_didInitialScroll) {
+      if (_initialTranscriptReady) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted ||
               !_isCurrentScrollTarget(target, navigationGeneration)) {
@@ -2869,6 +3451,7 @@ class _ChatViewState extends State<ChatView> {
   }
 
   void _setScrollTarget(int? messageId, {bool forceNavigation = false}) {
+    if (forceNavigation) ++_jumpOriginReturnGeneration;
     if (forceNavigation || _scrollTargetId != messageId) {
       ++_scrollTargetGeneration;
     }
@@ -2881,6 +3464,35 @@ class _ChatViewState extends State<ChatView> {
       _stopActiveTranscriptScroll();
     }
     _scrollTargetId = messageId;
+  }
+
+  /// Makes an arbitrary loaded target the first child after the scroll view's
+  /// center sliver, so Flutter lays it out without depending on guessed row
+  /// heights. The transcript keeps the same chronological order on both sides
+  /// of the new pivot; only its zero scroll coordinate moves to the target.
+  bool _stageMessageAtTranscriptCenter(int messageId) {
+    if (!_scroll.hasClients) return false;
+    ChatMessage? target;
+    for (final message in _vm.messages) {
+      if (message.id == messageId) {
+        target = message;
+        break;
+      }
+    }
+    if (target == null) return false;
+
+    final cutoff = _transcriptOrderId(target);
+    if (_transcriptPivot?.cutoffMessageId != cutoff ||
+        !_transcriptPivotFrozen) {
+      setState(() {
+        _transcriptPivot = TranscriptPivot(cutoff);
+        // Async sender, preview, and media hydration must not reset the pivot
+        // before the target's final alignment passes have completed.
+        _transcriptPivotFrozen = true;
+      });
+    }
+    _scroll.jumpTo(clampScrollOffset(_scroll.position, 0));
+    return true;
   }
 
   void _cancelSessionScrollAnchorMaintenance() {
@@ -2942,6 +3554,9 @@ class _ChatViewState extends State<ChatView> {
   /// deterministic estimate immediately and then do one zero-duration correction
   /// after layout, without waiting to reveal the UI.
   Future<void> _completeInitialScroll() async {
+    // Opening (or reopening) the session establishes a fresh reading position;
+    // an origin from a previous visit of this state must not survive it.
+    _forgetJumpOrigin();
     if (_shouldRestoreSessionScroll) {
       await _restoreSessionScrollPosition();
     } else {
@@ -2952,6 +3567,11 @@ class _ChatViewState extends State<ChatView> {
       setState(() => _initialTranscriptReady = true);
       return;
     }
+    final shortUnreadTail =
+        _initialViewportTarget().kind ==
+            ChatInitialViewportTargetKind.firstUnread &&
+        _vm.historyReachesLatest &&
+        _isTranscriptShort();
     if (_repairParkedShortTranscriptPivot()) {
       await WidgetsBinding.instance.endOfFrame;
       if (!mounted) return;
@@ -2959,7 +3579,17 @@ class _ChatViewState extends State<ChatView> {
         setState(() => _initialTranscriptReady = true);
         return;
       }
-      if (_canFollowLoadedBottom()) _scrollToBottom();
+      if (_canFollowLoadedBottom() || shortUnreadTail) _scrollToBottom();
+      if (shortUnreadTail) {
+        // Finish the short unread tail's bottom alignment before revealing it.
+        // Rebasing a one-row center otherwise exposes empty space, then the
+        // first gesture repairs it with a sudden jump to the newest message.
+        for (var pass = 0; pass < 3; pass++) {
+          await WidgetsBinding.instance.endOfFrame;
+          if (!mounted || _initialTranscriptPositioningAborted) return;
+          _scrollToBottom();
+        }
+      }
     }
     if (!mounted) return;
     setState(() => _initialTranscriptReady = true);
@@ -3069,9 +3699,15 @@ class _ChatViewState extends State<ChatView> {
   bool _restoreSessionScrollAnchor(_ChatScrollSnapshot snapshot) {
     final messageId = snapshot.anchorMessageId;
     final desiredOffset = snapshot.anchorViewportOffset;
-    if (messageId == null || desiredOffset == null || !_scroll.hasClients) {
-      return false;
-    }
+    if (messageId == null || desiredOffset == null) return false;
+    return _restoreMessageViewportOffset(messageId, desiredOffset);
+  }
+
+  /// Puts [messageId] back at [desiredOffset] pixels below the transcript
+  /// viewport top, measured rather than replayed as raw pixels: the row may sit
+  /// in a different sliver window than it did when the offset was recorded.
+  bool _restoreMessageViewportOffset(int messageId, double desiredOffset) {
+    if (!_scroll.hasClients) return false;
     final viewportContext = _transcriptViewportKey.currentContext;
     final itemContext = _entryVisibilityKeys[messageId]?.currentContext;
     final viewportRenderObject = viewportContext?.findRenderObject();
@@ -3105,7 +3741,20 @@ class _ChatViewState extends State<ChatView> {
 
   Future<void> _positionInitialTranscript() async {
     if (!_scroll.hasClients || _initialTranscriptPositioningAborted) return;
-    _jumpToInitialEstimate();
+    // Build the resolved unread row before aligning it. Height estimates can
+    // skip it entirely in channels with long posts and mixed media.
+    final decision = _initialViewportTarget();
+    final initialTarget = decision.messageId;
+    if (initialTarget != null &&
+        (decision.kind == ChatInitialViewportTargetKind.message ||
+            decision.kind == ChatInitialViewportTargetKind.readBoundary)) {
+      setState(() => _setScrollTarget(initialTarget));
+    }
+    if (initialTarget == null ||
+        !_stageMessageAtTranscriptCenter(initialTarget)) {
+      _jumpToInitialEstimate();
+    }
+    var corrected = false;
     for (var i = 0; i < 3; i++) {
       await WidgetsBinding.instance.endOfFrame;
       if (!mounted ||
@@ -3113,8 +3762,13 @@ class _ChatViewState extends State<ChatView> {
           _initialTranscriptPositioningAborted) {
         return;
       }
-      await _correctInitialPosition();
+      corrected = await _correctInitialPosition() || corrected;
       if (_initialTranscriptPositioningAborted) return;
+    }
+    // Keep one target key through every alignment pass. Clearing it inside
+    // the loop leaves later passes pointing at a key that was never built.
+    if (corrected && mounted && _scrollTargetId == initialTarget) {
+      setState(() => _setScrollTarget(null));
     }
   }
 
@@ -3125,12 +3779,10 @@ class _ChatViewState extends State<ChatView> {
     _scroll.jumpTo(position);
   }
 
-  double? _initialPositionEstimate() {
-    if (!_scroll.hasClients || _vm.messages.isEmpty) return null;
-    final max = _scroll.position.maxScrollExtent;
+  ChatInitialViewportTarget _initialViewportTarget() {
     final i = _firstUnreadIndex();
     final boundaryLoaded = _isUnreadBoundaryLoaded();
-    final decision = resolveChatInitialViewportTarget(
+    return resolveChatInitialViewportTarget(
       explicitMessageId: widget.initialMessageId,
       pendingMessageId: _scrollTargetId,
       openAtBottom: _shouldOpenAtBottom,
@@ -3140,6 +3792,12 @@ class _ChatViewState extends State<ChatView> {
       unreadBoundaryLoaded: boundaryLoaded,
       lastReadInboxId: _entryLastReadInboxId,
     );
+  }
+
+  double? _initialPositionEstimate() {
+    if (!_scroll.hasClients || _vm.messages.isEmpty) return null;
+    final max = _scroll.position.maxScrollExtent;
+    final decision = _initialViewportTarget();
     return switch (decision.kind) {
       ChatInitialViewportTargetKind.message ||
       ChatInitialViewportTargetKind.readBoundary => () {
@@ -3161,18 +3819,7 @@ class _ChatViewState extends State<ChatView> {
     if (!_scroll.hasClients || _initialTranscriptPositioningAborted) {
       return false;
     }
-    final i = _firstUnreadIndex();
-    final boundaryLoaded = _isUnreadBoundaryLoaded();
-    final decision = resolveChatInitialViewportTarget(
-      explicitMessageId: widget.initialMessageId,
-      pendingMessageId: _scrollTargetId,
-      openAtBottom: _shouldOpenAtBottom,
-      anchoredHistory: _vm.anchoredHistory,
-      unreadCount: _entryUnreadCount,
-      firstUnreadMessageId: i < 0 ? null : _vm.messages[i].id,
-      unreadBoundaryLoaded: boundaryLoaded,
-      lastReadInboxId: _entryLastReadInboxId,
-    );
+    final decision = _initialViewportTarget();
     switch (decision.kind) {
       case ChatInitialViewportTargetKind.message:
       case ChatInitialViewportTargetKind.readBoundary:
@@ -3183,9 +3830,6 @@ class _ChatViewState extends State<ChatView> {
           alignment: _initialTargetAlignment,
         );
         if (_initialTranscriptPositioningAborted) return false;
-        if (corrected && mounted && _scrollTargetId == target) {
-          setState(() => _setScrollTarget(null));
-        }
         return corrected;
       case ChatInitialViewportTargetKind.firstUnread:
         return _ensureKeyVisible(
@@ -3407,7 +4051,7 @@ class _ChatViewState extends State<ChatView> {
     _parkedShortTranscriptRepairScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _parkedShortTranscriptRepairScheduled = false;
-      if (!mounted) return;
+      if (!mounted || !_initialTranscriptReady) return;
       if (!_repairParkedShortTranscriptPivot()) return;
       setState(() {});
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -3451,6 +4095,7 @@ class _ChatViewState extends State<ChatView> {
 
   Future<void> _fillShortTranscript() async {
     if (!mounted ||
+        !_initialTranscriptReady ||
         !_scroll.hasClients ||
         !_vm.initialLoaded ||
         _initialTranscriptPositionCancelled) {
@@ -3545,6 +4190,15 @@ class _ChatViewState extends State<ChatView> {
 
   bool _isTranscriptShort() {
     if (!_scroll.hasClients) return true;
+    // An unread/search destination can contain just one or two very tall
+    // messages. A thin around-unread page may also fall back to latest history,
+    // clearing anchoredHistory without changing the unread entry destination.
+    // In either case, a low row count must not rebase a full-height message
+    // and jump past its unread divider to the bottom.
+    if (_vm.anchoredHistory ||
+        (_entryUnreadCount > 0 && !_shouldOpenAtBottom)) {
+      return _scroll.position.maxScrollExtent <= 24;
+    }
     // With a center sliver, only the after-center arm defines the latest edge.
     // A large negative min extent says nothing about whether that arm fills
     // the viewport.
@@ -3624,6 +4278,8 @@ class _ChatViewState extends State<ChatView> {
     setState(() {
       _actionTarget = null;
       _actionRect = null;
+      // Multi-select replaces the HUD outright; there is no exit to replay.
+      _actionOverlaySnapshot = null;
       _clearMobileTextSelectionState();
       _actionSource = MessageActionSource.normal;
       _reactionExpanded = false;
@@ -3672,11 +4328,9 @@ class _ChatViewState extends State<ChatView> {
       final viewportBottom = viewportRenderObject.size.height;
       var bestDistance = double.infinity;
       int? bestIndex;
-      for (final trackedEntry in _trackedTranscriptEntries.entries) {
-        final itemContext =
-            _entryVisibilityKeys[trackedEntry.key]?.currentContext;
-        final itemRenderObject = itemContext?.findRenderObject();
-        if (itemRenderObject is! RenderBox || !itemRenderObject.attached) {
+      for (final trackedEntry in _mountedTranscriptEntries.entries) {
+        final itemRenderObject = trackedEntry.value;
+        if (!itemRenderObject.attached) {
           continue;
         }
         final itemTop = itemRenderObject
@@ -3691,7 +4345,8 @@ class _ChatViewState extends State<ChatView> {
                   : viewportBottom - itemBottom);
         if (distance >= bestDistance) continue;
         bestDistance = distance;
-        final entry = trackedEntry.value;
+        final entry = _trackedTranscriptEntries[trackedEntry.key];
+        if (entry == null) continue;
         bestIndex = topEdge
             ? entry.startIndex
             : entry.startIndex + entry.messages.length - 1;
@@ -3727,6 +4382,33 @@ class _ChatViewState extends State<ChatView> {
     });
   }
 
+  /// Markdown detection over the messages about to be forwarded: the picker
+  /// offers the render option when any message carries convertible markers and
+  /// pre-checks it when at least one looks like authored Markdown.
+  ForwardMarkdownOffer _forwardMarkdownOffer(List<int> messageIds) {
+    // Both gates are client-side: the re-send is a normal sendMessage, the
+    // server never sees a "rich text forward" mode. The settings toggle keeps
+    // detection opt-in; Premium is required by product decision, and the
+    // cached AccountStore flag is authoritative enough for hiding a chip.
+    final theme = context.read<ThemeController>();
+    if (!theme.forwardRichMarkdown) return const ForwardMarkdownOffer.none();
+    if (!(context.read<AccountStore?>()?.activeIsPremium ?? false)) {
+      return const ForwardMarkdownOffer.none();
+    }
+    var available = false;
+    final byId = {for (final message in _vm.messages) message.id: message};
+    for (final id in messageIds) {
+      final message = byId[id];
+      if (message == null) continue;
+      // Detection is heuristic and must never break forwarding: any parse or
+      // match failure degrades to "no offer", leaving a regular forward.
+      final offer = forwardMarkdownOfferForMessage(message);
+      if (offer.suggested) return offer;
+      if (offer.available) available = true;
+    }
+    return ForwardMarkdownOffer(available: available, suggested: false);
+  }
+
   Future<void> _forwardSelected() async {
     final ids = _orderedSelectedIds();
     if (ids.isEmpty) return;
@@ -3736,9 +4418,10 @@ class _ChatViewState extends State<ChatView> {
     }
     final result = await Navigator.of(context).push<ChatPickerResult>(
       MaterialPageRoute(
-        builder: (_) => const ChatPickerView(
+        builder: (_) => ChatPickerView(
           title: AppStringKeys.chatForwardToTitle,
           showForwardOptions: true,
+          markdownOffer: _forwardMarkdownOffer(ids),
         ),
       ),
     );
@@ -3815,18 +4498,30 @@ class _ChatViewState extends State<ChatView> {
   @override
   void dispose() {
     _prepareExitState();
+    _detachPaneBackHandler?.call();
     _detachExitController?.call();
+    _detachRevealLatestController?.call();
     NotificationController.shared.unregisterVisibleChat(this);
     ActiveConversation.shared.unregister(this);
     _wallpaperController.removeListener(_onWallpaperChanged);
     _bannerTimer?.cancel();
     _readSyncTimer?.cancel();
     _handoffUpdateTimer?.cancel();
+    _linkedMessageHighlightFadeTimer?.cancel();
+    _linkedMessageHighlightClearTimer?.cancel();
     _translation.removeListener(_onTranslationSettingsChanged);
     _ai?.removeListener(_onTranslationSettingsChanged);
     _search
       ..removeListener(_onSearchChanged)
       ..dispose();
+    final topicListHost = _shellTopicListHost;
+    final publishedTopicList = _publishedAttachment;
+    if (topicListHost != null && publishedTopicList != null) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => topicListHost.unpublish(publishedTopicList),
+      );
+    }
+    _vm.removeListener(_publishTopicList);
     _vm.removeListener(_onModel);
     _vm.onDisappear();
     _vm.dispose();
@@ -3869,6 +4564,71 @@ class _ChatViewState extends State<ChatView> {
           ),
           Expanded(child: Divider(color: c.linkBlue, height: 1, thickness: 1)),
         ],
+      ),
+    );
+  }
+
+  /// The section marker above the first message of a topic run, in the forum
+  /// transcript that mixes every topic together.
+  ///
+  /// Telegram iOS renders this as a tappable header naming the topic the
+  /// messages below belong to, so the list stays attributable without opening
+  /// each topic. Tapping it opens that topic's own transcript, matching the
+  /// topic list's navigation.
+  Widget _topicSectionHeader(int topicId) {
+    final c = context.colors;
+    final display = _topicSectionDisplay(topicId);
+    final plate = servicePlateBackground(c);
+    final foreground = servicePlateForeground(plate);
+    return Padding(
+      key: ValueKey('forum-topic-section-$topicId'),
+      padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+      child: Center(
+        child: GestureDetector(
+          key: ValueKey('forum-topic-section-tap-$topicId'),
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _openTopicTranscript(topicId),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: plate,
+              borderRadius: BorderRadius.circular(AppRadius.lg),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (display.isGeneral && _vm.peerTitle.isNotEmpty)
+                  PhotoAvatar(
+                    title: _vm.peerTitle,
+                    photo: _vm.peerPhoto,
+                    size: 16,
+                    square: true,
+                    allowAnimation: false,
+                  )
+                else
+                  TopicIconSurface(
+                    size: 16,
+                    iconCustomEmojiId: display.iconCustomEmojiId,
+                    tint: display.iconColor == 0
+                        ? foreground
+                        : Color(0xFF000000 | (display.iconColor & 0xFFFFFF)),
+                  ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    display.name,
+                    key: ValueKey('forum-topic-section-label-$topicId'),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppTextStyle.caption(foreground),
+                  ),
+                ),
+                const SizedBox(width: 2),
+                AppIcon(HeroAppIcons.chevronRight, size: 11, color: foreground),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -3935,6 +4695,38 @@ class _ChatViewState extends State<ChatView> {
         _vm.ensureMessageCapabilities(member);
       }
     }
+    final revisionIds = groupedMedia.isEmpty
+        ? <int>[message.id]
+        : <int>[for (final member in groupedMedia) member.id];
+    return _ActiveChatListenableBuilder(
+      listenable: Listenable.merge([
+        for (final messageId in revisionIds)
+          _vm.messageRevisionListenable(messageId),
+      ]),
+      builder: (context) => _buildMessageBubble(
+        message,
+        messageIndex,
+        groupedMedia: groupedMedia,
+        targetMediaMessageId: targetMediaMessageId,
+        targetMediaKey: targetMediaKey,
+      ),
+    );
+  }
+
+  /// Answers a swipe on the transcript. The gesture is a shortcut to typing,
+  /// so the composer takes the caret as well as the reply target.
+  void _beginSwipeReply(ChatMessage message) {
+    _vm.setReply(message);
+    _vm.requestComposerFocus();
+  }
+
+  Widget _buildMessageBubble(
+    ChatMessage message,
+    int messageIndex, {
+    required List<ChatMessage> groupedMedia,
+    required int? targetMediaMessageId,
+    required GlobalKey? targetMediaKey,
+  }) {
     final mobileSelectionKey =
         !_vm.hasProtectedContent && _mobileTextSelectionMessageId == message.id
         ? _mobileTextSelectionAreaKey
@@ -3956,6 +4748,7 @@ class _ChatViewState extends State<ChatView> {
       showRepeat: _vm.canForwardContent && _isRepeatTail(messageIndex),
       onRepeat: () => _vm.repeatMessage(message),
       onLongPress: _isSelecting ? null : _showActionMenuForMessage,
+      onDesktopQuoteChanged: _handleDesktopQuoteChanged,
       mobileTextSelectionAreaKey: mobileSelectionKey,
       onMobileTextSelectionChanged: _handleMobileTextSelectionChanged,
       onMobileTextSelectionDisposed: mobileSelectionKey == null
@@ -3964,15 +4757,16 @@ class _ChatViewState extends State<ChatView> {
               message.id,
               mobileSelectionKey,
             ),
-      onReply: (m) => _vm.setReply(m),
+      onReply: _beginSwipeReply,
       onAvatarTap: _openSenderProfile,
       onAvatarLongPress: (m) {
         if (_vm.isGroup && (m.senderName?.isNotEmpty ?? false)) {
           _vm.insertMention(m);
         }
       },
-      onOpenReply: _scrollToMessage,
+      onOpenReply: _openReplyMessage,
       onOpenForwarded: _openForwardedMessage,
+      onTapViaBot: (m) => unawaited(_activateMessageViaBot(m)),
       onOpenComments: _openMessageComments,
       showCommentAttachment: chatTranscriptAllowsCommentAttachment(
         isChannel: _vm.isChannel,
@@ -4303,6 +5097,96 @@ class _ChatViewState extends State<ChatView> {
     return messages[index].date - messages[index - 1].date > _separatorGap;
   }
 
+  /// Whether the transcript mixes every topic into one list: a forum opened
+  /// without a specific topic. Telegram iOS sections that list by topic so
+  /// each message stays attributable; a single-topic transcript is already
+  /// scoped and needs no sections. A topics-enabled bot's chat mixes the
+  /// same way when opened without a topic — its messages carry explicit
+  /// topic ids and no General bucket exists, so the headers attribute them
+  /// exactly like a forum's.
+  bool get _showsForumTopicSections =>
+      (_vm.isForum || _vm.supportsBotTopics) && !_vm.isForumTopicTranscript;
+
+  /// The topic [message] belongs to, or null when it is attributable to
+  /// none. TDLib omits `topic_id` on General messages of a forum supergroup,
+  /// which is why the fallback is the General topic id there. A bot topic
+  /// chat has no General topic, so an unattributed message (topics traffic
+  /// predating the bot's toggle, say) belongs to no section rather than to a
+  /// bucket that cannot exist.
+  int? _topicSectionId(ChatMessage message) =>
+      message.forumTopicId ?? (_vm.isForum ? generalForumTopicId : null);
+
+  /// The display data for a topic section header.
+  ///
+  /// The loaded topic page carries the name and icon; a topic outside that
+  /// page still resolves through the shared index, which live topic traffic
+  /// keeps current. Both can miss for a topic this session never listed, so
+  /// the label falls back to a generic one — the icon and the tap target keep
+  /// the message attributable either way.
+  ({String name, int iconCustomEmojiId, int iconColor, bool isGeneral})
+  _topicSectionDisplay(int topicId) {
+    final isGeneral = topicId == generalForumTopicId;
+    final topic = _topicById(topicId);
+    if (topic != null) {
+      return (
+        name: topic.name,
+        iconCustomEmojiId: topic.iconCustomEmojiId,
+        iconColor: topic.iconColor,
+        isGeneral: isGeneral,
+      );
+    }
+    final indexed = ForumTopicIndex.shared.entryFor(
+      _sessionKey.accountSlot,
+      widget.chatId,
+      topicId,
+    );
+    if (indexed != null) {
+      return (
+        name: indexed.name,
+        iconCustomEmojiId: indexed.iconCustomEmojiId,
+        iconColor: indexed.iconColor,
+        isGeneral: isGeneral,
+      );
+    }
+    return (
+      name: isGeneral
+          ? AppStringKeys.generalTitle.l10n(context)
+          : AppStringKeys.topicChatTopicTitle.l10n(context),
+      iconCustomEmojiId: 0,
+      iconColor: 0,
+      isGeneral: isGeneral,
+    );
+  }
+
+  /// Whether a topic section header belongs above [index].
+  ///
+  /// Mirrors Telegram iOS: the header marks the boundary where the topic
+  /// changes, so a run of same-topic messages carries exactly one header.
+  /// Service messages never carry one — a join/pin event is not attributable
+  /// to a topic — and they do not break a run either: the comparison skips
+  /// back over them, because TDLib reports them without a topic and a naive
+  /// read would file them under General and repeat the header after them.
+  /// A bot chat's unattributed messages are the same: no header, no run
+  /// break. The very first attributable message starts a section, since
+  /// nothing above it can carry one.
+  bool _needsTopicSeparator(int index, {List<ChatMessage>? messages}) {
+    if (!_showsForumTopicSections) return false;
+    messages ??= _vm.messages;
+    if (index < 0 || index >= messages.length) return false;
+    final message = messages[index];
+    if (message.isService) return false;
+    final sectionId = _topicSectionId(message);
+    if (sectionId == null) return false;
+    var previous = index - 1;
+    while (previous >= 0 &&
+        (messages[previous].isService ||
+            _topicSectionId(messages[previous]) == null)) {
+      previous--;
+    }
+    if (previous < 0) return true;
+    return sectionId != _topicSectionId(messages[previous]);
+  }
+
   bool _isRepeatTail(int index) {
     final messages = _vm.messages;
     if (index != messages.length - 1 || index == 0) return false;
@@ -4360,7 +5244,11 @@ class _ChatViewState extends State<ChatView> {
 
   VideoSplitSession _videoSession(ChatMessage message) {
     final videoMessages = _vm.messages
-        .where((candidate) => candidate.video != null)
+        .where(
+          (candidate) =>
+              candidate.video != null &&
+              canPreviewMediaAlongside(candidate, message),
+        )
         .toList();
     if (!videoMessages.any((candidate) => candidate.id == message.id)) {
       videoMessages.add(message);
@@ -4414,9 +5302,31 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  ImageViewerMessageActions? _imageMessageActions(List<ChatMessage> pairs) {
+    return ImageViewerMessageActions(
+      messageIds: [for (final m in pairs) m.id],
+      onViewInChat: (messageId) async => _jumpToMessage(messageId),
+      onReply: (messageId) async => _jumpToMessage(messageId, reply: true),
+    );
+  }
+
+  Future<void> _jumpToMessage(int messageId, {bool reply = false}) async {
+    if (!mounted) return;
+    _captureJumpOrigin();
+    setState(() => _setScrollTarget(messageId, forceNavigation: true));
+    if (!reply) return;
+    final target = _vm.messages.where((m) => m.id == messageId).firstOrNull;
+    if (target != null) _vm.setReply(target);
+  }
+
   void _openImage(ChatMessage message) {
     final pairs = _vm.messages
-        .where((m) => m.isPhoto && m.image != null)
+        .where(
+          (m) =>
+              m.isPhoto &&
+              m.image != null &&
+              canPreviewMediaAlongside(m, message),
+        )
         .toList();
     final items = pairs.map((m) => m.image!).toList();
     final start = pairs.indexWhere((m) => m.id == message.id);
@@ -4425,6 +5335,11 @@ class _ChatViewState extends State<ChatView> {
         context,
         items: items,
         startIndex: start < 0 ? 0 : start,
+        messageActions: _imageMessageActions(pairs),
+        metadata: MediaMetadata.listFor(
+          pairs,
+          enabled: context.read<ThemeController>().mediaMetadataEnabled,
+        ),
       ),
     );
   }
@@ -4433,6 +5348,9 @@ class _ChatViewState extends State<ChatView> {
     required List<TdFileRef> items,
     required int startIndex,
   }) {
+    // The bubble gallery hands over a collage/slideshow's photo list without
+    // message ids; those items came from a single message, so anchoring the
+    // jump on any of them is meaningless. View in Chat stays hidden.
     unawaited(openImagePreview(context, items: items, startIndex: startIndex));
   }
 
@@ -4468,7 +5386,7 @@ class _ChatViewState extends State<ChatView> {
       message: message,
       peerTitle: _vm.peerTitle,
       onAvatarTap: _openSenderProfile,
-      onOpenReply: _scrollToMessage,
+      onOpenReply: _openReplyMessage,
       onOpenImage: _openImage,
       onOpenSticker: _openSticker,
       onPlayVideo: _playVideo,
@@ -4503,6 +5421,7 @@ class _ChatViewState extends State<ChatView> {
     MessageRepliesViewTarget target,
   ) async {
     if (target.chatId == widget.chatId) {
+      _captureJumpOrigin();
       await _scrollToMessage(target.messageId);
       return;
     }
@@ -4601,16 +5520,104 @@ class _ChatViewState extends State<ChatView> {
       _sendKeyboardButtonText(button.text);
       return;
     }
-    if (button.switchInlineQuery != null) {
-      showToast(context, AppStringKeys.chatInlineSwitchButtonUnsupported);
+    if (button.isSwitchInline) {
+      await _activateSwitchInlineButton(message, button);
       return;
     }
     showToast(context, AppStringKeys.chatButtonUnsupported);
   }
 
+  Future<void> _activateMessageViaBot(ChatMessage message) async {
+    final username = await _vm.resolveInlineBotUsername(message);
+    if (!mounted) return;
+    if (username == null || username.isEmpty) return;
+    if (_vm.canSendMessages) {
+      _vm.activateInlineQuery(username);
+      return;
+    }
+    await openLink(context, 'https://t.me/$username');
+  }
+
+  Future<void> _activateSwitchInlineButton(
+    ChatMessage message,
+    MessageButton button,
+  ) async {
+    final query = button.switchInlineQuery ?? '';
+    final target =
+        button.switchInlineTarget ?? const SwitchInlineTarget.chooseChat();
+    if (target.kind == SwitchInlineTargetKind.internalLink &&
+        target.internalLink != null) {
+      final resolvedUsername = await _vm.resolveInlineBotUsername(message);
+      if (!mounted) return;
+      final link = Map<String, dynamic>.from(target.internalLink!);
+      if (resolvedUsername != null &&
+          resolvedUsername.isNotEmpty &&
+          link.type == 'internalLinkTypePublicChat' &&
+          (link.str('draft_text') ?? '').trim().isEmpty) {
+        link['draft_text'] = '@$resolvedUsername $query';
+      }
+      await openInternalLinkType(context, link);
+      return;
+    }
+    final username = await _vm.resolveInlineBotUsername(message);
+    if (!mounted) return;
+    if (username == null || username.isEmpty) {
+      showToast(context, AppStringKeys.topicPostContentActionFailed);
+      return;
+    }
+    if (target.isCurrentChat && _vm.canSendMessages) {
+      _vm.activateInlineQuery(username, query);
+      return;
+    }
+    final allowedKinds = target.isCurrentChat
+        ? const {
+            ChatKind.privateChat,
+            ChatKind.bot,
+            ChatKind.group,
+            ChatKind.channel,
+          }
+        : target.allowedChatKinds;
+    final picked = await Navigator.of(context).push<ChatSummary>(
+      MaterialPageRoute(
+        builder: (_) => ChatPickerView(
+          allowedKinds: allowedKinds,
+          allowChannels: allowedKinds.contains(ChatKind.channel),
+        ),
+      ),
+    );
+    if (picked == null || !mounted) return;
+    if (picked.id == _vm.chatId && _vm.canSendMessages) {
+      _vm.activateInlineQuery(username, query);
+      return;
+    }
+    try {
+      await TdClient.shared.query(
+        setTextChatDraftRequest(
+          chatId: picked.id,
+          date: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          formattedText: {
+            '@type': 'formattedText',
+            'text': '@$username $query',
+            'entities': const <Map<String, dynamic>>[],
+          },
+        ),
+      );
+    } catch (_) {}
+    if (!mounted) return;
+    await openChatFromCurrentWindow(
+      context,
+      chatId: picked.id,
+      title: picked.title,
+    );
+  }
+
   Future<void> _perform(MessageAction action, ChatMessage message) async {
+    final selectedQuote = _actionQuote;
+    final canReplyInCurrentChat =
+        _vm.canSendMessages && _actionCanReply == true;
     setState(() {
       _actionTarget = null;
+      _actionQuote = null;
       _actionRect = null;
       _clearMobileTextSelectionState();
       _actionSource = MessageActionSource.normal;
@@ -4618,6 +5625,10 @@ class _ChatViewState extends State<ChatView> {
     switch (action) {
       case MessageAction.copy:
         unawaited(Clipboard.setData(ClipboardData(text: message.text)));
+      case MessageAction.copyImage:
+        await _copyMessageImage(message);
+      case MessageAction.copyMessageLink:
+        await _copyMessageLink(message);
       case MessageAction.edit:
         unawaited(_editMessage(message));
       case MessageAction.suggestOffer:
@@ -4629,7 +5640,20 @@ class _ChatViewState extends State<ChatView> {
       case MessageAction.displayTranslation:
         setState(() => _showOriginalTranslationMessageIds.remove(message.id));
       case MessageAction.reply:
-        _vm.setReply(message);
+        if (_vm.isChannel &&
+            _vm.hasLinkedDiscussion &&
+            !canReplyInCurrentChat) {
+          // A channel composer does not override the message's same-chat
+          // reply permission. When either is unavailable, answer in the
+          // linked group instead; its sheet applies that group's permissions.
+          await _openMessageComments(message);
+        } else if (selectedQuote != null && _vm.canQuoteText) {
+          await _quoteMessageText(message, selectedQuote: selectedQuote);
+        } else {
+          _vm.setReply(message);
+        }
+      case MessageAction.quote:
+        await _quoteMessageText(message, selectedQuote: selectedQuote);
       case MessageAction.replies:
         await _openMessageComments(message);
       case MessageAction.forward:
@@ -4670,6 +5694,8 @@ class _ChatViewState extends State<ChatView> {
             AppStrings.t(AppStringKeys.chatReportFailed, {'value1': e}),
           );
         }
+      case MessageAction.hideSender:
+        await _hideSender(message);
       case MessageAction.block:
         final confirmed = await confirmDialog(
           context,
@@ -4694,6 +5720,8 @@ class _ChatViewState extends State<ChatView> {
         _playVideo(message, muted: true);
       case MessageAction.addToPlaylist:
         unawaited(showMusicPlaylists(context, addMessage: message));
+      case MessageAction.saveAs:
+        await _saveMediaToFolder(message);
       case MessageAction.saveToPhotos:
         DateTime? progressShownAt;
         final progressTimer = Timer(const Duration(milliseconds: 500), () {
@@ -4780,6 +5808,64 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  /// Desktop counterpart of 保存到相册: fetch the original if it is not local
+  /// yet, then copy it into a folder the user picks.
+  Future<void> _saveMediaToFolder(ChatMessage message) async {
+    final progressTimer = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStringKeys.chatSavingToPhotos,
+        visibleFor: const Duration(milliseconds: 900),
+      );
+    });
+    final outcome = await MediaDownloadService.saveMessageMedia(message);
+    progressTimer.cancel();
+    if (!mounted) return;
+    final feedback = MediaDownloadService.feedbackFor(outcome);
+    if (feedback != null) {
+      showToast(context, feedback, visibleFor: const Duration(seconds: 2));
+    }
+  }
+
+  Future<void> _copyMessageImage(ChatMessage message) async {
+    final image = message.isPhoto ? message.image : null;
+    if (image == null) return;
+    try {
+      final path = await TdFileCenter.shared.pathFor(
+        image,
+        accountSlot: _sessionKey.accountSlot,
+      );
+      final copied =
+          path != null &&
+          await DesktopClipboardImageService.copyImageFile(File(path));
+      if (!copied && mounted) {
+        showToast(context, AppStringKeys.messageActionCopyImageFailed);
+      }
+    } catch (_) {
+      if (mounted) {
+        showToast(context, AppStringKeys.messageActionCopyImageFailed);
+      }
+    }
+  }
+
+  Future<void> _copyMessageLink(ChatMessage message) async {
+    try {
+      final link = await _vm.messageLink(message.id);
+      if (!mounted) return;
+      if (link.isEmpty) {
+        showToast(context, AppStringKeys.messageActionCopyLinkFailed);
+        return;
+      }
+      await Clipboard.setData(ClipboardData(text: link));
+      if (mounted) showToast(context, AppStringKeys.messageLinkCopied);
+    } catch (_) {
+      if (mounted) {
+        showToast(context, AppStringKeys.messageActionCopyLinkFailed);
+      }
+    }
+  }
+
   Future<void> _offerSuggestedPost(ChatMessage message) async {
     final loader = ChannelDirectMessageTopicController(
       chatId: _vm.chatId,
@@ -4821,6 +5907,31 @@ class _ChatViewState extends State<ChatView> {
     } finally {
       loader.dispose();
     }
+  }
+
+  /// Hides [message]'s sender on this device, in this group or everywhere.
+  /// Nothing reaches Telegram: unlike Block, the member is not blocked,
+  /// reported or told.
+  Future<void> _hideSender(ChatMessage message) async {
+    final senderId = message.senderId;
+    if (senderId == null) return;
+    final name = _deleteSenderName(message);
+    final scope = await showHideSenderDialog(context, name: name);
+    if (!mounted || scope == null) return;
+    final thisGroup = scope == HideSenderScope.thisGroup;
+    HiddenSenderStore.shared.hide(
+      HiddenSender(
+        senderId: senderId,
+        name: name,
+        chatId: thisGroup ? _vm.chatId : null,
+        chatTitle: thisGroup ? _vm.peerTitle : null,
+        hiddenAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      ),
+    );
+    showToast(
+      context,
+      AppStrings.t(AppStringKeys.hideSenderDone, {'value1': name}),
+    );
   }
 
   Future<void> _performDeleteAction(ChatMessage message) async {
@@ -4882,6 +5993,19 @@ class _ChatViewState extends State<ChatView> {
         );
       },
     );
+  }
+
+  /// Someone else's message in a group; never the group itself posting as
+  /// an anonymous admin, and not in broadcast channels.
+  bool _canHideSender(ChatMessage message) {
+    final senderId = message.senderId;
+    return _vm.isGroup &&
+        !_vm.isChannel &&
+        !message.isOutgoing &&
+        !message.isService &&
+        senderId != null &&
+        senderId != 0 &&
+        senderId != _vm.chatId;
   }
 
   String _deleteSenderName(ChatMessage message) {
@@ -4989,14 +6113,74 @@ class _ChatViewState extends State<ChatView> {
     MessageReaction reaction,
   ) async {
     if (!mounted || message.reactions.isEmpty) return;
+    // `can_report_reactions` is a messageProperties field, not a field of the
+    // message. Start the hydrated permission alongside the sheet so the report
+    // action appears only after TDLib granted it, and fails closed otherwise.
+    final reportPermission = _vm.canReportMessageReactions(message.id);
     await showReactionUsersModal<void>(
       context,
       builder: (dialogContext) => _ReactionUsersSheet(
         viewModel: _vm,
         message: message,
         initialReaction: reaction,
+        reportPermission: reportPermission,
+        onOpenSender: _openReactionSender,
+        onReportSender: (user) => _reportReactionSender(message, user),
       ),
     );
+  }
+
+  /// Opens the profile of a user who reacted, or the chat when the reaction
+  /// was sent by a chat. A deleted account has neither.
+  void _openReactionSender(MessageReactionUser user) {
+    final senderId = user.senderId;
+    if (user.isDeleted || senderId == 0) return;
+    // The list is left either way: it belongs to the message behind it, and
+    // keeping it alive under a pushed profile leaves a stale sheet to come
+    // back to.
+    Navigator.of(context).pop();
+    if (senderId > 0) {
+      _openUserProfile(senderId, user.title);
+      return;
+    }
+    if (senderId == widget.chatId) {
+      unawaited(_openChatInfo(title: user.title, useAppPageRoute: true));
+      return;
+    }
+    unawaited(
+      openChatFromCurrentWindow(context, chatId: senderId, title: user.title),
+    );
+  }
+
+  Future<void> _reportReactionSender(
+    ChatMessage message,
+    MessageReactionUser user,
+  ) async {
+    if (user.isDeleted) return;
+    if (user.senderId == _vm.meId) return;
+    final confirmed = await showAppConfirmDialog(
+      context,
+      title: AppStrings.t(AppStringKeys.chatReactionReportTitle),
+      message: AppStrings.t(AppStringKeys.chatReactionReportMessage, {
+        'value1': user.title,
+      }),
+      confirmText: AppStrings.t(AppStringKeys.chatReportConfirm),
+      destructive: true,
+    );
+    // The permission and the write belong to the pane's own account: a switch
+    // while the dialog was open must drop the report entirely.
+    if (!mounted || !confirmed || !_vm.isAccountCurrent) return;
+    try {
+      await _vm.reportReaction(message, user.senderId);
+      if (!mounted) return;
+      showToast(context, AppStringKeys.chatReactionReportSent);
+    } catch (e) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.chatReactionReportFailed, {'value1': e}),
+      );
+    }
   }
 
   Future<bool> _translateMessage(
@@ -5735,9 +6919,10 @@ class _ChatViewState extends State<ChatView> {
     }
     final result = await Navigator.of(context).push<ChatPickerResult>(
       MaterialPageRoute(
-        builder: (_) => const ChatPickerView(
+        builder: (_) => ChatPickerView(
           title: AppStringKeys.chatForwardToTitle,
           showForwardOptions: true,
+          markdownOffer: _forwardMarkdownOffer([message.id]),
         ),
       ),
     );
@@ -5840,6 +7025,12 @@ class _ChatViewState extends State<ChatView> {
     final c = context.colors;
     final themeController = context.watch<ThemeController>();
     _themingEnabled = themeController.themingEnabled;
+    // The model has no theme access of its own, so the outgoing 盘古之白
+    // switches are mirrored on every build: flipping one in Settings takes
+    // effect on the next send without recreating the transcript.
+    _vm
+      ..panguOnSend = themeController.panguOnSend
+      ..panguOnEdit = themeController.panguOnEdit;
     final dark = Theme.of(context).brightness == Brightness.dark;
     _resolvedCloudTheme = themeController.cloudThemeFor(
       dark ? Brightness.dark : Brightness.light,
@@ -5943,24 +7134,26 @@ class _ChatViewState extends State<ChatView> {
                                           : _header()),
                                 body: showPeerRestrictionBlock
                                     ? _restrictedPeerBlockPage()
-                                    : Column(
-                                        children: [
-                                          Expanded(
-                                            child: _transcriptLayer(
-                                              searchPane: searchPane,
+                                    : _withTopicNavigation(
+                                        Column(
+                                          children: [
+                                            Expanded(
+                                              child: _transcriptLayer(
+                                                searchPane: searchPane,
+                                              ),
                                             ),
-                                          ),
-                                          _chatMusicPlayer(),
-                                          // A narrow chat trades the composer
-                                          // for the hit navigator; a wide one
-                                          // keeps composing beside the results.
-                                          if (searching && !searchPane)
-                                            _searchNavigator()
-                                          else if (_isSelecting)
-                                            _selectionActionBar()
-                                          else
-                                            _composerArea(),
-                                        ],
+                                            _chatMusicPlayer(),
+                                            // A narrow chat trades the composer
+                                            // for the hit navigator; a wide one
+                                            // keeps composing beside the results.
+                                            if (searching && !searchPane)
+                                              _searchNavigator()
+                                            else if (_isSelecting)
+                                              _selectionActionBar()
+                                            else
+                                              _composerArea(),
+                                          ],
+                                        ),
                                       ),
                                 trailingPane: searchPane
                                     ? _searchResultsPane()
@@ -5979,7 +7172,9 @@ class _ChatViewState extends State<ChatView> {
                         ),
                         if (_desktopStickerSetId != null)
                           _desktopStickerSetPanel(_desktopStickerSetId!),
-                        if (_actionTarget != null && !_isSelecting)
+                        if ((_actionTarget != null ||
+                                _actionOverlaySnapshot != null) &&
+                            !_isSelecting)
                           _actionMenuOverlay(),
                       ],
                     ),
@@ -5990,6 +7185,30 @@ class _ChatViewState extends State<ChatView> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _withTopicNavigation(Widget child) {
+    if (!_topicsKnown ||
+        !usesSplitSelectionLayout(MediaQuery.sizeOf(context))) {
+      return child;
+    }
+    // A sidebar-placement shell paints this chat's topic list over its chat
+    // list column; the conversation pane keeps its full width there.
+    if (_topicListOverlaid) return child;
+    return TopicNavigationLayout(
+      topics: [
+        for (final topic in _vm.forumTopics) _topicNavigationItem(topic),
+      ],
+      selectedTopicId: widget.forumTopicId,
+      hasForumTabs: _vm.hasForumTabs,
+      onSelected: _openTopicTranscript,
+      onCreateTopic: _vm.canCreateForumTopics ? _openCreateTopicDialog : null,
+      onMarkAllRead: _hasUnreadTopics ? _markAllTopicsRead : null,
+      onTopicMenu: _showTopicRowMenu,
+      generalAvatarTitle: _vm.peerTitle.isEmpty ? widget.title : _vm.peerTitle,
+      generalAvatarPhoto: _vm.peerPhoto,
+      child: child,
     );
   }
 
@@ -6203,7 +7422,8 @@ class _ChatViewState extends State<ChatView> {
                   (_showEntryUnreadBanner || _vm.unreadCount > 0),
             ),
           ),
-        if (transcriptReady && _vm.unreadMentionCount > 0)
+        if (transcriptReady &&
+            (_vm.unreadMentionCount > 0 || _vm.unreadReactionCount > 0))
           Positioned(
             top:
                 (showPinnedTodo ? 72.0 : 8.0) +
@@ -6211,7 +7431,7 @@ class _ChatViewState extends State<ChatView> {
                     ? 52
                     : 0),
             right: 12,
-            child: _unreadMentionIndicator(),
+            child: _unreadActivityIndicators(),
           ),
         if (transcriptReady &&
             bottomIndicator == ChatBottomIndicator.jumpToBottom)
@@ -6359,7 +7579,7 @@ class _ChatViewState extends State<ChatView> {
     if (_showEntryUnreadBanner) return true;
     if (_liveNewMessageCount > 0) return !_isAtLoadedBottom();
     if (_isAtLoadedBottom()) return false;
-    return _openAtLatest || !_isNearBottom(80);
+    return _openAtLatest || !_vm.historyReachesLatest || !_isNearBottom(80);
   }
 
   /// Small button (bottom-right of the transcript) to return to the newest
@@ -6405,7 +7625,9 @@ class _ChatViewState extends State<ChatView> {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: pointsDown
-          ? _onReturnToLatestTapped
+          // The unread pill always means "go to the newest message", even
+          // while the arrow would return to a jump origin.
+          ? () => _requestReturnToLatest(userInitiated: true)
           : () => unawaited(_jumpToFirstUnread()),
       child: Container(
         padding: EdgeInsetsDirectional.fromSTEB(
@@ -6769,34 +7991,83 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
-  Widget _unreadMentionIndicator() {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _openingUnreadMention ? null : _openUnreadMention,
-      child: AnimatedOpacity(
-        duration: const Duration(milliseconds: 120),
-        opacity: _openingUnreadMention ? 0.62 : 1,
-        child: Container(
-          width: 40,
-          height: 34,
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: AppTheme.brand,
-            borderRadius: BorderRadius.circular(17),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.12),
-                blurRadius: 6,
-                offset: const Offset(0, 2),
-              ),
-            ],
+  Widget _unreadActivityIndicators() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        if (_vm.unreadMentionCount > 0)
+          _unreadActivityIndicator(
+            key: const ValueKey('unread-mention-indicator'),
+            icon: HeroAppIcons.at,
+            count: _vm.unreadMentionCount,
+            label: AppStrings.t(AppStringKeys.notificationMentions),
+            opening: _openingUnreadMention,
+            onTap: _openUnreadMention,
           ),
-          child: const Text(
-            '@',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
+        if (_vm.unreadMentionCount > 0 && _vm.unreadReactionCount > 0)
+          const SizedBox(height: AppSpacing.md),
+        if (_vm.unreadReactionCount > 0)
+          _unreadActivityIndicator(
+            key: const ValueKey('unread-reaction-indicator'),
+            icon: HeroAppIcons.heart,
+            count: _vm.unreadReactionCount,
+            label: AppStrings.t(AppStringKeys.notificationReactions),
+            opening: _openingUnreadReaction,
+            onTap: _openUnreadReaction,
+          ),
+      ],
+    );
+  }
+
+  Widget _unreadActivityIndicator({
+    required Key key,
+    required AppIconData icon,
+    required int count,
+    required String label,
+    required bool opening,
+    required VoidCallback onTap,
+  }) {
+    final countLabel = count > 999 ? '999+' : '$count';
+    return Semantics(
+      button: true,
+      label: '$label: $countLabel',
+      child: GestureDetector(
+        key: key,
+        behavior: HitTestBehavior.opaque,
+        onTap: opening ? null : onTap,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 120),
+          opacity: opening ? 0.62 : 1,
+          child: Container(
+            height: 34,
+            constraints: const BoxConstraints(minWidth: 40),
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.md),
+            decoration: BoxDecoration(
+              color: AppTheme.brand,
+              borderRadius: BorderRadius.circular(17),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.12),
+                  blurRadius: 6,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                AppIcon(icon, size: AppIconSize.lg, color: Colors.white),
+                const SizedBox(width: AppSpacing.xs),
+                Text(
+                  countLabel,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: AppTextSize.caption,
+                    fontWeight: AppTextWeight.semibold,
+                  ),
+                ),
+              ],
             ),
           ),
         ),
@@ -6817,9 +8088,26 @@ class _ChatViewState extends State<ChatView> {
     if (mounted) setState(() => _openingUnreadMention = false);
   }
 
+  Future<void> _openUnreadReaction() async {
+    if (_openingUnreadReaction || _vm.unreadReactionCount <= 0) return;
+    setState(() => _openingUnreadReaction = true);
+    final messageId = await _vm.openNextUnreadReaction();
+    if (messageId != null && mounted) {
+      await _scrollToMessage(messageId);
+      if (_vm.messages.any((message) => message.id == messageId)) {
+        await _vm.markUnreadReactionRead(messageId);
+      }
+    }
+    if (mounted) setState(() => _openingUnreadReaction = false);
+  }
+
   // MARK: - Composer area (input bar / join bar / disabled bar)
 
   Widget _chatMusicPlayer() {
+    // In split layouts the shell shows the player under every pane.
+    if (MusicPlayerShellScope.providesPlayer(context)) {
+      return const SizedBox.shrink();
+    }
     return AnimatedBuilder(
       animation: MusicPlayerController.shared,
       builder: (context, _) {
@@ -6896,7 +8184,7 @@ class _ChatViewState extends State<ChatView> {
       onMessageSent: _onComposerMessageSent,
       onPanelGeometryChanged: _onComposerPanelGeometryChanged,
       onMediaSendTapped: _onComposerMediaSendTapped,
-      onBotTopicCreated: _openTopicMode,
+      onBotTopicCreated: _openTopicTranscript,
     );
   }
 
@@ -7186,12 +8474,19 @@ class _ChatViewState extends State<ChatView> {
   }
 
   Widget _header() {
+    return _ActiveChatListenableBuilder(
+      listenable: _vm.headerRevisionListenable,
+      builder: (context) => _buildHeader(),
+    );
+  }
+
+  Widget _buildHeader() {
     final c = context.colors;
     final subtitle = _vm.subtitle;
     final actionActive = _vm.hasActiveChatAction;
     final wideGroupHeader = _usesWideGroupHeader;
     return Container(
-      padding: EdgeInsets.only(top: MediaQuery.paddingOf(context).top),
+      padding: EdgeInsets.only(top: topChromeInsetOf(context)),
       decoration: BoxDecoration(
         color: widget.headerColor ?? c.navBar,
         border: widget.showHeaderDivider
@@ -7260,12 +8555,23 @@ class _ChatViewState extends State<ChatView> {
                           ? _handleInfoPressed
                           : _handleFullInfoPressed,
                     ),
-                  if (_vm.supportsTopics) ...[
+                  if (_showsTopicSurfaces) ...[
                     _ChatHeaderAction(
                       key: const ValueKey('chatHeaderTopics'),
                       label: AppStringKeys.topicChatAllTopics.l10n(context),
                       icon: HeroAppIcons.hashtag,
-                      onTap: _openTopicMode,
+                      onTap: () {
+                        // A shell overlay the user dismissed comes back from
+                        // the header; other shells pick from the sheet.
+                        final host = _topicListOverlaid
+                            ? _shellTopicListHost
+                            : null;
+                        if (host != null && host.listHidden) {
+                          host.showList();
+                          return;
+                        }
+                        unawaited(_showTopicSelector());
+                      },
                     ),
                   ],
                 ],
@@ -7289,6 +8595,11 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  /// Topics keep their dedicated surface — header chevron, topic picker, and
+  /// the # header action — whenever the chat is a topic chat. The picker
+  /// switches between topic transcripts.
+  bool get _showsTopicSurfaces => _topicsKnown;
+
   /// The join screen and a restricted peer both render the chat header over a
   /// page with no transcript behind it. Offering search there would open a
   /// field that can only ever report nothing.
@@ -7305,15 +8616,17 @@ class _ChatViewState extends State<ChatView> {
 
   Widget _headerTitleBlock(String subtitle, bool actionActive) {
     final c = context.colors;
-    final serverTitle = _vm.peerTitle;
-    final displayTitle = _vm.isGroup && !_vm.isChannel
+    final serverTitle = _vm.displayTitle;
+    final displayTitle =
+        _vm.forumTopicId == null && _vm.isGroup && !_vm.isChannel
         ? context.watch<GroupRemarkController?>()?.displayTitleFor(
                 widget.chatId,
                 serverTitle,
               ) ??
               serverTitle
         : serverTitle;
-    final headerTitle = _vm.isGroup && _vm.memberCount > 0
+    final headerTitle =
+        _vm.forumTopicId == null && _vm.isGroup && _vm.memberCount > 0
         ? '$displayTitle(${_vm.memberCount})'
         : displayTitle;
     final titleText = Text(
@@ -7339,7 +8652,7 @@ class _ChatViewState extends State<ChatView> {
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (_vm.supportsTopics)
+        if (_showsTopicSurfaces)
           Row(
             children: [
               Expanded(child: title),
@@ -7365,7 +8678,7 @@ class _ChatViewState extends State<ChatView> {
           ),
       ],
     );
-    if (_vm.supportsTopics) {
+    if (_showsTopicSurfaces) {
       return GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: _showTopicSelector,
@@ -7382,41 +8695,269 @@ class _ChatViewState extends State<ChatView> {
     return content;
   }
 
-  ChatSummary _topicChatSummary() => ChatSummary(
-    id: widget.chatId,
-    title: _vm.peerTitle,
-    lastMessage: '',
-    lastMessageId: 0,
-    date: 0,
-    unreadCount: _vm.unreadCount,
-    order: 0,
-    isMuted: _vm.isMuted,
-    kind: _vm.peerIsBot
-        ? ChatKind.bot
-        : _vm.isChannel
-        ? ChatKind.channel
-        : ChatKind.group,
-    photo: _vm.peerPhoto,
-    isForum: _vm.isForum,
-    supportsBotTopics: _vm.supportsBotTopics,
-  );
-
-  Future<void> _openTopicMode([int? threadId]) async {
-    await TopicGroupDisplayPreference.set(TopicGroupDisplayMode.channel);
-    if (!mounted) return;
-    final onOpenTopicMode = widget.onOpenTopicMode;
-    if (onOpenTopicMode != null) {
-      onOpenTopicMode(threadId);
+  /// Opens a topic, or the whole chat for null, as the ordinary chat
+  /// transcript (topics-as-group setting). Replaces this transcript in place
+  /// so the navigation stack stays flat. An owning shell rebuilds the
+  /// transcript itself; a bare split detail pane swaps its own content.
+  void _openTopicTranscript(int? topicId) {
+    if (topicId == widget.forumTopicId) return;
+    _prepareExitState();
+    final onOpenTopicTranscript = widget.onOpenTopicTranscript;
+    if (onOpenTopicTranscript != null) {
+      onOpenTopicTranscript(topicId);
+      return;
+    }
+    if (ChatPane.replace(
+      context,
+      (onBack) => ChatView(
+        // A distinct key per transcript: ChatView reads its topic only once.
+        key: ValueKey(('pane-topic-transcript', widget.chatId, topicId)),
+        chatId: widget.chatId,
+        title: widget.title,
+        forumTopicId: topicId,
+        showBackButton: widget.showBackButton,
+        headerHeight: widget.headerHeight,
+        headerColor: widget.headerColor,
+        showHeaderDivider: widget.showHeaderDivider,
+        trailingPane: widget.trailingPane,
+        trailingPaneWidth: widget.trailingPaneWidth,
+        exitController: widget.exitController,
+        onChatKindResolved: widget.onChatKindResolved,
+        onInfoPressed: widget.onInfoPressed,
+        onOpenFullInfo: widget.onOpenFullInfo,
+        onOpenUserProfile: widget.onOpenUserProfile,
+        onBack: onBack,
+      ),
+    )) {
       return;
     }
     unawaited(
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => TopicChatView(
-            chat: _topicChatSummary(),
-            initialThreadId: threadId,
+      replaceWithAppChatRoute<void, void>(
+        context,
+        AppChatPageRoute<void>(
+          builder: (_) => ChatView(
+            chatId: widget.chatId,
+            title: widget.title,
+            forumTopicId: topicId,
           ),
         ),
+      ),
+    );
+  }
+
+  // MARK: - Topic moderation (Telegram iOS parity)
+
+  ForumTopicOption? _topicById(int? id) {
+    if (id == null) return null;
+    for (final topic in _vm.forumTopics) {
+      if (topic.id == id) return topic;
+    }
+    return null;
+  }
+
+  /// Telegram iOS offers topic creation right from the topic list.
+  Future<void> _openCreateTopicDialog() async {
+    final draft = await showDialog<TopicDraft>(
+      context: context,
+      builder: (dialogContext) => TopicDraftDialog(
+        title: AppStrings.t(AppStringKeys.groupAdministrationNewTopic),
+        initialName: '',
+        initialColor:
+            topicIconColors[_vm.forumTopics.length % topicIconColors.length],
+        initialCustomEmojiId: 0,
+        canChangeColor: true,
+      ),
+    );
+    if (!mounted || draft == null || draft.name.isEmpty) return;
+    try {
+      final created = await _vm.createForumTopic(
+        name: draft.name,
+        iconColor: draft.color,
+        iconCustomEmojiId: draft.customEmojiId,
+      );
+      // Open the fresh topic the way iOS does after creation.
+      if (mounted && created != null && created != 0) {
+        _openTopicTranscript(created);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(
+          AppStringKeys.groupAdministrationCouldnTCreateTopicValue1,
+          {'value1': error},
+        ),
+      );
+    }
+  }
+
+  Future<void> _editTopic(ForumTopicOption topic) async {
+    if (topic.isGeneral) return;
+    final draft = await showDialog<TopicDraft>(
+      context: context,
+      builder: (dialogContext) => TopicDraftDialog(
+        title: AppStrings.t(AppStringKeys.groupAdministrationEditTopic),
+        initialName: topic.name,
+        initialColor: topic.iconColor == 0
+            ? topicIconColors.first
+            : topic.iconColor,
+        initialCustomEmojiId: topic.iconCustomEmojiId,
+        canChangeColor: false,
+      ),
+    );
+    if (!mounted || draft == null || draft.name.isEmpty) return;
+    try {
+      await _vm.editForumTopic(
+        forumTopicId: topic.id,
+        name: draft.name,
+        iconCustomEmojiId: draft.customEmojiId,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.groupAdministrationCouldnTEditTopicValue1, {
+          'value1': error,
+        }),
+      );
+    }
+  }
+
+  Future<void> _deleteTopic(ForumTopicOption topic) async {
+    if (topic.isGeneral || !_vm.canDeleteTopic(topic)) return;
+    final ok = await confirmDialog(
+      context,
+      title: AppStrings.t(
+        AppStringKeys.groupAdministrationDeleteTopicAndMessages,
+        {'value1': topic.name},
+      ),
+      confirmText: AppStringKeys.chatDelete,
+      destructive: true,
+    );
+    if (!ok || !mounted) return;
+    // The dialog can stay open across a rights change, a revocation or an
+    // account switch; re-verify the current state before anything
+    // destructive is sent.
+    final current = _topicById(topic.id);
+    if (current == null || !_vm.canDeleteTopic(current)) return;
+    try {
+      await _vm.deleteForumTopic(current.id);
+      if (widget.forumTopicId == topic.id) {
+        _openTopicTranscript(null);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(
+          AppStringKeys.groupAdministrationCouldnTDeleteTopicValue1,
+          {'value1': error},
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicPinned(ForumTopicOption topic) async {
+    try {
+      await _vm.setForumTopicPinned(topic.id, pinned: !topic.isPinned);
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.groupAdministrationCouldnTPinTopicValue1, {
+          'value1': error,
+        }),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicMuted(ForumTopicOption topic) async {
+    try {
+      await _vm.setForumTopicMuted(topic.id, muted: !topic.isMuted);
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        topicActionErrorText(
+          AppStrings.t(AppStringKeys.topicChatMuteFailed),
+          error,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleTopicClosed(ForumTopicOption topic) async {
+    try {
+      await _vm.setForumTopicClosed(topic.id, closed: !topic.isClosed);
+    } catch (error) {
+      if (!mounted) return;
+      showToast(
+        context,
+        topicActionErrorText(
+          AppStrings.t(AppStringKeys.topicPostContentActionFailed),
+          error,
+        ),
+      );
+    }
+  }
+
+  Future<void> _markTopicRead(ForumTopicOption topic) =>
+      _vm.markForumTopicRead(topic);
+
+  /// Clears every topic in the list at once: one scoped read per topic, with
+  /// the unread counters cleared optimistically and restored if a read fails.
+  Future<void> _markAllTopicsRead() async {
+    try {
+      await _vm.markForumTopicsRead(_vm.forumTopics.map((topic) => topic.id));
+    } catch (_) {
+      // Every read failed: the rows were rolled back; say so once.
+      if (!mounted) return;
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+      return;
+    }
+    if (!mounted) return;
+    if (_vm.takeBulkReadFailure()) {
+      showToast(
+        context,
+        AppStrings.t(AppStringKeys.topicChatMarkAllReadFailed),
+      );
+    }
+  }
+
+  /// The topic row's context menu (iOS swipe action / long press). Destructive
+  /// and management items only appear while the account holds the right;
+  /// mute and mark-read stay available to everyone.
+  Future<void> _showTopicRowMenu(
+    TopicNavigationItem item,
+    Offset? globalPosition,
+  ) async {
+    final topic = _topicById(item.id);
+    if (topic == null) return;
+    // The creator deletion carve-out depends on the topic's live history
+    // (at most 11 messages, none from other users), so probe before the menu
+    // is offered. Rights-based eligibility is already known synchronously.
+    if (!topic.isGeneral &&
+        _vm.canDeleteForumTopics != true &&
+        _vm.creatorOfTopic(topic)) {
+      await _vm.ensureTopicCreatorDeletable(topic.id);
+      if (!mounted) return;
+    }
+    await showTopicRowMenuSheet(
+      context: context,
+      topic: item,
+      actions: topicRowActions(
+        topic: item,
+        canManage: _vm.canManageTopics,
+        canDelete: _vm.canDeleteTopic(topic),
+        onMarkRead: () => _markTopicRead(topic),
+        onTogglePinned: () => _toggleTopicPinned(topic),
+        onToggleMuted: () => _toggleTopicMuted(topic),
+        onEdit: () => _editTopic(topic),
+        onToggleClosed: () => _toggleTopicClosed(topic),
+        onDelete: () => _deleteTopic(topic),
       ),
     );
   }
@@ -7464,9 +9005,25 @@ class _ChatViewState extends State<ChatView> {
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: c.textPrimary, fontSize: 16),
               ),
+              // The centered sheet variant lays tiles out at a narrow width;
+              // an unsized badge can exceed the whole row, so wrap it in a
+              // bounded box rather than handing the pill to ListTile directly.
+              trailing: topic == null || topic.unreadCount <= 0
+                  ? null
+                  : SizedBox(
+                      width: 64,
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: UnreadBadge(
+                          key: ValueKey('topic-selector-unread-${topic.id}'),
+                          count: topic.unreadCount,
+                          muted: topic.isMuted,
+                        ),
+                      ),
+                    ),
               onTap: () {
                 Navigator.of(sheetContext).pop();
-                _openTopicMode(topic?.id);
+                _openTopicTranscript(topic?.id);
               },
             );
           },
@@ -7492,7 +9049,7 @@ class _ChatViewState extends State<ChatView> {
     final c = context.colors;
     final count = _selectedMessageIds.length;
     return Container(
-      padding: EdgeInsets.only(top: MediaQuery.paddingOf(context).top),
+      padding: EdgeInsets.only(top: topChromeInsetOf(context)),
       decoration: BoxDecoration(
         color: c.navBar,
         border: Border(bottom: BorderSide(color: c.divider, width: 0.5)),
@@ -7661,22 +9218,18 @@ class _ChatViewState extends State<ChatView> {
       behavior: HitTestBehavior.opaque,
       onTap: () => _openPinnedFromBar(pinned),
       child: Container(
+        key: const ValueKey('chatPinnedBar'),
         height: 48,
         padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
-          color: c.card.withValues(alpha: 0.86),
+          // Solid composer surface, like the docked panels below the
+          // transcript: no translucent card fill and no drop shadow.
+          color: c.inputBarBackground,
           borderRadius: BorderRadius.circular(AppRadius.card),
           border: Border.all(
             color: c.divider.withValues(alpha: 0.55),
             width: 0.5,
           ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.08),
-              blurRadius: 16,
-              offset: const Offset(0, 4),
-            ),
-          ],
         ),
         child: Row(
           children: [
@@ -7796,11 +9349,44 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  Future<void> _openReplyMessage(int messageId) async {
+    // Capture before the viewport is claimed: the claim marks a navigation in
+    // progress and the recorded origin is the frame the reader just left.
+    _captureJumpOrigin();
+    _claimTranscriptViewport();
+    final didReachTarget = await _scrollToMessageAndReport(messageId);
+    if (!didReachTarget || !mounted) return;
+    if (isDesktopTargetPlatform(Theme.of(context).platform)) {
+      _flashLinkedMessageHighlight(messageId);
+    }
+  }
+
+  void _flashLinkedMessageHighlight(int messageId) {
+    _linkedMessageHighlightFadeTimer?.cancel();
+    _linkedMessageHighlightClearTimer?.cancel();
+    setState(() {
+      _linkedMessageHighlightId = messageId;
+      _linkedMessageHighlightActive = true;
+    });
+    _linkedMessageHighlightFadeTimer = Timer(
+      const Duration(milliseconds: 650),
+      () {
+        if (!mounted || _linkedMessageHighlightId != messageId) return;
+        setState(() => _linkedMessageHighlightActive = false);
+        _linkedMessageHighlightClearTimer = Timer(AppMotion.deliberate, () {
+          if (!mounted || _linkedMessageHighlightId != messageId) return;
+          setState(() => _linkedMessageHighlightId = null);
+        });
+      },
+    );
+  }
+
   Future<bool> _scrollToMessageAndReport(
     int messageId, {
     bool pinnedJump = false,
     double? alignment,
     bool forceAlignment = false,
+    bool alignUnreadDivider = false,
     bool Function()? isCancelled,
   }) async {
     if (isCancelled?.call() ?? false) return false;
@@ -7822,6 +9408,7 @@ class _ChatViewState extends State<ChatView> {
         pinnedJump: pinnedJump,
         alignment: alignment,
         forceAlignment: forceAlignment,
+        alignUnreadDivider: alignUnreadDivider,
         isCancelled: targetCancelled,
       );
     }
@@ -7839,6 +9426,7 @@ class _ChatViewState extends State<ChatView> {
       pinnedJump: pinnedJump,
       alignment: alignment,
       forceAlignment: forceAlignment,
+      alignUnreadDivider: alignUnreadDivider,
       isCancelled: targetCancelled,
     );
   }
@@ -7918,7 +9506,17 @@ class _ChatViewState extends State<ChatView> {
     showDivider: widget.showHeaderDivider,
     showSteppers: showSteppers,
     onClose: _closeSearch,
+    onJumpToMessage: _jumpToDateMessage,
   );
+
+  /// Lands the transcript on the message a calendar date resolved to.
+  ///
+  /// Unlike a search hit nothing is marked — the jump reads as navigation, not
+  /// as a match — and the search session stays open for the next step.
+  Future<void> _jumpToDateMessage(ChatMessage message) async {
+    _search.focusNode.unfocus();
+    await _scrollToMessage(message.id, alignment: 0.38, forceAlignment: true);
+  }
 
   Widget _searchResultsPane() => ChatSearchResultsPane(
     controller: _search,
@@ -7963,6 +9561,7 @@ class _ChatViewState extends State<ChatView> {
     bool instant = false,
     double? alignment,
     bool forceAlignment = false,
+    bool alignUnreadDivider = false,
     bool Function()? isCancelled,
   }) async {
     bool targetCancelled() =>
@@ -7971,9 +9570,13 @@ class _ChatViewState extends State<ChatView> {
 
     final targetAlignment =
         alignment ?? (pinnedJump ? pinnedMessageScrollAlignment : 0.3);
+    var stagedAtTranscriptCenter = false;
     for (var tries = 0; tries < 6; tries++) {
       if (targetCancelled()) return false;
-      final activeKey = _targetKey;
+      // Unread navigation targets the divider, not a fraction of the message
+      // body. For an oversized post, aligning its body at 12% would put the
+      // beginning and the divider hundreds of pixels above the viewport.
+      final activeKey = alignUnreadDivider ? _unreadKey : _targetKey;
       final ctx = activeKey.currentContext;
       if (ctx != null && ctx.mounted) {
         if (pinnedJump && alignment == null && _scroll.hasClients) {
@@ -8005,32 +9608,96 @@ class _ChatViewState extends State<ChatView> {
           return false;
         }
         if (!mounted || !ctx.mounted || targetCancelled()) return false;
-        await Scrollable.ensureVisible(
-          ctx,
+        final aligned = await _alignMessageTarget(
+          activeKey,
           alignment: targetAlignment,
-          duration: instant
-              ? Duration.zero
-              : pinnedJump
-              ? const Duration(milliseconds: 140)
-              : const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
+          instant: instant,
+          pinnedJump: pinnedJump,
+          isCancelled: targetCancelled,
         );
-        if (mounted && !targetCancelled()) {
-          setState(() => _setScrollTarget(null));
-          return true;
-        }
-        return false;
+        if (!mounted || targetCancelled()) return false;
+        // A correction pass can lose the row's context without the navigation
+        // being cancelled, and the jump is over either way. Holding the target
+        // past that point stalls new-message auto-scroll, short-transcript
+        // fill, and parked-pivot repair for as long as the chat stays open.
+        setState(() => _setScrollTarget(null));
+        return aligned;
       }
       if (!_scroll.hasClients) return false;
-      final estimate = _estimateMessageOffset(messageId, targetAlignment);
-      if (estimate != null) _scroll.jumpTo(estimate);
-      await Future<void>.delayed(const Duration(milliseconds: 120));
+      // A loaded target can be arbitrarily far from the currently laid-out
+      // sliver children. Move the bidirectional transcript's center to that
+      // row once; unlike an absolute height estimate, this guarantees Flutter
+      // will build the target even when every preceding row was underestimated.
+      if (!stagedAtTranscriptCenter &&
+          _stageMessageAtTranscriptCenter(messageId)) {
+        stagedAtTranscriptCenter = true;
+      } else {
+        final estimate = _estimateMessageOffset(
+          messageId,
+          targetAlignment,
+          beforeUnreadDivider: alignUnreadDivider,
+        );
+        if (estimate != null) _scroll.jumpTo(estimate);
+      }
+      await WidgetsBinding.instance.endOfFrame;
       if (!mounted || targetCancelled()) return false;
     }
     if (mounted && !targetCancelled()) {
       setState(() => _setScrollTarget(null));
     }
     return false;
+  }
+
+  /// Repeats ordinary target alignment while rich content finishes laying out.
+  /// The first pass carries the visible motion; the two short correction passes
+  /// absorb thumbnail, preview, reaction, and text reflow during that motion.
+  Future<bool> _alignMessageTarget(
+    GlobalKey targetKey, {
+    required double alignment,
+    required bool instant,
+    required bool pinnedJump,
+    required bool Function() isCancelled,
+  }) async {
+    for (var pass = 0; pass < 3; pass++) {
+      if (isCancelled()) return false;
+      final ctx = targetKey.currentContext;
+      if (ctx == null || !ctx.mounted) return false;
+      // Nothing reflowed during the previous pass, so the remaining correction
+      // animations would only spend their duration re-issuing the offset the
+      // row already sits at.
+      if (pass > 0 && _isTargetAtAlignment(targetKey, alignment)) return true;
+      await Scrollable.ensureVisible(
+        ctx,
+        alignment: alignment,
+        duration: instant
+            ? Duration.zero
+            : pass == 0
+            ? pinnedJump
+                  ? const Duration(milliseconds: 140)
+                  : const Duration(milliseconds: 220)
+            : const Duration(milliseconds: 80),
+        curve: Curves.easeOutCubic,
+      );
+      if (isCancelled()) return false;
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    return !isCancelled();
+  }
+
+  /// Whether the row already rests where `Scrollable.ensureVisible` would put
+  /// it, using the viewport's own reveal math so pinned slivers and oversized
+  /// rows are accounted for exactly as the real call accounts for them.
+  bool _isTargetAtAlignment(GlobalKey targetKey, double alignment) {
+    if (!_scroll.hasClients) return false;
+    final object = targetKey.currentContext?.findRenderObject();
+    if (object == null || !object.attached) return false;
+    final viewport = RenderAbstractViewport.maybeOf(object);
+    if (viewport == null) return false;
+    final target = clampScrollOffset(
+      _scroll.position,
+      viewport.getOffsetToReveal(object, alignment).offset,
+    );
+    return (target - _scroll.position.pixels).abs() <= 0.5;
   }
 
   /// Aligns a pinned target more than once because media rows can finish a
@@ -8164,94 +9831,104 @@ class _ChatViewState extends State<ChatView> {
     final newerIndexByKey = _sliverCacheNewerIndexByKey!;
     _scheduleUnreadProgressUpdate();
     _scheduleShortFirstContactReveal();
+    _scheduleTranscriptBottomGapCorrection();
     // No fill of its own: ChatWallpaperBackground already covers this region
     // with the same chatBackground when no wallpaper is set, and a transparent
     // ColoredBox still issues a full-viewport drawRect.
-    return NotificationListener<ScrollNotification>(
-      onNotification: _onTranscriptScrollNotification,
-      child: Listener(
-        behavior: HitTestBehavior.translucent,
-        onPointerDown: _onTranscriptPointerDown,
-        onPointerUp: _onTranscriptPointerEnd,
-        onPointerCancel: _onTranscriptPointerEnd,
-        child: CustomScrollView(
-          key: _transcriptViewportKey,
-          controller: _scroll,
-          center: _newerTranscriptSliverKey,
-          physics: const ClampingScrollPhysics(
-            parent: AlwaysScrollableScrollPhysics(),
-          ),
-          scrollCacheExtent: ScrollCacheExtent.pixels(
-            defaultTargetPlatform == TargetPlatform.android ? 260 : 420,
-          ),
-          semanticChildCount:
-              entries.length + (firstContactInfo == null ? 0 : 1),
-          slivers: [
-            const SliverToBoxAdapter(child: SizedBox(height: 8)),
-            SliverList(
-              delegate: SliverChildBuilderDelegate(
-                (context, index) {
-                  if (index < olderEntries.length) {
-                    return _buildTranscriptEntry(olderEntries[index], messages);
-                  }
-                  if (firstContactBeforeCenter &&
-                      index == olderEntries.length) {
-                    return _buildFirstContactCard(firstContactInfo);
-                  }
-                  if (showOlderLoadingGap) {
-                    return _historyLoadingGap('chat-older-history-gap');
-                  }
-                  return _buildFirstContactCard(firstContactInfo!);
-                },
-                childCount: olderChildCount,
-                // Nothing in the transcript keeps itself alive and there is
-                // no SelectableRegion, so the two keep-alive wrappers are
-                // dead weight; every row already carries its own
-                // RepaintBoundary.
-                addAutomaticKeepAlives: false,
-                addRepaintBoundaries: false,
-                findChildIndexCallback: (key) {
-                  if (key == const ValueKey('chat-first-contact-card')) {
-                    return firstContactBeforeCenter
-                        ? olderEntries.length
-                        : null;
-                  }
-                  return olderIndexByKey[key];
-                },
-                semanticIndexCallback: (_, localIndex) =>
-                    olderChildCount - localIndex - 1,
-              ),
+    return NotificationListener<ScrollMetricsNotification>(
+      onNotification: (notification) {
+        if (notification.depth == 0) _scheduleTranscriptBottomGapCorrection();
+        return false;
+      },
+      child: NotificationListener<ScrollNotification>(
+        onNotification: _onTranscriptScrollNotification,
+        child: Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: _onTranscriptPointerDown,
+          onPointerUp: _onTranscriptPointerEnd,
+          onPointerCancel: _onTranscriptPointerEnd,
+          child: CustomScrollView(
+            key: _transcriptViewportKey,
+            controller: _scroll,
+            center: _newerTranscriptSliverKey,
+            physics: const ClampingScrollPhysics(
+              parent: AlwaysScrollableScrollPhysics(),
             ),
-            SliverList(
-              key: _newerTranscriptSliverKey,
-              delegate: SliverChildBuilderDelegate(
-                (context, index) {
-                  if (firstContactAtCenter && index == 0) {
-                    return _buildFirstContactCard(firstContactInfo);
-                  }
-                  return _buildTranscriptEntry(
-                    newerEntries[index - newerLeadingItemCount],
-                    messages,
-                  );
-                },
-                childCount: newerEntries.length + newerLeadingItemCount,
-                addAutomaticKeepAlives: false,
-                addRepaintBoundaries: false,
-                findChildIndexCallback: (key) {
-                  if (key == const ValueKey('chat-first-contact-card')) {
-                    return firstContactAtCenter ? 0 : null;
-                  }
-                  return newerIndexByKey[key];
-                },
-                semanticIndexOffset: olderChildCount,
-              ),
+            scrollCacheExtent: ScrollCacheExtent.pixels(
+              defaultTargetPlatform == TargetPlatform.android ? 260 : 420,
             ),
-            if (_vm.isLoadingLatest)
-              SliverToBoxAdapter(
-                child: _historyLoadingGap('chat-latest-history-gap'),
+            semanticChildCount:
+                entries.length + (firstContactInfo == null ? 0 : 1),
+            slivers: [
+              const SliverToBoxAdapter(child: SizedBox(height: 8)),
+              SliverList(
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                    if (index < olderEntries.length) {
+                      return _buildTranscriptEntry(
+                        olderEntries[index],
+                        messages,
+                      );
+                    }
+                    if (firstContactBeforeCenter &&
+                        index == olderEntries.length) {
+                      return _buildFirstContactCard(firstContactInfo);
+                    }
+                    if (showOlderLoadingGap) {
+                      return _historyLoadingGap('chat-older-history-gap');
+                    }
+                    return _buildFirstContactCard(firstContactInfo!);
+                  },
+                  childCount: olderChildCount,
+                  // Nothing in the transcript keeps itself alive and there is
+                  // no SelectableRegion, so the two keep-alive wrappers are
+                  // dead weight; every row already carries its own
+                  // RepaintBoundary.
+                  addAutomaticKeepAlives: false,
+                  addRepaintBoundaries: false,
+                  findChildIndexCallback: (key) {
+                    if (key == const ValueKey('chat-first-contact-card')) {
+                      return firstContactBeforeCenter
+                          ? olderEntries.length
+                          : null;
+                    }
+                    return olderIndexByKey[key];
+                  },
+                  semanticIndexCallback: (_, localIndex) =>
+                      olderChildCount - localIndex - 1,
+                ),
               ),
-            const SliverToBoxAdapter(child: SizedBox(height: 8)),
-          ],
+              SliverList(
+                key: _newerTranscriptSliverKey,
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                    if (firstContactAtCenter && index == 0) {
+                      return _buildFirstContactCard(firstContactInfo);
+                    }
+                    return _buildTranscriptEntry(
+                      newerEntries[index - newerLeadingItemCount],
+                      messages,
+                    );
+                  },
+                  childCount: newerEntries.length + newerLeadingItemCount,
+                  addAutomaticKeepAlives: false,
+                  addRepaintBoundaries: false,
+                  findChildIndexCallback: (key) {
+                    if (key == const ValueKey('chat-first-contact-card')) {
+                      return firstContactAtCenter ? 0 : null;
+                    }
+                    return newerIndexByKey[key];
+                  },
+                  semanticIndexOffset: olderChildCount,
+                ),
+              ),
+              if (_vm.isLoadingLatest)
+                SliverToBoxAdapter(
+                  child: _historyLoadingGap('chat-latest-history-gap'),
+                ),
+              const SliverToBoxAdapter(child: SizedBox(height: 8)),
+            ],
+          ),
         ),
       ),
     );
@@ -8420,7 +10097,7 @@ class _ChatViewState extends State<ChatView> {
       final fullInfo = await TdClient.shared.query(
         communityFullInfoRequest(preview.id),
       );
-      for (final peer in fullInfo.objects('peers') ?? const []) {
+      for (final peer in communityCatalogEntries(fullInfo)) {
         final chatId = peer.int64('chat_id');
         if (chatId == null) continue;
         try {
@@ -8522,43 +10199,54 @@ class _ChatViewState extends State<ChatView> {
     final positionedMessageBody = usesExactMediaTarget || targetKey == null
         ? messageBody
         : KeyedSubtree(key: targetKey, child: messageBody);
-    final content = Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (_needsUnreadDivider(messageIndex, messages: messages))
-          KeyedSubtree(key: _unreadKey, child: _unreadDivider()),
-        if (_needsSeparator(messageIndex, messages: messages))
-          TimeSeparator(unix: message.date),
-        positionedMessageBody,
-      ],
-    );
     final visibilityKey = _entryVisibilityKeys.putIfAbsent(
       entry.last.id,
       GlobalKey.new,
     );
-    // The visibility key resolved to this RepaintBoundary's render object
-    // already; hanging it here drops one wrapper element per row.
     return KeyedSubtree(
       key: entry.key,
-      child: RepaintBoundary(
-        key: visibilityKey,
-        child: _searchHighlight(entry, content),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_needsUnreadDivider(messageIndex, messages: messages))
+            KeyedSubtree(key: _unreadKey, child: _unreadDivider()),
+          if (_needsSeparator(messageIndex, messages: messages))
+            TimeSeparator(unix: message.date),
+          if (_needsTopicSeparator(messageIndex, messages: messages))
+            _topicSectionHeader(_topicSectionId(message)!),
+          // Anchor the message itself: unread/date separators can disappear
+          // between visits and must not shift the restored reading position.
+          TranscriptEntryBoundary(
+            key: visibilityKey,
+            messageId: entry.last.id,
+            mountedEntries: _mountedTranscriptEntries,
+            child: _messageNavigationHighlight(entry, positionedMessageBody),
+          ),
+        ],
       ),
     );
   }
 
-  /// Washes the row holding the current search hit. A full-width tint rather
-  /// than a bubble outline, so an album or a document run reads as one hit.
-  Widget _searchHighlight(_TranscriptEntry entry, Widget content) {
-    final highlightId = _searchHighlightId;
-    if (highlightId == null) return content;
-    final highlighted = entry.messages.any((m) => m.id == highlightId);
+  /// Washes the row holding a search hit or a just-opened reply destination.
+  /// A full-width tint makes an album or document run read as one destination;
+  /// reply navigation holds the stronger tint for 650 ms, then fades it out.
+  Widget _messageNavigationHighlight(_TranscriptEntry entry, Widget content) {
+    final searchHighlighted =
+        _searchHighlightId != null &&
+        entry.messages.any((m) => m.id == _searchHighlightId);
+    final linkedHighlighted =
+        _linkedMessageHighlightId != null &&
+        entry.messages.any((m) => m.id == _linkedMessageHighlightId);
+    if (!searchHighlighted && !linkedHighlighted) return content;
+    final alpha = linkedHighlighted && _linkedMessageHighlightActive
+        ? 0.18
+        : searchHighlighted
+        ? 0.12
+        : 0.0;
     return AnimatedContainer(
       duration: AppMotion.duration(context, AppMotion.deliberate),
       curve: AppMotion.standard,
-      color: highlighted
-          ? AppTheme.brand.withValues(alpha: 0.12)
-          : Colors.transparent,
+      color: AppTheme.brand.withValues(alpha: alpha),
       child: content,
     );
   }
@@ -8755,6 +10443,20 @@ class _ChatViewState extends State<ChatView> {
     );
   }
 
+  void _handleDesktopQuoteChanged(
+    ChatMessage message,
+    MessageTextQuote? quote,
+  ) {
+    if (!mounted) return;
+    if (quote != null) {
+      _desktopQuoteMessageId = message.id;
+      _desktopQuote = quote;
+    } else if (_desktopQuoteMessageId == message.id) {
+      _desktopQuoteMessageId = null;
+      _desktopQuote = null;
+    }
+  }
+
   void _showActionMenuForMessage(
     ChatMessage message,
     Rect? rect, [
@@ -8762,6 +10464,7 @@ class _ChatViewState extends State<ChatView> {
   ]) {
     EmojiStore.shared.loadIfNeeded();
     final reactionGeneration = ++_actionReactionAvailabilityGeneration;
+    final propertiesGeneration = ++_actionPropertiesGeneration;
     final overlayBox =
         _actionOverlayKey.currentContext?.findRenderObject() as RenderBox?;
     final platform = Theme.of(context).platform;
@@ -8788,7 +10491,16 @@ class _ChatViewState extends State<ChatView> {
     final oldSelectionState = _mobileTextSelectionAreaKey?.currentState;
     setState(() {
       _actionTarget = message;
+      // Keep the quote while the menu takes focus and clears Flutter's live
+      // selection. Each newly opened menu replaces this snapshot.
+      _actionQuote =
+          desktop && _vm.canQuoteText && _desktopQuoteMessageId == message.id
+          ? _desktopQuote
+          : null;
       _actionRect = overlayRect;
+      // The HUD's enter grows out of the pressed message and its exit
+      // collapses back into it.
+      _actionAnchor = overlayRect?.center;
       _mobileTextSelectionAreaKey = enableMobileTextSelection
           ? GlobalKey<SelectionAreaState>()
           : null;
@@ -8800,13 +10512,44 @@ class _ChatViewState extends State<ChatView> {
       _reactionExpanded = false;
       _reactionTab = 'standard';
       _actionReactionAvailability = null;
+      _actionMessageLinkAvailable = null;
+      _actionCanReply = null;
     });
     oldSelectionState?.selectableRegion.clearSelection();
-    if (!desktop && !message.isCall) {
+    if (!message.isCall) {
       unawaited(
         _loadActionReactionAvailability(message.id, reactionGeneration),
       );
     }
+    unawaited(_loadActionAvailability(message.id, propertiesGeneration));
+  }
+
+  /// The link row appears only once the server confirms the message carries
+  /// one (`messageProperties.can_get_link`), and the reply row only once it
+  /// confirms a reply is accepted (`messageProperties.can_be_replied`). A
+  /// chat without a composer never gets one at all. While the offline
+  /// properties query is in flight both entries stay hidden, so the menu
+  /// never grows a row it would have to remove a moment later.
+  Future<void> _loadActionAvailability(int messageId, int generation) async {
+    bool? canGetLink;
+    bool? canBeReplied;
+    try {
+      final availability = await _vm.messageActionAvailability(messageId);
+      canGetLink = availability.canGetLink;
+      canBeReplied = availability.canBeReplied;
+    } catch (_) {
+      canGetLink = false; // Fail closed — no query answer, no action.
+      canBeReplied = false;
+    }
+    if (!mounted ||
+        generation != _actionPropertiesGeneration ||
+        _actionTarget?.id != messageId) {
+      return;
+    }
+    setState(() {
+      _actionMessageLinkAvailable = canGetLink;
+      _actionCanReply = canBeReplied;
+    });
   }
 
   Future<void> _loadActionReactionAvailability(
@@ -8933,7 +10676,8 @@ class _ChatViewState extends State<ChatView> {
         startsNewSection: (index) =>
             _startsTranscriptPivotSection(messages, index) ||
             _needsSeparator(index, messages: messages) ||
-            _needsUnreadDivider(index, messages: messages),
+            _needsUnreadDivider(index, messages: messages) ||
+            _needsTopicSeparator(index, messages: messages),
       );
       run.addAll(messages.sublist(i + 1, j));
       entries.add(_TranscriptEntry(run, i));
@@ -8956,7 +10700,8 @@ class _ChatViewState extends State<ChatView> {
           startsNewSection: (index) =>
               _startsTranscriptPivotSection(messages, index) ||
               _needsSeparator(index, messages: messages) ||
-              _needsUnreadDivider(index, messages: messages),
+              _needsUnreadDivider(index, messages: messages) ||
+              _needsTopicSeparator(index, messages: messages),
         );
         run.addAll(messages.sublist(i + 1, j));
         entries.add(_TranscriptEntry(run, i));
@@ -8975,7 +10720,8 @@ class _ChatViewState extends State<ChatView> {
         final next = messages[j];
         if (_startsTranscriptPivotSection(messages, j) ||
             _needsSeparator(j, messages: messages) ||
-            _needsUnreadDivider(j, messages: messages)) {
+            _needsUnreadDivider(j, messages: messages) ||
+            _needsTopicSeparator(j, messages: messages)) {
           break;
         }
         if (!areMessagesInSameMediaAlbum(group.last, next)) break;
@@ -9003,14 +10749,27 @@ class _ChatViewState extends State<ChatView> {
     int? targetMessageId,
     GlobalKey? targetKey,
   }) {
-    final owner = _mediaAlbumInteractionOwner(entry.messages);
-    final ownerIndex = entry.startIndex + entry.messages.indexOf(owner);
-    return _messageBubble(
-      owner,
-      ownerIndex,
-      groupedMedia: entry.messages,
-      targetMediaMessageId: targetMessageId,
-      targetMediaKey: targetKey,
+    for (final member in entry.messages) {
+      _vm.ensureMessageCapabilities(member);
+    }
+    return _ActiveChatListenableBuilder(
+      listenable: Listenable.merge([
+        for (final message in entry.messages)
+          _vm.messageRevisionListenable(message.id),
+      ]),
+      builder: (context) {
+        // Replies/reactions can move album interaction ownership to another
+        // member, so reselect the owner inside the localized rebuild.
+        final owner = _mediaAlbumInteractionOwner(entry.messages);
+        final ownerIndex = entry.startIndex + entry.messages.indexOf(owner);
+        return _buildMessageBubble(
+          owner,
+          ownerIndex,
+          groupedMedia: entry.messages,
+          targetMediaMessageId: targetMessageId,
+          targetMediaKey: targetKey,
+        );
+      },
     );
   }
 
@@ -9022,6 +10781,23 @@ class _ChatViewState extends State<ChatView> {
     List<ChatMessage> group, {
     int? targetMessageId,
     GlobalKey? targetKey,
+  }) {
+    return _ActiveChatListenableBuilder(
+      listenable: Listenable.merge([
+        for (final message in group) _vm.messageRevisionListenable(message.id),
+      ]),
+      builder: (context) => _buildImageGroupBubble(
+        group,
+        targetMessageId: targetMessageId,
+        targetKey: targetKey,
+      ),
+    );
+  }
+
+  Widget _buildImageGroupBubble(
+    List<ChatMessage> group, {
+    required int? targetMessageId,
+    required GlobalKey? targetKey,
   }) {
     ChatMessage? captionMessage;
     for (final message in group) {
@@ -9035,54 +10811,63 @@ class _ChatViewState extends State<ChatView> {
             _mobileTextSelectionMessageId == captionMessage?.id
         ? _mobileTextSelectionAreaKey
         : null;
-    return ImageMediaAlbumBubble(
-      messages: group,
-      peerTitle: _vm.peerTitle,
-      peerPhoto: _vm.peerPhoto,
-      isGroup: _vm.isGroup,
-      meName: _vm.meName,
-      mePhoto: _vm.mePhoto,
-      hasCustomChatTheme: _hasCustomChatTheme,
-      showCommentAttachment: chatTranscriptAllowsCommentAttachment(
-        isChannel: _vm.isChannel,
+    // An album is one row, so it swipes as one. The reply lands on the member
+    // that already owns the album's interaction, the way a document album's
+    // bubble does.
+    return MessageSwipeReplyRow(
+      swipeEnabled: !_isSelecting && mobileSelectionKey == null,
+      onReply: () => _beginSwipeReply(_mediaAlbumInteractionOwner(group)),
+      child: ImageMediaAlbumBubble(
+        messages: group,
+        peerTitle: _vm.peerTitle,
+        peerPhoto: _vm.peerPhoto,
+        isGroup: _vm.isGroup,
+        meName: _vm.meName,
+        mePhoto: _vm.mePhoto,
+        hasCustomChatTheme: _hasCustomChatTheme,
+        showCommentAttachment: chatTranscriptAllowsCommentAttachment(
+          isChannel: _vm.isChannel,
+        ),
+        channelHasLinkedDiscussion: _vm.hasLinkedDiscussion,
+        selecting: _isSelecting,
+        selectedMessageIds: _selectedMessageIds,
+        outgoingBubbleColor: _effectiveOutgoingColor(),
+        outgoingBubbleTextColor: _effectiveOutgoingTextColor(),
+        incomingBubbleColor: _effectiveIncomingColor(),
+        incomingBubbleTextColor: _effectiveIncomingTextColor(),
+        messageColors: _effectiveMessageColors(),
+        translationDisplayStyle: _translation.displayStyle,
+        showOriginalTranslationMessageIds: _showOriginalTranslationMessageIds,
+        onAvatarTap: _openSenderProfile,
+        onAvatarLongPress: (message) {
+          if (_vm.isGroup && (message.senderName?.isNotEmpty ?? false)) {
+            _vm.insertMention(message);
+          }
+        },
+        onOpenForwarded: _openForwardedMessage,
+        onTapViaBot: (message) => unawaited(_activateMessageViaBot(message)),
+        onOpenImage: _openImage,
+        onPlayVideo: _playVideo,
+        onEditCaption: (message) => unawaited(_editMessageText(message)),
+        onOpenComments: _openMessageComments,
+        onLongPress: _showActionMenuForMessage,
+        onDesktopQuoteChanged: _handleDesktopQuoteChanged,
+        mobileTextSelectionAreaKey: mobileSelectionKey,
+        onMobileTextSelectionChanged: _handleMobileTextSelectionChanged,
+        onMobileTextSelectionDisposed:
+            captionMessage == null || mobileSelectionKey == null
+            ? null
+            : () => _handleMobileTextSelectionDisposed(
+                captionMessage!.id,
+                mobileSelectionKey,
+              ),
+        onToggleSelection: (message) => _toggleSelection([message]),
+        onBotCommandTap: _sendCommand,
+        onHashtagTap: _openHashtagSearch,
+        onMentionTap: _openUserProfile,
+        targetMessageId: targetMessageId,
+        targetKey: targetKey,
       ),
-      channelHasLinkedDiscussion: _vm.hasLinkedDiscussion,
-      selecting: _isSelecting,
-      selectedMessageIds: _selectedMessageIds,
-      outgoingBubbleColor: _effectiveOutgoingColor(),
-      outgoingBubbleTextColor: _effectiveOutgoingTextColor(),
-      incomingBubbleColor: _effectiveIncomingColor(),
-      incomingBubbleTextColor: _effectiveIncomingTextColor(),
-      messageColors: _effectiveMessageColors(),
-      translationDisplayStyle: _translation.displayStyle,
-      showOriginalTranslationMessageIds: _showOriginalTranslationMessageIds,
-      onAvatarTap: _openSenderProfile,
-      onAvatarLongPress: (message) {
-        if (_vm.isGroup && (message.senderName?.isNotEmpty ?? false)) {
-          _vm.insertMention(message);
-        }
-      },
-      onOpenForwarded: _openForwardedMessage,
-      onOpenImage: _openImage,
-      onPlayVideo: _playVideo,
-      onEditCaption: (message) => unawaited(_editMessageText(message)),
-      onOpenComments: _openMessageComments,
-      onLongPress: _showActionMenuForMessage,
-      mobileTextSelectionAreaKey: mobileSelectionKey,
-      onMobileTextSelectionChanged: _handleMobileTextSelectionChanged,
-      onMobileTextSelectionDisposed:
-          captionMessage == null || mobileSelectionKey == null
-          ? null
-          : () => _handleMobileTextSelectionDisposed(
-              captionMessage!.id,
-              mobileSelectionKey,
-            ),
-      onToggleSelection: (message) => _toggleSelection([message]),
-      onBotCommandTap: _sendCommand,
-      onHashtagTap: _openHashtagSearch,
-      onMentionTap: _openUserProfile,
-      targetMessageId: targetMessageId,
-      targetKey: targetKey,
     );
   }
 
@@ -9134,12 +10919,118 @@ class _ChatViewState extends State<ChatView> {
     }
   }
 
+  Future<void> _quoteMessageText(
+    ChatMessage message, {
+    MessageTextQuote? selectedQuote,
+  }) async {
+    if (!_vm.canQuoteText || !canQuoteMessageText(message)) return;
+    final limit = await _vm.messageQuoteLengthLimit();
+    if (!mounted || !_vm.canQuoteText) return;
+    // Desktop quotes are chosen directly in the transcript, not in a second
+    // window. Touch keeps the explicit quote-selection flow.
+    if (selectedQuote == null &&
+        isDesktopTargetPlatform(Theme.of(context).platform)) {
+      return;
+    }
+    final quote =
+        selectedQuote ??
+        await showGeneralDialog<MessageTextQuote>(
+          context: context,
+          barrierDismissible: true,
+          barrierLabel: AppStringKeys.confirmCancel.l10n(context),
+          barrierColor: Colors.black.withValues(alpha: 0.52),
+          transitionDuration: AppMotion.duration(context, AppMotion.responsive),
+          transitionBuilder: AppMotion.dialogTransition,
+          pageBuilder: (_, _, _) =>
+              MessageQuoteSelectionDialog(message: message, maxLength: limit),
+        );
+    if (!mounted || quote == null || !_vm.canQuoteText) return;
+    final current = _vm.messages.where((m) => m.id == message.id).firstOrNull;
+    if (current == null) return;
+    final validated = quoteMessageRange(
+      current,
+      start: quote.position,
+      end: quote.position + quote.text.length,
+      maxLength: limit,
+    );
+    if (validated == null || validated.text != quote.text) {
+      showToast(context, AppStringKeys.topicPostContentActionFailed);
+      return;
+    }
+    _vm.setReply(current, quote: validated);
+  }
+
   Future<void> _toggleMessageReaction(
     ChatMessage message,
     MessageReaction reaction,
   ) => _sendReaction(() => _vm.toggleReaction(message, reaction));
 
   Widget _actionMenuOverlay() {
+    final liveTarget = _actionTarget;
+    if (liveTarget != null) {
+      // Capture the fully configured surfaces this frame. Every close path
+      // clears the live state immediately, and the presentation replays this
+      // snapshot while the exit animation runs — otherwise the collapsing HUD
+      // would show the already-cleared state instead of the closing menu.
+      _actionOverlaySnapshot = _actionOverlayContent(liveTarget);
+    }
+    final content = _actionOverlaySnapshot;
+    if (content == null) return const SizedBox.shrink();
+    return Positioned.fill(
+      child: ChatActionOverlayGestureLayer(
+        selectionAreaKey: _mobileTextSelectionMessageId == null
+            ? null
+            : _mobileTextSelectionAreaKey,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                key: const ValueKey('message-action-dismiss-layer'),
+                behavior: HitTestBehavior.opaque,
+                onTap: _dismissActionOverlay,
+                child: const SizedBox.expand(),
+              ),
+            ),
+            Positioned.fill(
+              child: MessageActionMenuPresentation(
+                visible: liveTarget != null,
+                anchor: _actionAnchor,
+                onExitComplete: _handleActionOverlayExitComplete,
+                child: content,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Clears the live action state, handing the closing overlay its snapshot to
+  /// replay during the exit. A second dismiss while the exit is still running
+  /// finds no live target and leaves the running reverse alone.
+  void _dismissActionOverlay() {
+    if (_actionTarget == null) return;
+    setState(() {
+      _actionTarget = null;
+      _actionRect = null;
+      _lastActionPointerGlobalPosition = null;
+      _clearMobileTextSelectionState();
+      _actionSource = MessageActionSource.normal;
+      _reactionExpanded = false;
+    });
+  }
+
+  /// The exit animation landed: drop the snapshot and unmount the overlay. A
+  /// late report for a menu that has since re-opened (or closed again) is
+  /// stale — only a snapshot from the reported close is released here.
+  void _handleActionOverlayExitComplete() {
+    if (!mounted || _actionTarget != null || _actionOverlaySnapshot == null) {
+      return;
+    }
+    setState(() => _actionOverlaySnapshot = null);
+  }
+
+  Widget _actionOverlayContent(ChatMessage target) {
     final overlayBox =
         _actionOverlayKey.currentContext?.findRenderObject() as RenderBox?;
     final screenSize = overlayBox?.hasSize == true
@@ -9150,9 +11041,10 @@ class _ChatViewState extends State<ChatView> {
     final screenH = screenSize.height;
     final topSafe = safeArea.top + 8;
     final bottomSafe = screenH - safeArea.bottom - 8;
-    final outgoing = _actionTarget!.isOutgoing;
+    final outgoing = target.isOutgoing;
     final rect = _actionRect;
-    final showActionMenu = !_reactionExpanded;
+    final expandedReactions = _reactionExpanded;
+    final showActionMenu = !expandedReactions;
     final desktopMenu = isDesktopTargetPlatform(Theme.of(context).platform);
     final mobileDropdown =
         !desktopMenu &&
@@ -9163,36 +11055,63 @@ class _ChatViewState extends State<ChatView> {
         verticalMenu && rect != null && rect.width == 0 && rect.height == 0;
     final reactionAvailability = _actionReactionAvailability;
     final showReactions = messageActionShowsReactionControls(
-      isDesktop: desktopMenu,
-      isCall: _actionTarget!.isCall,
+      isCall: target.isCall,
       availability: reactionAvailability,
     );
     final actionMenu = MessageActionMenu(
-      message: _actionTarget!,
-      isPinned: _vm.pinnedMessage?.id == _actionTarget!.id,
+      message: target,
+      isPinned: _vm.pinnedMessage?.id == target.id,
       allowForwarding: _vm.canForwardContent,
       allowTranslation: _hasAvailableTranslationOption,
+      allowQuote: _vm.canQuoteText && _actionCanReply == true,
+      // A channel post is answered in its linked discussion group, so a
+      // channel that has one keeps Reply even when the channel itself takes no
+      // messages — the comments sheet, which speaks for the group, decides
+      // whether this account can send and says so after it opens. Everywhere
+      // else a reply needs a composer here, and a message the server refuses
+      // to have replied to is dropped even where posting is allowed. Null
+      // while the properties query is in flight: fail closed, exactly like the
+      // link row.
+      allowReply:
+          (_vm.isChannel && _vm.hasLinkedDiscussion && !target.isService) ||
+          (_vm.canSendMessages && _actionCanReply == true),
+      hasSelectedQuote: _actionQuote != null,
       allowSuggestedPostOffer:
           _vm.isDirectMessagesGroup && !_vm.isAdministeredDirectMessagesGroup,
+      allowHideSender: _canHideSender(target),
+      allowCopyMessageLink:
+          !target.isCall && _actionMessageLinkAvailable == true,
       source: _actionSource,
       showingOriginalTranslation: _showOriginalTranslationMessageIds.contains(
-        _actionTarget!.id,
+        target.id,
       ),
       layout: verticalMenu
           ? MessageActionMenuLayout.vertical
           : MessageActionMenuLayout.grid,
-      onSelect: (action) => _perform(action, _actionTarget!),
+      onSelect: (action) => _perform(action, target),
     );
 
+    // Desktop treats the strip as the menu's upper storey and places the pair
+    // as one block. Its row is reserved the moment the menu opens and only
+    // collapses if the server comes back with nothing to offer, so the menu
+    // does not jump out from under a settled pointer when the answer lands.
+    final desktopStrip =
+        desktopMenu &&
+        !_reactionExpanded &&
+        !target.isCall &&
+        (reactionAvailability == null || reactionAvailability.canAdd);
+    final desktopStripH = desktopStrip
+        ? MenuReactionBar.height + _menuReactionGap
+        : 0.0;
     final reactionH = !showReactions
         ? 0.0
         : _reactionExpanded
-        ? 268.0
+        ? _expandedPickerSize.height
         : 48.0;
     final menuH = showActionMenu
         ? math.min(
             actionMenu.preferredHeightFor(context),
-            math.max(0.0, bottomSafe - topSafe),
+            math.max(0.0, bottomSafe - topSafe - desktopStripH),
           )
         : 0.0;
     const gap = 8.0;
@@ -9231,79 +11150,94 @@ class _ChatViewState extends State<ChatView> {
     final boundedActionMenu = verticalMenu
         ? SizedBox(width: verticalMenuWidth, height: menuH, child: actionMenu)
         : actionMenu;
+    final desktopOrigin = desktopMenu
+        ? MessageActionMenu.verticalOriginForPointer(
+            pointer: rect?.topLeft ?? Offset(10, topSafe),
+            viewport: screenSize,
+            menuSize: _reactionExpanded
+                ? _expandedPickerSize
+                : Size(verticalMenuWidth, desktopStripH + menuH),
+            topSafe: topSafe,
+            bottomSafe: bottomSafe,
+          )
+        : Offset.zero;
 
-    void dismiss() => setState(() {
-      _actionTarget = null;
-      _actionRect = null;
-      _lastActionPointerGlobalPosition = null;
-      _clearMobileTextSelectionState();
-      _actionSource = MessageActionSource.normal;
-      _reactionExpanded = false;
-    });
-
-    return Positioned.fill(
-      child: ChatActionOverlayGestureLayer(
-        selectionAreaKey: _mobileTextSelectionMessageId == null
-            ? null
-            : _mobileTextSelectionAreaKey,
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: GestureDetector(
-                key: const ValueKey('message-action-dismiss-layer'),
-                behavior: HitTestBehavior.opaque,
-                onTap: dismiss,
-                child: const SizedBox.expand(),
-              ),
+    return Stack(
+      children: [
+        // Call logs and other special messages aren't reactable — no strip.
+        if (showReactions)
+          Positioned(
+            top: desktopMenu ? desktopOrigin.dy : reactionTop,
+            left: desktopMenu ? desktopOrigin.dx : 10,
+            right: desktopMenu ? null : 10,
+            child: AnimatedBuilder(
+              animation: EmojiStore.shared,
+              builder: (context, _) {
+                final availability = reactionAvailability!;
+                if (expandedReactions) {
+                  final picker = _expandedReactionPicker(availability);
+                  return desktopMenu
+                      ? picker
+                      : Align(alignment: align, child: picker);
+                }
+                final reactions = _quickReactionChoices(availability);
+                if (desktopMenu) {
+                  return SizedBox(
+                    width: verticalMenuWidth,
+                    child: MenuReactionBar(
+                      reactions: reactions,
+                      onReaction: _reactQuick,
+                      onExpand: () => setState(() => _reactionExpanded = true),
+                    ),
+                  );
+                }
+                return Align(
+                  alignment: align,
+                  child: QuickReactionBar(
+                    reactions: reactions,
+                    onReaction: _reactQuick,
+                    onExpand: () => setState(() => _reactionExpanded = true),
+                  ),
+                );
+              },
             ),
-            // Call logs and other special messages aren't reactable — no +1 bar.
-            if (showReactions)
-              Positioned(
-                top: reactionTop,
-                left: 10,
-                right: 10,
-                child: AnimatedBuilder(
-                  animation: EmojiStore.shared,
-                  builder: (context, _) {
-                    final availability = reactionAvailability!;
-                    if (_reactionExpanded) {
-                      return Align(
-                        alignment: align,
-                        child: _expandedReactionPicker(availability),
-                      );
-                    }
-                    final configured = effectiveQuickReactions(
-                      context.watch<ThemeController>().quickReactions,
-                      allowCustomEmoji:
-                          availability.allowArbitraryCustom ||
-                          availability.choices.any((choice) => choice.isCustom),
-                    );
-                    final reactions = availability.quickChoices(configured);
-                    return Align(
-                      alignment: align,
-                      child: QuickReactionBar(
-                        reactions: reactions,
-                        onReaction: _reactQuick,
-                        onExpand: () =>
-                            setState(() => _reactionExpanded = true),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            if (showActionMenu)
-              Positioned(
-                top: pointerAnchored ? pointerMenuOrigin.dy : menuTop,
-                left: pointerAnchored ? pointerMenuOrigin.dx : 10,
-                right: pointerAnchored ? null : 10,
-                child: pointerAnchored
-                    ? boundedActionMenu
-                    : Align(alignment: align, child: boundedActionMenu),
-              ),
-          ],
-        ),
-      ),
+          ),
+        if (showActionMenu)
+          Positioned(
+            top: desktopMenu
+                ? desktopOrigin.dy + desktopStripH
+                : pointerAnchored
+                ? pointerMenuOrigin.dy
+                : menuTop,
+            left: desktopMenu
+                ? desktopOrigin.dx
+                : pointerAnchored
+                ? pointerMenuOrigin.dx
+                : 10,
+            right: desktopMenu || pointerAnchored ? null : 10,
+            child: desktopMenu || pointerAnchored
+                ? boundedActionMenu
+                : Align(alignment: align, child: boundedActionMenu),
+          ),
+      ],
     );
+  }
+
+  /// The gap between the strip and the menu it rides on — tight enough that
+  /// the pair reads as one stack, wide enough to keep both borders visible.
+  static const _menuReactionGap = 4.0;
+  static const _expandedPickerSize = Size(300, 268);
+
+  List<QuickReactionChoice> _quickReactionChoices(
+    MessageReactionAvailability availability,
+  ) {
+    final configured = effectiveQuickReactions(
+      context.watch<ThemeController>().quickReactions,
+      allowCustomEmoji:
+          availability.allowArbitraryCustom ||
+          availability.choices.any((choice) => choice.isCustom),
+    );
+    return availability.quickChoices(configured);
   }
 
   Widget _expandedReactionPicker(MessageReactionAvailability availability) {
@@ -9312,8 +11246,8 @@ class _ChatViewState extends State<ChatView> {
         ? store.customPacks
         : const <CustomEmojiPack>[];
     return Container(
-      width: 300,
-      height: 268,
+      width: _expandedPickerSize.width,
+      height: _expandedPickerSize.height,
       decoration: BoxDecoration(
         color: const Color(0xFF2C2C2E),
         borderRadius: BorderRadius.circular(AppRadius.lg),
@@ -9502,19 +11436,31 @@ class _ReactionUsersSheet extends StatefulWidget {
     required this.viewModel,
     required this.message,
     required this.initialReaction,
+    required this.reportPermission,
+    required this.onOpenSender,
+    required this.onReportSender,
   });
 
   final ChatViewModel viewModel;
   final ChatMessage message;
   final MessageReaction initialReaction;
 
+  /// `messageProperties.can_report_reactions` for [message], resolved when the
+  /// sheet opens. Hidden until true and never resurrected by a late answer.
+  final Future<bool> reportPermission;
+  final ValueChanged<MessageReactionUser> onOpenSender;
+  final ValueChanged<MessageReactionUser> onReportSender;
+
   @override
   State<_ReactionUsersSheet> createState() => _ReactionUsersSheetState();
 }
 
+enum _ReactionUserAction { report }
+
 class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   late MessageReaction _selected;
   final Map<String, Future<List<MessageReactionUser>>> _loads = {};
+  bool _allowReport = false;
 
   @override
   void initState() {
@@ -9524,6 +11470,13 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
       (reaction) => _reactionKey(reaction) == initialKey,
       orElse: () => widget.message.reactions.first,
     );
+    unawaited(_loadReportPermission());
+  }
+
+  Future<void> _loadReportPermission() async {
+    final allowed = await widget.reportPermission;
+    if (!mounted || !allowed) return;
+    setState(() => _allowReport = true);
   }
 
   Future<List<MessageReactionUser>> _load(MessageReaction reaction) {
@@ -9537,6 +11490,14 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
   String _reactionKey(MessageReaction reaction) => reaction.customEmojiId != 0
       ? 'custom:${reaction.customEmojiId}'
       : 'emoji:${reaction.emoji ?? ''}';
+
+  bool _canReport(MessageReactionUser user) =>
+      _allowReport && !user.isDeleted && user.senderId != widget.viewModel.meId;
+
+  void _retrySelected() {
+    _loads.remove(_reactionKey(_selected));
+    setState(() {});
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -9617,6 +11578,43 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             ),
           );
         }
+        if (snapshot.hasError) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    AppStrings.t(AppStringKeys.chatReactionUsersLoadFailed),
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 14, color: c.textSecondary),
+                  ),
+                  const SizedBox(height: 12),
+                  GestureDetector(
+                    key: const ValueKey('reaction-users-retry'),
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _retrySelected,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: c.searchFill,
+                        borderRadius: BorderRadius.circular(AppRadius.control),
+                      ),
+                      child: Text(
+                        AppStrings.t(AppStringKeys.chatReactionUsersRetry),
+                        style: TextStyle(fontSize: 14, color: c.textPrimary),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
         final users = snapshot.data ?? const <MessageReactionUser>[];
         if (users.isEmpty) {
           return Center(
@@ -9637,8 +11635,9 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
 
   Widget _reactionUserRow(AppColors c, MessageReactionUser user) {
     final time = DateText.listLabel(user.date);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+    final reportable = _canReport(user);
+    final row = Padding(
+      padding: EdgeInsets.fromLTRB(18, 9, reportable ? 6 : 18, 9),
       child: Row(
         children: [
           PhotoAvatar(title: user.title, photo: user.photo, size: 44),
@@ -9655,9 +11654,56 @@ class _ReactionUsersSheetState extends State<_ReactionUsersSheet> {
             const SizedBox(width: 10),
             Text(time, style: TextStyle(fontSize: 12, color: c.textTertiary)),
           ],
+          if (reportable)
+            GestureDetector(
+              key: ValueKey('reactionUserReport-${user.senderId}'),
+              behavior: HitTestBehavior.opaque,
+              onTap: () => unawaited(_showUserActions(user)),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
+                child: AppIcon(
+                  HeroAppIcons.ellipsisVertical,
+                  size: 18,
+                  color: c.textTertiary,
+                ),
+              ),
+            ),
         ],
       ),
     );
+    if (user.isDeleted) return row;
+    return GestureDetector(
+      key: ValueKey('reactionUser-${user.senderId}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => widget.onOpenSender(user),
+      child: row,
+    );
+  }
+
+  Future<void> _showUserActions(MessageReactionUser user) async {
+    final action = await showAppModalSheet<_ReactionUserAction>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: SettingsCard(
+          margin: const EdgeInsets.all(10),
+          children: [
+            SettingsRow(
+              key: const ValueKey('reaction-user-report-action'),
+              leading: const AppIcon(HeroAppIcons.triangleExclamation),
+              title: AppStrings.t(AppStringKeys.chatReactionReportAction),
+              titleColor: AppTheme.tagRed,
+              showChevron: false,
+              onTap: () =>
+                  Navigator.of(sheetContext).pop(_ReactionUserAction.report),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action != _ReactionUserAction.report) return;
+    widget.onReportSender(user);
   }
 
   Widget _reactionGlyph(MessageReaction reaction, Color color) {
